@@ -4,6 +4,7 @@ export interface StorageHealth {
   ok: boolean;
   mode: StorageMode;
   dbPath: string;
+  lastUpdatedAt?: string;
   migration: {
     latestAvailableId?: string;
     latestAppliedId?: string;
@@ -35,6 +36,7 @@ export interface MigrationRunResult {
 }
 
 export interface MigrationRunner {
+  listPending(): string[];
   status(): MigrationStatus;
   runPending(): MigrationRunResult;
 }
@@ -47,6 +49,17 @@ export interface StorageDriver {
   backup(): string;
   healthcheck(): StorageHealth;
   close(): void;
+}
+
+export interface ProjectRecord {
+  id: string;
+  name: string;
+  repoPath: string;
+  baseBranch?: string | null;
+  archived: boolean;
+  metadataJson?: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface LoopRecord {

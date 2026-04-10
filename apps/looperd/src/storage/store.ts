@@ -3,6 +3,7 @@ import type {
   LockRecord,
   LoopRecord,
   MigrationStatus,
+  ProjectRecord,
   PullRequestSnapshotRecord,
   RunRecord,
   StorageHealth,
@@ -12,6 +13,12 @@ import type {
 
 export interface Store {
   withTransaction<T>(fn: (store: Store) => T): T;
+
+  projects: {
+    upsert(record: ProjectRecord): void;
+    getById(id: string): ProjectRecord | null;
+    list(): ProjectRecord[];
+  };
 
   loops: {
     upsert(record: LoopRecord): void;

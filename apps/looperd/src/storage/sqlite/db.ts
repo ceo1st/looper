@@ -1,5 +1,5 @@
 import { mkdir } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { mkdirSync } from "node:fs";
 
 import { Database } from "bun:sqlite";
 
@@ -9,6 +9,10 @@ import {
   type SqliteMigrationRunner,
   type SqliteMigrationRunnerOptions,
 } from "./migrate";
+import {
+  buildBackupPath as buildSqliteBackupPath,
+  getDbParentDir,
+} from "./paths";
 
 export interface SqliteCoordinatorOptions extends SqliteMigrationRunnerOptions {
   dbPath: string;
@@ -20,6 +24,7 @@ export class SqliteDbCoordinator {
   private readonly runner: SqliteMigrationRunner;
 
   constructor(private readonly options: SqliteCoordinatorOptions) {
+    mkdirSync(getDbParentDir(options.dbPath), { recursive: true });
     this.db = new Database(options.dbPath, { create: true });
     this.applyPragmas();
     this.runner = createMigrationRunner(this.db, {
@@ -58,6 +63,8 @@ export class SqliteDbCoordinator {
         ok: true,
         mode: "sqlite",
         dbPath: this.options.dbPath,
+        lastUpdatedAt:
+          this.options.now?.().toISOString() ?? new Date().toISOString(),
         migration: {
           latestAvailableId: status.available.at(-1)?.id,
           latestAppliedId: status.applied.at(-1)?.id,
@@ -69,6 +76,8 @@ export class SqliteDbCoordinator {
         ok: false,
         mode: "sqlite",
         dbPath: this.options.dbPath,
+        lastUpdatedAt:
+          this.options.now?.().toISOString() ?? new Date().toISOString(),
         migration: {
           pendingCount: 0,
         },
@@ -96,10 +105,9 @@ export function buildBackupPath(
   backupDir: string,
   now: Date = new Date(),
 ): string {
-  const stamp = now.toISOString().replaceAll(":", "-");
-  return join(backupDir, `looper-${stamp}.sqlite`);
+  return buildSqliteBackupPath(backupDir, now);
 }
 
 export async function ensureDbParentDir(dbPath: string): Promise<void> {
-  await mkdir(dirname(dbPath), { recursive: true });
+  await mkdir(getDbParentDir(dbPath), { recursive: true });
 }

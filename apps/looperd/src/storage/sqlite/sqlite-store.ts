@@ -3,6 +3,7 @@ import type {
   EventLogRecord,
   LockRecord,
   LoopRecord,
+  ProjectRecord,
   PullRequestSnapshotRecord,
   RunRecord,
   TaskItemRecord,
@@ -14,12 +15,15 @@ export interface SqliteStoreOptions {
   dbPath: string;
   backupDir?: string;
   migrationsDir?: string;
+  now?: () => Date;
 }
 
 export class SqliteStore implements Store {
   private readonly coordinator: SqliteDbCoordinator;
+  private readonly now: () => Date;
 
   constructor(options: SqliteStoreOptions) {
+    this.now = options.now ?? (() => new Date());
     this.coordinator = new SqliteDbCoordinator(options);
   }
 
@@ -37,6 +41,45 @@ export class SqliteStore implements Store {
   public withTransaction<T>(fn: (store: Store) => T): T {
     return this.coordinator.withTransaction(() => fn(this));
   }
+
+  public readonly projects = {
+    upsert: (record: ProjectRecord): void => {
+      this.coordinator.db
+        .query(`
+          INSERT INTO projects (id, name, repo_path, base_branch, archived, metadata_json, created_at, updated_at)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+          ON CONFLICT(id) DO UPDATE SET
+            name=excluded.name,
+            repo_path=excluded.repo_path,
+            base_branch=excluded.base_branch,
+            archived=excluded.archived,
+            metadata_json=excluded.metadata_json,
+            updated_at=excluded.updated_at
+        `)
+        .run(
+          record.id,
+          record.name,
+          record.repoPath,
+          record.baseBranch ?? null,
+          record.archived ? 1 : 0,
+          record.metadataJson ?? null,
+          record.createdAt,
+          record.updatedAt,
+        );
+    },
+    getById: (id: string): ProjectRecord | null => {
+      const row = this.coordinator.db
+        .query("SELECT * FROM projects WHERE id = ?1")
+        .get(id) as Record<string, unknown> | null;
+      return row ? mapProject(row) : null;
+    },
+    list: (): ProjectRecord[] => {
+      const rows = this.coordinator.db
+        .query("SELECT * FROM projects ORDER BY updated_at DESC")
+        .all() as Record<string, unknown>[];
+      return rows.map(mapProject);
+    },
+  };
 
   public readonly loops = {
     upsert: (record: LoopRecord): void => {
@@ -232,8 +275,7 @@ export class SqliteStore implements Store {
             pr_number=excluded.pr_number,
             head_sha=excluded.head_sha,
             payload_json=excluded.payload_json,
-            captured_at=excluded.captured_at,
-            created_at=excluded.created_at
+            captured_at=excluded.captured_at
         `)
         .run(
           record.id,
@@ -285,7 +327,7 @@ export class SqliteStore implements Store {
 
   public readonly locks = {
     acquire: (record: LockRecord): boolean => {
-      const now = new Date().toISOString();
+      const now = this.now().toISOString();
       const result = this.coordinator.db
         .query(`
           INSERT INTO locks (key, owner, reason, expires_at, created_at, updated_at)
@@ -331,6 +373,19 @@ export class SqliteStore implements Store {
     getMigrationStatus: () => this.coordinator.getMigrationStatus(),
     healthcheck: () => this.coordinator.healthcheck(),
     backup: () => this.coordinator.backup(),
+  };
+}
+
+function mapProject(row: Record<string, unknown>): ProjectRecord {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    repoPath: String(row.repo_path),
+    baseBranch: asNullableString(row.base_branch),
+    archived: asBoolean(row.archived),
+    metadataJson: asNullableString(row.metadata_json),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
   };
 }
 
@@ -449,4 +504,8 @@ function asNullableNumber(value: unknown): number | null {
   }
 
   return Number(value);
+}
+
+function asBoolean(value: unknown): boolean {
+  return value === 1 || value === true || value === "1";
 }

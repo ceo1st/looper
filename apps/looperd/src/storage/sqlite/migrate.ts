@@ -1,11 +1,12 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdirSync } from "node:fs";
 import { basename, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { Database } from "bun:sqlite";
 
 import type { MigrationRunResult, MigrationStatus } from "../types";
-import { buildBackupPath } from "./db";
+import { buildBackupPath } from "./paths";
 
 const MIGRATION_FILE_RE = /^(\d{4}_[a-zA-Z0-9_\-]+)\.sql$/;
 
@@ -17,6 +18,7 @@ export interface SqliteMigrationRunnerOptions {
 }
 
 export interface SqliteMigrationRunner {
+  listPending(): string[];
   status(): MigrationStatus;
   runPending(options?: { requireBackup?: boolean }): MigrationRunResult;
   backup(): string;
@@ -37,10 +39,12 @@ class InternalSqliteMigrationRunner implements SqliteMigrationRunner {
     private readonly db: Database,
     private readonly options: SqliteMigrationRunnerOptions,
   ) {
-    this.migrationsDir =
-      options.migrationsDir ??
-      new URL("./migrations", import.meta.url).pathname;
+    this.migrationsDir = options.migrationsDir ?? resolveDefaultMigrationsDir();
     this.now = options.now ?? (() => new Date());
+  }
+
+  public listPending(): string[] {
+    return this.status().pending.map((migration) => migration.id);
   }
 
   public status(): MigrationStatus {
@@ -140,4 +144,15 @@ class InternalSqliteMigrationRunner implements SqliteMigrationRunner {
       )
       .all() as Array<{ id: string; appliedAt: string }>;
   }
+}
+
+function resolveDefaultMigrationsDir(): string {
+  const colocatedDir = fileURLToPath(new URL("./migrations", import.meta.url));
+  if (existsSync(colocatedDir)) {
+    return colocatedDir;
+  }
+
+  return fileURLToPath(
+    new URL("../../../src/storage/sqlite/migrations", import.meta.url),
+  );
 }

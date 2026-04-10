@@ -19,21 +19,21 @@
 
 ## 3. SQLite 与持久化基础
 
-- [ ] 接入 `bun:sqlite`
-- [ ] 创建 migration runner
-- [ ] 编写 `0001_init.sql`
-- [ ] 建立最小核心表：`loops`
-- [ ] 建立最小核心表：`runs`
-- [ ] 建立最小核心表：`locks`
-- [ ] 建立最小核心表：`event_logs`
-- [ ] 建立最小核心表：`pull_request_snapshots`
-- [ ] 建立最小核心表：`tasks`
-- [ ] 建立最小核心表：`task_items`
-- [ ] 为 `loops` 表加入 target 字段（`target_type` / `target_id` / `repo` / `pr_number`）
-- [ ] 实现数据库初始化与 WAL / foreign_keys / busy_timeout 设置
-- [ ] 实现数据库备份入口
-- [ ] 先用 `db.ts` + 具名函数落地最小读写能力
-- [ ] 为关键写操作提供事务封装
+- [x] 接入 `bun:sqlite`
+- [x] 创建 migration runner
+- [x] 编写 `0001_init.sql`
+- [x] 建立最小核心表：`loops`
+- [x] 建立最小核心表：`runs`
+- [x] 建立最小核心表：`locks`
+- [x] 建立最小核心表：`event_logs`
+- [x] 建立最小核心表：`pull_request_snapshots`
+- [x] 建立最小核心表：`tasks`
+- [x] 建立最小核心表：`task_items`
+- [x] 为 `loops` 表加入 target 字段（`target_type` / `target_id` / `repo` / `pr_number`）
+- [x] 实现数据库初始化与 WAL / foreign_keys / busy_timeout 设置
+- [x] 实现数据库备份入口
+- [x] 先用 `db.ts` + 具名函数落地最小读写能力
+- [x] 为关键写操作提供事务封装
 
 ## 4. 核心领域与状态
 

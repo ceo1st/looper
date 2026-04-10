@@ -3,6 +3,20 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS projects (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  repo_path TEXT NOT NULL,
+  base_branch TEXT,
+  archived INTEGER NOT NULL DEFAULT 0,
+  metadata_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (archived IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_projects_archived ON projects (archived);
+
 CREATE TABLE IF NOT EXISTS loops (
   id TEXT PRIMARY KEY,
   type TEXT NOT NULL,
