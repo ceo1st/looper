@@ -149,17 +149,17 @@
 
 ## 10. Reviewer Loop（先打通第一条链路）
 
-- [ ] 实现 reviewer discover
-- [ ] 实现 reviewer filter
-- [ ] 实现 reviewer claim
-- [ ] 实现 reviewer snapshot
-- [ ] 实现 reviewer review（调用 agent）
-- [ ] 实现 reviewer publish（回写 GitHub review）
-- [ ] 保证 publish 失败时可重试而不重复 review 同一 head sha
-- [ ] 为 reviewer loop 写入 run / event / snapshot / lock 状态
-- [ ] 实现 reviewer loop 的线性执行主流程
-- [ ] 实现 reviewer loop 的失败处理与重试
-- [ ] 实现 reviewer loop 的最小恢复语义（从最后成功 step 的下一步继续）
+- [x] 实现 reviewer discover
+- [x] 实现 reviewer filter
+- [x] 实现 reviewer claim
+- [x] 实现 reviewer snapshot
+- [x] 实现 reviewer review（调用 agent）
+- [x] 实现 reviewer publish（回写 GitHub review）
+- [x] 保证 publish 失败时可重试而不重复 review 同一 head sha
+- [x] 为 reviewer loop 写入 run / event / snapshot / lock 状态
+- [x] 实现 reviewer loop 的线性执行主流程
+- [x] 实现 reviewer loop 的失败处理与重试
+- [x] 实现 reviewer loop 的最小恢复语义（从最后成功 step 的下一步继续）
 
 ## 11. Worker Loop（MVP 基础版）
 
@@ -214,7 +214,7 @@
 - [ ] 为 SQLite 关键读写写测试
 - [ ] 为锁语义写测试
 - [ ] 为 scheduler 重试与退避写测试
-- [ ] 为 reviewer loop 第一条链路写集成测试
+- [x] 为 reviewer loop 第一条链路写集成测试
 - [ ] 为 worker 基础链路写集成测试
 - [ ] 为 fixer 基础链路写集成测试
 - [ ] 为恢复流程写测试
