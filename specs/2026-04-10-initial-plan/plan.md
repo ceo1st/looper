@@ -10,12 +10,12 @@
 
 ## 2. 配置与启动
 
-- [ ] 定义 `LooperConfig` 与 `AgentConfig` 的 TypeScript 类型
-- [ ] 实现配置加载顺序（CLI / env / `~/.looper/config.json`）
-- [ ] 实现配置校验
-- [ ] 实现工具路径探测（`bun`、`git`、`gh`、`osascript`）
-- [ ] 实现 `looperd` foreground 启动入口
-- [ ] 实现启动日志初始化
+- [x] 定义 `LooperConfig` 与 `AgentConfig` 的 TypeScript 类型
+- [x] 实现配置加载顺序（CLI / env / `~/.looper/config.json`）
+- [x] 实现配置校验
+- [x] 实现工具路径探测（`bun`、`git`、`gh`、`osascript`）
+- [x] 实现 `looperd` foreground 启动入口
+- [x] 实现启动日志初始化
 
 ## 3. SQLite 与持久化基础
 
