@@ -1,7 +1,9 @@
 import type {
+  AgentExecutionRecord,
   EventLogRecord,
   LockRecord,
   LoopRecord,
+  NotificationRecord,
   MigrationStatus,
   ProjectRecord,
   PullRequestSnapshotRecord,
@@ -9,6 +11,7 @@ import type {
   StorageHealth,
   TaskItemRecord,
   TaskRecord,
+  WorktreeRecord,
 } from "./types";
 
 export interface Store {
@@ -62,6 +65,30 @@ export interface Store {
     release(key: string): void;
     get(key: string): LockRecord | null;
     listExpired(nowIso: string): LockRecord[];
+  };
+
+  agentExecutions: {
+    upsert(record: AgentExecutionRecord): void;
+    getById(id: string): AgentExecutionRecord | null;
+    list(): AgentExecutionRecord[];
+    listActive(): AgentExecutionRecord[];
+  };
+
+  notifications: {
+    upsert(record: NotificationRecord): void;
+    getById(id: string): NotificationRecord | null;
+    list(limit?: number): NotificationRecord[];
+    getLatestByDedupe(
+      channel: string,
+      dedupeKey: string,
+    ): NotificationRecord | null;
+  };
+
+  worktrees: {
+    upsert(record: WorktreeRecord): void;
+    getById(id: string): WorktreeRecord | null;
+    getByBranch(projectId: string, branch: string): WorktreeRecord | null;
+    listByProject(projectId: string): WorktreeRecord[];
   };
 
   schema: {

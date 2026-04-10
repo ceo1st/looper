@@ -1,13 +1,16 @@
 import type { Store } from "../store";
 import type {
+  AgentExecutionRecord,
   EventLogRecord,
   LockRecord,
   LoopRecord,
+  NotificationRecord,
   ProjectRecord,
   PullRequestSnapshotRecord,
   RunRecord,
   TaskItemRecord,
   TaskRecord,
+  WorktreeRecord,
 } from "../types";
 import { SqliteDbCoordinator } from "./db";
 
@@ -419,6 +422,210 @@ export class SqliteStore implements Store {
     },
   };
 
+  public readonly agentExecutions = {
+    upsert: (record: AgentExecutionRecord): void => {
+      this.coordinator.db
+        .query(`
+          INSERT INTO agent_executions (id, project_id, loop_id, run_id, task_id, vendor, status, pid, command_json, cwd, summary, parse_status, completion_signal, heartbeat_count, last_heartbeat_at, output_json, error_message, started_at, ended_at, metadata_json, created_at, updated_at)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+          ON CONFLICT(id) DO UPDATE SET
+            project_id=excluded.project_id,
+            loop_id=excluded.loop_id,
+            run_id=excluded.run_id,
+            task_id=excluded.task_id,
+            vendor=excluded.vendor,
+            status=excluded.status,
+            pid=excluded.pid,
+            command_json=excluded.command_json,
+            cwd=excluded.cwd,
+            summary=excluded.summary,
+            parse_status=excluded.parse_status,
+            completion_signal=excluded.completion_signal,
+            heartbeat_count=excluded.heartbeat_count,
+            last_heartbeat_at=excluded.last_heartbeat_at,
+            output_json=excluded.output_json,
+            error_message=excluded.error_message,
+            started_at=excluded.started_at,
+            ended_at=excluded.ended_at,
+            metadata_json=excluded.metadata_json,
+            updated_at=excluded.updated_at
+        `)
+        .run(
+          record.id,
+          record.projectId ?? null,
+          record.loopId ?? null,
+          record.runId ?? null,
+          record.taskId ?? null,
+          record.vendor,
+          record.status,
+          record.pid ?? null,
+          record.commandJson,
+          record.cwd,
+          record.summary ?? null,
+          record.parseStatus ?? null,
+          record.completionSignal ?? null,
+          record.heartbeatCount,
+          record.lastHeartbeatAt ?? null,
+          record.outputJson ?? null,
+          record.errorMessage ?? null,
+          record.startedAt,
+          record.endedAt ?? null,
+          record.metadataJson ?? null,
+          record.createdAt,
+          record.updatedAt,
+        );
+    },
+    getById: (id: string): AgentExecutionRecord | null => {
+      const row = this.coordinator.db
+        .query("SELECT * FROM agent_executions WHERE id = ?1")
+        .get(id) as Record<string, unknown> | null;
+      return row ? mapAgentExecution(row) : null;
+    },
+    list: (): AgentExecutionRecord[] => {
+      return this.coordinator.db
+        .query("SELECT * FROM agent_executions ORDER BY started_at DESC")
+        .all()
+        .map((row) => mapAgentExecution(row as Record<string, unknown>));
+    },
+    listActive: (): AgentExecutionRecord[] => {
+      return this.coordinator.db
+        .query(
+          "SELECT * FROM agent_executions WHERE status IN ('running', 'cancelling') ORDER BY started_at DESC",
+        )
+        .all()
+        .map((row) => mapAgentExecution(row as Record<string, unknown>));
+    },
+  };
+
+  public readonly notifications = {
+    upsert: (record: NotificationRecord): void => {
+      this.coordinator.db
+        .query(`
+          INSERT INTO notifications (id, project_id, loop_id, run_id, entity_type, entity_id, channel, level, title, subtitle, body, status, dedupe_key, error_message, payload_json, sent_at, created_at, updated_at)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+          ON CONFLICT(id) DO UPDATE SET
+            project_id=excluded.project_id,
+            loop_id=excluded.loop_id,
+            run_id=excluded.run_id,
+            entity_type=excluded.entity_type,
+            entity_id=excluded.entity_id,
+            channel=excluded.channel,
+            level=excluded.level,
+            title=excluded.title,
+            subtitle=excluded.subtitle,
+            body=excluded.body,
+            status=excluded.status,
+            dedupe_key=excluded.dedupe_key,
+            error_message=excluded.error_message,
+            payload_json=excluded.payload_json,
+            sent_at=excluded.sent_at,
+            updated_at=excluded.updated_at
+        `)
+        .run(
+          record.id,
+          record.projectId ?? null,
+          record.loopId ?? null,
+          record.runId ?? null,
+          record.entityType ?? null,
+          record.entityId ?? null,
+          record.channel,
+          record.level,
+          record.title,
+          record.subtitle ?? null,
+          record.body,
+          record.status,
+          record.dedupeKey ?? null,
+          record.errorMessage ?? null,
+          record.payloadJson ?? null,
+          record.sentAt ?? null,
+          record.createdAt,
+          record.updatedAt,
+        );
+    },
+    getById: (id: string): NotificationRecord | null => {
+      const row = this.coordinator.db
+        .query("SELECT * FROM notifications WHERE id = ?1")
+        .get(id) as Record<string, unknown> | null;
+      return row ? mapNotification(row) : null;
+    },
+    list: (limit = 100): NotificationRecord[] => {
+      return this.coordinator.db
+        .query("SELECT * FROM notifications ORDER BY created_at DESC LIMIT ?1")
+        .all(limit)
+        .map((row) => mapNotification(row as Record<string, unknown>));
+    },
+    getLatestByDedupe: (
+      channel: string,
+      dedupeKey: string,
+    ): NotificationRecord | null => {
+      const row = this.coordinator.db
+        .query(
+          "SELECT * FROM notifications WHERE channel = ?1 AND dedupe_key = ?2 ORDER BY created_at DESC LIMIT 1",
+        )
+        .get(channel, dedupeKey) as Record<string, unknown> | null;
+      return row ? mapNotification(row) : null;
+    },
+  };
+
+  public readonly worktrees = {
+    upsert: (record: WorktreeRecord): void => {
+      this.coordinator.db
+        .query(`
+          INSERT INTO worktrees (id, project_id, task_id, repo_path, worktree_path, branch, base_branch, status, head_sha, metadata_json, created_at, updated_at, cleaned_at)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+          ON CONFLICT(id) DO UPDATE SET
+            project_id=excluded.project_id,
+            task_id=excluded.task_id,
+            repo_path=excluded.repo_path,
+            worktree_path=excluded.worktree_path,
+            branch=excluded.branch,
+            base_branch=excluded.base_branch,
+            status=excluded.status,
+            head_sha=excluded.head_sha,
+            metadata_json=excluded.metadata_json,
+            updated_at=excluded.updated_at,
+            cleaned_at=excluded.cleaned_at
+        `)
+        .run(
+          record.id,
+          record.projectId,
+          record.taskId ?? null,
+          record.repoPath,
+          record.worktreePath,
+          record.branch,
+          record.baseBranch,
+          record.status,
+          record.headSha ?? null,
+          record.metadataJson ?? null,
+          record.createdAt,
+          record.updatedAt,
+          record.cleanedAt ?? null,
+        );
+    },
+    getById: (id: string): WorktreeRecord | null => {
+      const row = this.coordinator.db
+        .query("SELECT * FROM worktrees WHERE id = ?1")
+        .get(id) as Record<string, unknown> | null;
+      return row ? mapWorktree(row) : null;
+    },
+    getByBranch: (projectId: string, branch: string): WorktreeRecord | null => {
+      const row = this.coordinator.db
+        .query(
+          "SELECT * FROM worktrees WHERE project_id = ?1 AND branch = ?2 LIMIT 1",
+        )
+        .get(projectId, branch) as Record<string, unknown> | null;
+      return row ? mapWorktree(row) : null;
+    },
+    listByProject: (projectId: string): WorktreeRecord[] => {
+      return this.coordinator.db
+        .query(
+          "SELECT * FROM worktrees WHERE project_id = ?1 ORDER BY updated_at DESC",
+        )
+        .all(projectId)
+        .map((row) => mapWorktree(row as Record<string, unknown>));
+    },
+  };
+
   public readonly schema = {
     getMigrationStatus: () => this.coordinator.getMigrationStatus(),
     healthcheck: () => this.coordinator.healthcheck(),
@@ -556,6 +763,74 @@ function mapLock(row: Record<string, unknown>): LockRecord {
     expiresAt: String(row.expires_at),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
+  };
+}
+
+function mapAgentExecution(row: Record<string, unknown>): AgentExecutionRecord {
+  return {
+    id: String(row.id),
+    projectId: asNullableString(row.project_id),
+    loopId: asNullableString(row.loop_id),
+    runId: asNullableString(row.run_id),
+    taskId: asNullableString(row.task_id),
+    vendor: String(row.vendor),
+    status: String(row.status),
+    pid: asNullableNumber(row.pid),
+    commandJson: String(row.command_json),
+    cwd: String(row.cwd),
+    summary: asNullableString(row.summary),
+    parseStatus: asNullableString(row.parse_status),
+    completionSignal: asNullableString(row.completion_signal),
+    heartbeatCount: Number(row.heartbeat_count),
+    lastHeartbeatAt: asNullableString(row.last_heartbeat_at),
+    outputJson: asNullableString(row.output_json),
+    errorMessage: asNullableString(row.error_message),
+    startedAt: String(row.started_at),
+    endedAt: asNullableString(row.ended_at),
+    metadataJson: asNullableString(row.metadata_json),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function mapNotification(row: Record<string, unknown>): NotificationRecord {
+  return {
+    id: String(row.id),
+    projectId: asNullableString(row.project_id),
+    loopId: asNullableString(row.loop_id),
+    runId: asNullableString(row.run_id),
+    entityType: asNullableString(row.entity_type),
+    entityId: asNullableString(row.entity_id),
+    channel: String(row.channel),
+    level: String(row.level),
+    title: String(row.title),
+    subtitle: asNullableString(row.subtitle),
+    body: String(row.body),
+    status: String(row.status),
+    dedupeKey: asNullableString(row.dedupe_key),
+    errorMessage: asNullableString(row.error_message),
+    payloadJson: asNullableString(row.payload_json),
+    sentAt: asNullableString(row.sent_at),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function mapWorktree(row: Record<string, unknown>): WorktreeRecord {
+  return {
+    id: String(row.id),
+    projectId: String(row.project_id),
+    taskId: asNullableString(row.task_id),
+    repoPath: String(row.repo_path),
+    worktreePath: String(row.worktree_path),
+    branch: String(row.branch),
+    baseBranch: String(row.base_branch),
+    status: String(row.status),
+    headSha: asNullableString(row.head_sha),
+    metadataJson: asNullableString(row.metadata_json),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+    cleanedAt: asNullableString(row.cleaned_at),
   };
 }
 

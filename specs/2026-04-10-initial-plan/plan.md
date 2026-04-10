@@ -103,36 +103,36 @@
 
 ### 8.1 GitHub
 
-- [ ] 封装 `gh pr list`
-- [ ] 封装 `gh pr view`
-- [ ] 封装 `gh pr diff` 或等价 snapshot 获取方式
-- [ ] 封装 `gh pr review`
-- [ ] 封装 PR 评论 / 状态读取的最小能力
+- [x] 封装 `gh pr list`
+- [x] 封装 `gh pr view`
+- [x] 封装 `gh pr diff` 或等价 snapshot 获取方式
+- [x] 封装 `gh pr review`
+- [x] 封装 PR 评论 / 状态读取的最小能力
 
 ### 8.2 Git / Worktree
 
-- [ ] 封装 worktree 创建
-- [ ] 封装 worktree 查询与恢复
-- [ ] 封装分支创建与绑定
-- [ ] 封装工作区清理
-- [ ] 实现禁止直接修改受保护分支的保护逻辑
+- [x] 封装 worktree 创建
+- [x] 封装 worktree 查询与恢复
+- [x] 封装分支创建与绑定
+- [x] 封装工作区清理
+- [x] 实现禁止直接修改受保护分支的保护逻辑
 
 ### 8.3 Agent
 
-- [ ] 实现单一 Agent 适配入口
-- [ ] 实现 agent 子进程启动
-- [ ] 实现 agent 超时控制
-- [ ] 实现 agent 取消与 kill
-- [ ] 实现 stdout / stderr 捕获
-- [ ] 实现 agent 结果解析
-- [ ] 实现 agent 执行审计落盘
-- [ ] 记录 agent pid 供恢复时清理
+- [x] 实现单一 Agent 适配入口
+- [x] 实现 agent 子进程启动
+- [x] 实现 agent 超时控制
+- [x] 实现 agent 取消与 kill
+- [x] 实现 stdout / stderr 捕获
+- [x] 实现 agent 结果解析
+- [x] 实现 agent 执行审计落盘
+- [x] 记录 agent pid 供恢复时清理
 
 ### 8.4 通知
 
-- [ ] 实现应用内通知落盘
-- [ ] 实现 macOS `osascript` 通知
-- [ ] 实现关键失败 / action required 场景通知
+- [x] 实现应用内通知落盘
+- [x] 实现 macOS `osascript` 通知
+- [x] 实现关键失败 / action required 场景通知
 
 ## 9. Scheduler / Queue 基础
 

@@ -149,6 +149,65 @@ describe("SqliteStore", () => {
         updatedAt: now,
       }),
     ).toBe(true);
+    store.agentExecutions.upsert({
+      id: "agent_exec_1",
+      projectId: "project_1",
+      loopId: "loop_1",
+      runId: "run_1",
+      taskId: "task_1",
+      vendor: "opencode",
+      status: "running",
+      pid: 12345,
+      commandJson: '{"command":"opencode","args":["run"]}',
+      cwd: "/tmp/looper",
+      summary: null,
+      parseStatus: null,
+      completionSignal: null,
+      heartbeatCount: 3,
+      lastHeartbeatAt: now,
+      outputJson: '{"stdout":"ok","stderr":""}',
+      errorMessage: null,
+      startedAt: now,
+      endedAt: null,
+      metadataJson: '{"idempotencyKey":"abc"}',
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.notifications.upsert({
+      id: "notification_1",
+      projectId: "project_1",
+      loopId: "loop_1",
+      runId: "run_1",
+      entityType: "task",
+      entityId: "task_1",
+      channel: "in_app",
+      level: "info",
+      title: "Task updated",
+      subtitle: "task_1",
+      body: "Checklist advanced",
+      status: "success",
+      dedupeKey: "task.updated:task:task_1",
+      errorMessage: null,
+      payloadJson: '{"title":"Task updated"}',
+      sentAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.worktrees.upsert({
+      id: "worktree_1",
+      projectId: "project_1",
+      taskId: "task_1",
+      repoPath: "/tmp/looper",
+      worktreePath: "/tmp/looper-worktrees/task-1",
+      branch: "task/task-1",
+      baseBranch: "main",
+      status: "active",
+      headSha: "abc123",
+      metadataJson: '{"recovered":false}',
+      createdAt: now,
+      updatedAt: now,
+      cleanedAt: null,
+    });
 
     expect(store.projects.getById("project_1")).toEqual({
       id: "project_1",
@@ -182,10 +241,22 @@ describe("SqliteStore", () => {
       "reviewer_1",
     );
     expect(store.locks.get("pr:acme/looper:42")?.owner).toBe("reviewer-loop");
+    expect(store.agentExecutions.listActive()).toHaveLength(1);
+    expect(store.agentExecutions.getById("agent_exec_1")?.pid).toBe(12345);
+    expect(store.notifications.list(1)[0]?.channel).toBe("in_app");
+    expect(
+      store.notifications.getLatestByDedupe(
+        "in_app",
+        "task.updated:task:task_1",
+      )?.status,
+    ).toBe("success");
+    expect(
+      store.worktrees.getByBranch("project_1", "task/task-1")?.status,
+    ).toBe("active");
 
     const health = store.schema.healthcheck();
     expect(health.ok).toBe(true);
-    expect(health.migration.latestAppliedId).toBe("0001_init");
+    expect(health.migration.latestAppliedId).toBe("0002_integrations");
     expect(health.lastUpdatedAt).toBeString();
 
     const backupPath = store.schema.backup();

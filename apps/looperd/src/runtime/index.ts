@@ -1,11 +1,18 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { LooperConfig } from "../config/index";
 import type { Logger } from "../bootstrap/logger";
+import { NotificationGateway } from "../infra/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
-import type { EventLogRecord, LoopRecord, RunRecord } from "../storage/types";
+import type {
+  AgentExecutionRecord,
+  EventLogRecord,
+  LoopRecord,
+  RunRecord,
+} from "../storage/types";
 import { createLooperdApiServer, type LooperdApiServer } from "../server/index";
 
 export interface RecoverySummary {
@@ -34,10 +41,17 @@ export interface CreateLooperdRuntimeOptions {
   logger: Logger;
 }
 
-const MIGRATIONS_DIR = join(
-  dirname(fileURLToPath(import.meta.url)),
-  "../storage/sqlite/migrations",
-);
+const MIGRATIONS_DIR = resolveMigrationsDir();
+
+function resolveMigrationsDir(): string {
+  const currentDir = dirname(fileURLToPath(import.meta.url));
+  const distPath = join(currentDir, "../storage/sqlite/migrations");
+  if (existsSync(distPath)) {
+    return distPath;
+  }
+
+  return join(currentDir, "../../src/storage/sqlite/migrations");
+}
 
 class BasicLooperdRuntime implements LooperdRuntime {
   public startedAt?: Date;
@@ -108,6 +122,31 @@ class BasicLooperdRuntime implements LooperdRuntime {
         port: this.server.getPort() ?? this.options.config.server.port,
         recoverySummary: this.recoverySummary,
       });
+
+      await this.notifySystemEvent({
+        level: "success",
+        title: "looperd 状态变更",
+        subtitle: "system",
+        body: "服务已启动",
+        entityType: "notification",
+        entityId: "looperd.started",
+        dedupeKey: "looperd.started:system:looperd",
+      });
+
+      if (
+        this.recoverySummary.interruptedRunsMarked > 0 ||
+        this.recoverySummary.orphanAgentCleanup.cleanedCount > 0
+      ) {
+        await this.notifySystemEvent({
+          level: "info",
+          title: "looperd 状态变更",
+          subtitle: "system",
+          body: "服务恢复完成",
+          entityType: "notification",
+          entityId: "looperd.recovered",
+          dedupeKey: "looperd.recovered:system:looperd",
+        });
+      }
     } catch (error) {
       this.server = undefined;
       this.store?.close();
@@ -188,8 +227,6 @@ class BasicLooperdRuntime implements LooperdRuntime {
       orphanAgentCleanup: {
         attempted: true,
         cleanedCount: 0,
-        warning:
-          "No agent process registry is configured yet; skipping orphan cleanup",
       },
       expiredLocksReleased: 0,
       interruptedRunsMarked: 0,
@@ -197,9 +234,14 @@ class BasicLooperdRuntime implements LooperdRuntime {
       eventsWritten: 0,
     };
 
-    this.options.logger.warn("looperd recovery skipped orphan agent cleanup", {
-      reason: summary.orphanAgentCleanup.warning,
-    });
+    const runningExecutions = this.store.agentExecutions.listActive();
+    for (const execution of runningExecutions) {
+      const cleaned = this.tryCleanupOrphanExecution(execution, nowIso);
+      if (cleaned) {
+        summary.orphanAgentCleanup.cleanedCount += 1;
+        eventsWritten += 1;
+      }
+    }
 
     const expiredLocks = this.store.locks.listExpired(nowIso);
     for (const lock of expiredLocks) {
@@ -297,6 +339,71 @@ class BasicLooperdRuntime implements LooperdRuntime {
     summary.eventsWritten = eventsWritten;
 
     return summary;
+  }
+
+  private tryCleanupOrphanExecution(
+    execution: AgentExecutionRecord,
+    nowIso: string,
+  ): boolean {
+    if (!execution.pid) {
+      return false;
+    }
+
+    try {
+      process.kill(execution.pid, "SIGTERM");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+        this.options.logger.warn("failed to cleanup orphan agent execution", {
+          executionId: execution.id,
+          pid: execution.pid,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    this.store?.agentExecutions.upsert({
+      ...execution,
+      status: "killed",
+      errorMessage: execution.errorMessage ?? "Killed during looperd recovery",
+      endedAt: nowIso,
+      updatedAt: nowIso,
+    });
+    this.appendEvent({
+      id: randomUUID(),
+      eventType: "agent.killed",
+      projectId: execution.projectId ?? undefined,
+      loopId: execution.loopId ?? undefined,
+      runId: execution.runId ?? undefined,
+      entityType: "agent_execution",
+      entityId: execution.id,
+      payloadJson: JSON.stringify({
+        pid: execution.pid,
+        recoveredAt: nowIso,
+      }),
+      createdAt: nowIso,
+    });
+    return true;
+  }
+
+  private async notifySystemEvent(input: {
+    level: "info" | "warning" | "action_required" | "success" | "failure";
+    title: string;
+    subtitle: string;
+    body: string;
+    entityType: string;
+    entityId: string;
+    dedupeKey: string;
+  }): Promise<void> {
+    if (!this.store) {
+      return;
+    }
+
+    const gateway = new NotificationGateway({
+      config: this.options.config.notifications,
+      osascriptPath: this.options.config.tools.osascriptPath,
+      store: this.store,
+    });
+    await gateway.notify(input);
   }
 
   private appendEvent(record: EventLogRecord): void {

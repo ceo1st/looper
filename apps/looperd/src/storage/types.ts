@@ -165,3 +165,65 @@ export interface LockRecord {
   createdAt: string;
   updatedAt: string;
 }
+
+export interface AgentExecutionRecord {
+  id: string;
+  projectId?: string | null;
+  loopId?: string | null;
+  runId?: string | null;
+  taskId?: string | null;
+  vendor: string;
+  status: string;
+  pid?: number | null;
+  commandJson: string;
+  cwd: string;
+  summary?: string | null;
+  parseStatus?: string | null;
+  completionSignal?: string | null;
+  heartbeatCount: number;
+  lastHeartbeatAt?: string | null;
+  outputJson?: string | null;
+  errorMessage?: string | null;
+  startedAt: string;
+  endedAt?: string | null;
+  metadataJson?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface NotificationRecord {
+  id: string;
+  projectId?: string | null;
+  loopId?: string | null;
+  runId?: string | null;
+  entityType?: string | null;
+  entityId?: string | null;
+  channel: string;
+  level: string;
+  title: string;
+  subtitle?: string | null;
+  body: string;
+  status: string;
+  dedupeKey?: string | null;
+  errorMessage?: string | null;
+  payloadJson?: string | null;
+  sentAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WorktreeRecord {
+  id: string;
+  projectId: string;
+  taskId?: string | null;
+  repoPath: string;
+  worktreePath: string;
+  branch: string;
+  baseBranch: string;
+  status: string;
+  headSha?: string | null;
+  metadataJson?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  cleanedAt?: string | null;
+}

@@ -150,7 +150,7 @@ describe("createLooperdApi", () => {
 
     expect(statusResponse.status).toBe(200);
     expect(statusBody.ok).toBe(true);
-    expect(statusBody.data.storage.schemaVersion).toBe("0001_init");
+    expect(statusBody.data.storage.schemaVersion).toBe("0002_integrations");
 
     const configResponse = await api.handle(
       new Request("http://localhost/api/v1/config"),
