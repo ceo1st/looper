@@ -383,12 +383,7 @@ export class GitWorktreeGateway {
     message: string;
   }): Promise<{ commitSha: string }> {
     await this.runGit(["add", "-A"], input.worktreePath);
-    await this.runGit(["commit", "-m", input.message], input.worktreePath, {
-      GIT_AUTHOR_NAME: "looperd",
-      GIT_AUTHOR_EMAIL: "looperd@example.invalid",
-      GIT_COMMITTER_NAME: "looperd",
-      GIT_COMMITTER_EMAIL: "looperd@example.invalid",
-    });
+    await this.runGit(["commit", "-m", input.message], input.worktreePath);
 
     return {
       commitSha: requireString(

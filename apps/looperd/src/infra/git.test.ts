@@ -126,6 +126,10 @@ describe("GitWorktreeGateway", () => {
     expect(commit.commitSha).toBeTruthy();
     expect(inspectAfterCommit.hasUncommittedChanges).toBe(false);
     expect(inspectAfterCommit.newCommitShas).toHaveLength(1);
+    const commitAuthor = (
+      await runGit(["log", "-1", "--format=%an <%ae>"], worktree.worktreePath)
+    ).trim();
+    expect(commitAuthor).toBe("Looper Test <test@example.com>");
     const globalEmailAfter = (
       await runGit(
         ["config", "--global", "--get", "user.email"],
