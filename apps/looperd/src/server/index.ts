@@ -3,9 +3,6 @@ import { randomUUID } from "node:crypto";
 import type { Logger } from "../bootstrap/logger";
 import type { LooperConfig } from "../config/index";
 import {
-  LOOP_STATUSES,
-  LOOP_TARGET_TYPES,
-  LOOP_TYPES,
   assertTaskStatusTransition,
   assertUniqueActiveLoop,
   createLoop,
@@ -497,15 +494,6 @@ function mutateLoopStatus(
   }
 
   const now = new Date().toISOString();
-  if (status === "paused") {
-    new SchedulerQueue({
-      store: context.store,
-      retryMaxAttempts: context.config.scheduler.retryMaxAttempts,
-      retryBaseDelayMs: context.config.scheduler.retryBaseDelayMs,
-      now: () => new Date(now),
-    }).cancelByLoop(loopId, "loop paused");
-  }
-
   const updated: typeof loop = {
     ...loop,
     status,
@@ -650,14 +638,8 @@ function startTask(context: LooperdApiContext, taskId: string) {
     throw new ApiError("TASK_NOT_FOUND", 404, `Task not found: ${taskId}`);
   }
 
-  validateTaskStartPrerequisites(context, task);
-
   const now = new Date().toISOString();
   let loop = task.loopId ? context.store.loops.getById(task.loopId) : null;
-
-  if (loop && !isReusableWorkerLoopForTask(loop, task)) {
-    loop = null;
-  }
 
   if (!loop) {
     loop = createLoopRecord({
@@ -789,11 +771,9 @@ async function buildLoopsCreateResponse(
     );
   }
 
-  const type = readLoopType(body);
-  const targetType = readLoopTargetType(body);
-  const status = readLoopStatus(body);
-
-  assertLoopTargetTypeMatchesLoopType(type, targetType);
+  const type = readRequiredString(body, "type");
+  const targetType = readRequiredString(body, "targetType");
+  const status = readOptionalString(body, "status") ?? "running";
 
   if (
     (type === "reviewer" || type === "fixer") &&
@@ -896,68 +876,6 @@ function createLoopRecord(input: {
   return record;
 }
 
-function validateTaskStartPrerequisites(
-  context: LooperdApiContext,
-  task: ReturnType<Store["tasks"]["getById"]> extends infer T
-    ? Exclude<T, null>
-    : never,
-) {
-  if (!isCodingAgentConfigured(context.config)) {
-    throw new ApiError(
-      "AGENT_NOT_CONFIGURED",
-      400,
-      "Cannot start task without config.agent.vendor",
-    );
-  }
-
-  if (!task.repo) {
-    throw new ApiError(
-      "VALIDATION_FAILED",
-      400,
-      `Task ${task.id} must define repo before it can be started`,
-    );
-  }
-
-  const metadata = parsePayloadJson(task.metadataJson ?? "null") as Record<
-    string,
-    unknown
-  > | null;
-  if (
-    typeof metadata?.specPath !== "string" ||
-    metadata.specPath.length === 0
-  ) {
-    throw new ApiError(
-      "VALIDATION_FAILED",
-      400,
-      `Task ${task.id} must define specPath before it can be started`,
-    );
-  }
-
-  if (context.store.taskItems.listByTask(task.id).length === 0) {
-    throw new ApiError(
-      "VALIDATION_FAILED",
-      400,
-      `Task ${task.id} must have at least one checklist item before it can be started`,
-    );
-  }
-}
-
-function isReusableWorkerLoopForTask(
-  loop: ReturnType<Store["loops"]["getById"]> extends infer T
-    ? Exclude<T, null>
-    : never,
-  task: ReturnType<Store["tasks"]["getById"]> extends infer T
-    ? Exclude<T, null>
-    : never,
-) {
-  return (
-    loop.projectId === task.projectId &&
-    loop.type === "worker" &&
-    loop.targetType === "task" &&
-    loop.targetId === `task:${task.id}`
-  );
-}
-
 function serializeTask(
   context: LooperdApiContext,
   task: ReturnType<Store["tasks"]["getById"]> extends infer T
@@ -1028,70 +946,6 @@ function readTaskItems(
       updatedAt: now,
     });
   });
-}
-
-function readLoopType(body: Record<string, unknown>) {
-  const type = readRequiredString(body, "type");
-  if (!LOOP_TYPES.includes(type as (typeof LOOP_TYPES)[number])) {
-    throw new ApiError(
-      "VALIDATION_FAILED",
-      400,
-      `type must be one of: ${LOOP_TYPES.join(", ")}`,
-    );
-  }
-
-  return type;
-}
-
-function readLoopTargetType(body: Record<string, unknown>) {
-  const targetType = readRequiredString(body, "targetType");
-  if (
-    !LOOP_TARGET_TYPES.includes(
-      targetType as (typeof LOOP_TARGET_TYPES)[number],
-    )
-  ) {
-    throw new ApiError(
-      "VALIDATION_FAILED",
-      400,
-      `targetType must be one of: ${LOOP_TARGET_TYPES.join(", ")}`,
-    );
-  }
-
-  return targetType;
-}
-
-function assertLoopTargetTypeMatchesLoopType(type: string, targetType: string) {
-  if (type === "worker" && targetType !== "task") {
-    throw new ApiError(
-      "VALIDATION_FAILED",
-      400,
-      "worker loops must target a task",
-    );
-  }
-
-  if (
-    (type === "reviewer" || type === "fixer") &&
-    targetType !== "pull_request"
-  ) {
-    throw new ApiError(
-      "VALIDATION_FAILED",
-      400,
-      `${type} loops must target a pull request`,
-    );
-  }
-}
-
-function readLoopStatus(body: Record<string, unknown>) {
-  const status = readOptionalString(body, "status") ?? "running";
-  if (!LOOP_STATUSES.includes(status as (typeof LOOP_STATUSES)[number])) {
-    throw new ApiError(
-      "VALIDATION_FAILED",
-      400,
-      `status must be one of: ${LOOP_STATUSES.join(", ")}`,
-    );
-  }
-
-  return status;
 }
 
 function readRequiredValue(

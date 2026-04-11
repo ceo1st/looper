@@ -393,6 +393,7 @@ describe("WorkerLoopRunner", () => {
       projectId: string;
       loopId: string;
       runId: string;
+      subtitle: string;
       body: string;
       dedupeKey: string;
     }> = [];
@@ -423,7 +424,8 @@ describe("WorkerLoopRunner", () => {
     await runner.processClaimedItem(claimed);
 
     expect(notifications).toHaveLength(1);
-    expect(notifications[0]?.body).toBe("Worker agent started for task task_1");
+    expect(notifications[0]?.subtitle).toBe("task_1");
+    expect(notifications[0]?.body).toBe("Task started");
     expect(notifications[0]?.dedupeKey).toMatch(
       /^runtime\.agent\.started:worker:/,
     );

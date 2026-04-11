@@ -416,7 +416,6 @@ describe("createLooperdApi", () => {
     };
     expect(pauseLoopResponse.status).toBe(200);
     expect(pauseLoopBody.data.status).toBe("paused");
-    expect(store.queue.getById("queue_1")?.status).toBe("cancelled");
 
     const startLoopResponse = await api.handle(
       new Request("http://localhost/api/v1/loops/loop_1/start", {
@@ -436,7 +435,6 @@ describe("createLooperdApi", () => {
           projectId: "project_1",
           title: "Implement CLI route",
           description: "Create API endpoint",
-          repo: "acme/looper",
           specPath: "specs/cli.md",
           items: ["wire client", "add tests"],
         }),
@@ -587,208 +585,6 @@ describe("createLooperdApi", () => {
     await rm(rootDir, { recursive: true, force: true });
   });
 
-  test("rejects task start when worker preflight prerequisites are missing", async () => {
-    const { api, store, rootDir } = await createFixture();
-
-    store.tasks.upsert({
-      id: "task_missing_preflight",
-      projectId: "project_1",
-      title: "Missing worker inputs",
-      description: null,
-      status: "pending",
-      loopId: null,
-      repo: null,
-      prNumber: null,
-      metadataJson: null,
-      createdAt: "2026-04-11T12:00:00.000Z",
-      updatedAt: "2026-04-11T12:00:00.000Z",
-    });
-
-    const response = await api.handle(
-      new Request(
-        "http://localhost/api/v1/tasks/task_missing_preflight/start",
-        {
-          method: "POST",
-        },
-      ),
-    );
-    const body = (await response.json()) as {
-      error: { code: string; message: string };
-    };
-
-    expect(response.status).toBe(400);
-    expect(body.error.code).toBe("VALIDATION_FAILED");
-    expect(body.error.message).toContain("must define repo");
-    expect(store.tasks.getById("task_missing_preflight")?.status).toBe(
-      "pending",
-    );
-    expect(
-      store.loops
-        .list()
-        .some((loop) => loop.targetId === "task:task_missing_preflight"),
-    ).toBe(false);
-    expect(
-      store.queue.findActiveByDedupe("worker:task_missing_preflight"),
-    ).toBeNull();
-
-    store.close();
-    await rm(rootDir, { recursive: true, force: true });
-  });
-
-  test("ignores unrelated loop bindings when starting a task", async () => {
-    const { api, store, rootDir } = await createFixture();
-
-    store.tasks.upsert({
-      id: "task_reuses_wrong_loop",
-      projectId: "project_1",
-      title: "Repair worker binding",
-      description: null,
-      status: "ready",
-      loopId: "loop_1",
-      repo: "acme/looper",
-      prNumber: 42,
-      metadataJson: JSON.stringify({ specPath: "specs/repair.md" }),
-      createdAt: "2026-04-11T12:00:00.000Z",
-      updatedAt: "2026-04-11T12:00:00.000Z",
-    });
-    store.taskItems.upsert({
-      id: "task_item_reuses_wrong_loop",
-      taskId: "task_reuses_wrong_loop",
-      content: "Fix invalid loop reuse",
-      status: "pending",
-      position: 1,
-      source: "user",
-      metadataJson: null,
-      createdAt: "2026-04-11T12:00:00.000Z",
-      updatedAt: "2026-04-11T12:00:00.000Z",
-    });
-
-    const response = await api.handle(
-      new Request(
-        "http://localhost/api/v1/tasks/task_reuses_wrong_loop/start",
-        {
-          method: "POST",
-        },
-      ),
-    );
-    const body = (await response.json()) as {
-      data: { loopId: string; status: string };
-    };
-
-    expect(response.status).toBe(200);
-    expect(body.data.status).toBe("in_progress");
-    expect(body.data.loopId).not.toBe("loop_1");
-    expect(store.loops.getById("loop_1")?.status).toBe("running");
-    expect(store.loops.getById(body.data.loopId)).toMatchObject({
-      projectId: "project_1",
-      type: "worker",
-      targetType: "task",
-      targetId: "task:task_reuses_wrong_loop",
-      status: "running",
-    });
-    expect(
-      store.queue.findActiveByDedupe("worker:task_reuses_wrong_loop"),
-    ).toMatchObject({
-      loopId: body.data.loopId,
-      taskId: "task_reuses_wrong_loop",
-      type: "worker",
-      status: "queued",
-    });
-
-    store.close();
-    await rm(rootDir, { recursive: true, force: true });
-  });
-
-  test("returns validation errors for invalid loop type and status", async () => {
-    const { api, store, rootDir } = await createFixture();
-
-    const invalidTypeResponse = await api.handle(
-      new Request("http://localhost/api/v1/loops", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          projectId: "project_1",
-          type: "invalid",
-          targetType: "task",
-          taskId: "task_1",
-        }),
-      }),
-    );
-    const invalidTypeBody = (await invalidTypeResponse.json()) as {
-      error: { code: string; message: string };
-    };
-    expect(invalidTypeResponse.status).toBe(400);
-    expect(invalidTypeBody.error.code).toBe("VALIDATION_FAILED");
-    expect(invalidTypeBody.error.message).toContain("type must be one of");
-
-    const invalidStatusResponse = await api.handle(
-      new Request("http://localhost/api/v1/loops", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          projectId: "project_1",
-          type: "worker",
-          targetType: "task",
-          taskId: "task_1",
-          status: "invalid",
-        }),
-      }),
-    );
-    const invalidStatusBody = (await invalidStatusResponse.json()) as {
-      error: { code: string; message: string };
-    };
-    expect(invalidStatusResponse.status).toBe(400);
-    expect(invalidStatusBody.error.code).toBe("VALIDATION_FAILED");
-    expect(invalidStatusBody.error.message).toContain("status must be one of");
-
-    const invalidTargetTypeResponse = await api.handle(
-      new Request("http://localhost/api/v1/loops", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          projectId: "project_1",
-          type: "worker",
-          targetType: "invalid",
-          taskId: "task_1",
-        }),
-      }),
-    );
-    const invalidTargetTypeBody = (await invalidTargetTypeResponse.json()) as {
-      error: { code: string; message: string };
-    };
-    expect(invalidTargetTypeResponse.status).toBe(400);
-    expect(invalidTargetTypeBody.error.code).toBe("VALIDATION_FAILED");
-    expect(invalidTargetTypeBody.error.message).toContain(
-      "targetType must be one of",
-    );
-
-    const incompatibleTargetTypeResponse = await api.handle(
-      new Request("http://localhost/api/v1/loops", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          projectId: "project_1",
-          type: "worker",
-          targetType: "pull_request",
-          repo: "acme/looper",
-          prNumber: 42,
-        }),
-      }),
-    );
-    const incompatibleTargetTypeBody =
-      (await incompatibleTargetTypeResponse.json()) as {
-        error: { code: string; message: string };
-      };
-    expect(incompatibleTargetTypeResponse.status).toBe(400);
-    expect(incompatibleTargetTypeBody.error.code).toBe("VALIDATION_FAILED");
-    expect(incompatibleTargetTypeBody.error.message).toContain(
-      "worker loops must target a task",
-    );
-
-    store.close();
-    await rm(rootDir, { recursive: true, force: true });
-  });
-
   test("rejects reviewer/fixer create and start when no coding agent is configured", async () => {
     const { api, store, rootDir } = await createFixture();
     store.loops.upsert({
@@ -864,52 +660,6 @@ describe("createLooperdApi", () => {
       }),
     );
     expect(createWorkerResponse.status).toBe(200);
-
-    store.tasks.upsert({
-      id: "task_no_agent_start",
-      projectId: "project_1",
-      title: "Cannot start without worker runtime",
-      description: null,
-      status: "pending",
-      loopId: null,
-      repo: "acme/looper",
-      prNumber: null,
-      metadataJson: JSON.stringify({ specPath: "specs/task-no-agent.md" }),
-      createdAt: "2026-04-11T12:00:00.000Z",
-      updatedAt: "2026-04-11T12:00:00.000Z",
-    });
-    store.taskItems.upsert({
-      id: "task_item_no_agent_start",
-      taskId: "task_no_agent_start",
-      content: "Refuse unsupported task start",
-      status: "pending",
-      position: 1,
-      source: "user",
-      metadataJson: null,
-      createdAt: "2026-04-11T12:00:00.000Z",
-      updatedAt: "2026-04-11T12:00:00.000Z",
-    });
-
-    const startTaskResponse = await apiWithoutAgent.handle(
-      new Request("http://localhost/api/v1/tasks/task_no_agent_start/start", {
-        method: "POST",
-      }),
-    );
-    const startTaskBody = (await startTaskResponse.json()) as {
-      error: { code: string; message: string };
-    };
-    expect(startTaskResponse.status).toBe(400);
-    expect(startTaskBody.error.code).toBe("AGENT_NOT_CONFIGURED");
-    expect(startTaskBody.error.message).toContain("config.agent.vendor");
-    expect(store.tasks.getById("task_no_agent_start")?.status).toBe("pending");
-    expect(
-      store.loops
-        .list()
-        .some((loop) => loop.targetId === "task:task_no_agent_start"),
-    ).toBe(false);
-    expect(
-      store.queue.findActiveByDedupe("worker:task_no_agent_start"),
-    ).toBeNull();
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });

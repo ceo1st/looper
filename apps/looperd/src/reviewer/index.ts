@@ -73,6 +73,7 @@ export interface ReviewerLoopRunnerOptions {
     projectId: string;
     loopId: string;
     runId: string;
+    subtitle: string;
     body: string;
     dedupeKey: string;
   }) => Promise<void> | void;
@@ -718,7 +719,8 @@ export class ReviewerLoopRunner {
       projectId: input.project.id,
       loopId: input.loop.id,
       runId: input.run.id,
-      body: `Reviewer agent started for ${repo}#${prNumber}`,
+      subtitle: `${repo}#${prNumber}`,
+      body: "Review started",
       dedupeKey: `runtime.agent.started:reviewer:${input.run.id}`,
     });
     const result = await execution.wait();
@@ -967,12 +969,7 @@ export class ReviewerLoopRunner {
     if (existing) {
       const updated = {
         ...existing,
-        status:
-          existing.status === "paused"
-            ? existing.status
-            : existing.status === "running"
-              ? existing.status
-              : "queued",
+        status: existing.status === "running" ? existing.status : "queued",
         nextRunAt: nowIso,
         updatedAt: nowIso,
       };
@@ -1098,7 +1095,7 @@ function buildReviewerDedupeKey(repo: string, prNumber: number): string {
 }
 
 function buildPullRequestEntityId(repo: string, prNumber: number): string {
-  return buildPullRequestTargetId(repo, prNumber);
+  return `${repo}#${prNumber}`;
 }
 
 function buildPullRequestLockKey(queueItem: QueueItemRecord): string {

@@ -79,15 +79,12 @@ export class ConfiguredAgentExecutor {
       this.options.config,
       input.prompt,
     );
-    const env = Object.fromEntries(
-      Object.entries({
-        ...process.env,
-        ...this.options.config.env,
-        ...input.env,
-        LOOPER_PROMPT: input.prompt,
-        LOOPER_COMPLETION_MARKER: COMPLETION_MARKER,
-      }).filter((entry): entry is [string, string] => entry[1] !== undefined),
-    );
+    const env = {
+      ...this.options.config.env,
+      ...input.env,
+      LOOPER_PROMPT: input.prompt,
+      LOOPER_COMPLETION_MARKER: COMPLETION_MARKER,
+    };
 
     const subprocess = Bun.spawn({
       cmd: [command, ...args],

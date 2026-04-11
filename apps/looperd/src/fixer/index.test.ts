@@ -423,11 +423,6 @@ describe("FixerLoopRunner", () => {
     expect(git.lastExpectedRemoteHeadSha).toBe("abc123");
     expect(github.resolvedThreadIds).toEqual(["thread-1"]);
     expect(git.cleanupCalls).toBe(1);
-    expect(
-      fixture.store.events
-        .listByEntity("pull_request", "pr:acme/looper:42")
-        .some((event) => event.eventType === "fixer.worktree.cleaned"),
-    ).toBe(true);
     const run = fixture.store.runs.listByLoop(result.loopId)[0];
     const checkpoint = JSON.parse(run?.checkpointJson ?? "{}");
     expect(checkpoint.recheck.remainingFixItems).toHaveLength(0);
@@ -496,6 +491,7 @@ describe("FixerLoopRunner", () => {
       projectId: string;
       loopId: string;
       runId: string;
+      subtitle: string;
       body: string;
       dedupeKey: string;
     }> = [];
@@ -528,65 +524,11 @@ describe("FixerLoopRunner", () => {
     await runner.processClaimedItem(claimed);
 
     expect(notifications).toHaveLength(1);
-    expect(notifications[0]?.body).toBe(
-      "Fixer agent started for acme/looper#42",
-    );
+    expect(notifications[0]?.subtitle).toBe("acme/looper#42");
+    expect(notifications[0]?.body).toBe("Fix started");
     expect(notifications[0]?.dedupeKey).toMatch(
       /^runtime\.agent\.started:fixer:/,
     );
-
-    fixture.store.close();
-  });
-
-  test("auto-discovery preserves paused fixer loops", async () => {
-    const fixture = await createFixture();
-    const github = new FakeGitHubGateway({
-      views: [{ comments: [{ id: "comment-1", threadId: "thread-1" }] }],
-    });
-    const git = new FakeGitGateway();
-    const agent = new FakeAgentExecutor([completedAgentResult("fixed")]);
-    const runner = new FixerLoopRunner({
-      store: fixture.store,
-      scheduler: fixture.queue,
-      github,
-      git,
-      agentExecutor: agent,
-      logger: createCapturingLogger().logger,
-      now: () => fixture.now,
-      validationRunner: async (): Promise<FixerValidationResult> => ({
-        passed: true,
-        summary: "ok",
-      }),
-    });
-    const nowIso = fixture.now.toISOString();
-
-    fixture.store.loops.upsert({
-      id: "loop_paused",
-      projectId: "project_1",
-      type: "fixer",
-      targetType: "pull_request",
-      targetId: "pr:acme/looper:42",
-      repo: "acme/looper",
-      prNumber: 42,
-      status: "paused",
-      configJson: null,
-      metadataJson: null,
-      lastRunAt: null,
-      nextRunAt: nowIso,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-    });
-
-    const discovery = await runner.discoverPullRequests({
-      projectId: "project_1",
-      repo: "acme/looper",
-    });
-
-    expect(discovery.queueItems).toHaveLength(0);
-    expect(discovery.createdLoopIds).toHaveLength(0);
-    expect(discovery.skipped).toBe(1);
-    expect(fixture.store.loops.getById("loop_paused")?.status).toBe("paused");
-    expect(fixture.store.queue.list()).toHaveLength(0);
 
     fixture.store.close();
   });
@@ -801,10 +743,6 @@ describe("FixerLoopRunner", () => {
     expect(eventTypes).toContain("fixer.commits.reconciled");
     expect(eventTypes).toContain("fixer.comments.resolved");
     expect(eventTypes).toContain("pr.branch.pushed");
-    const prEventTypes = fixture.store.events
-      .listByEntity("pull_request", "pr:acme/looper:42")
-      .map((event) => event.eventType);
-    expect(prEventTypes).toContain("pr.branch.pushed");
 
     fixture.store.close();
   });
@@ -1194,73 +1132,6 @@ describe("FixerLoopRunner", () => {
     fixture.store.close();
   });
 
-  test("reacquires the PR lock before resumed fixer steps", async () => {
-    const fixture = await createFixture();
-    const github = new FakeGitHubGateway({
-      views: [
-        {
-          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
-          checks: [],
-          headSha: "abc123",
-        },
-        {
-          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
-          checks: [],
-          headSha: "abc123",
-        },
-      ],
-    });
-    const git = new FakeGitGateway({
-      pushError: "Remote head changed for feature/fixer",
-    });
-    const agent = new FakeAgentExecutor([completedAgentResult("fixed")]);
-    const runner = new FixerLoopRunner({
-      store: fixture.store,
-      scheduler: fixture.queue,
-      github,
-      git,
-      agentExecutor: agent,
-      logger: createCapturingLogger().logger,
-      now: () => fixture.now,
-      validationRunner: async (): Promise<FixerValidationResult> => ({
-        passed: true,
-        summary: "ok",
-      }),
-    });
-
-    await runner.discoverPullRequests({
-      projectId: "project_1",
-      repo: "acme/looper",
-    });
-    const firstClaim = fixture.queue.claimNext("fixer-1");
-    if (!firstClaim) throw new Error("Expected first fixer claim");
-
-    const first = await runner.processClaimedItem(firstClaim);
-    expect(first.status).toBe("failed");
-    expect(first.failureKind).toBe("retryable_after_resume");
-
-    expect(
-      fixture.queue.acquireBusinessLock({
-        key: "pr:acme/looper:42",
-        owner: "reviewer-1",
-        reason: "reviewer-run",
-        expiresAt: new Date("2099-01-01T00:00:00.000Z").toISOString(),
-      }),
-    ).toBe(true);
-
-    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
-    const retryClaim = fixture.queue.claimNext("fixer-1");
-    if (!retryClaim) throw new Error("Expected retry fixer claim");
-
-    const retry = await runner.processClaimedItem(retryClaim);
-    expect(retry.status).toBe("failed");
-    expect(retry.failureKind).toBe("retryable_transient");
-    expect(retry.summary).toContain("Pull request lock is already held");
-    expect(agent.starts).toHaveLength(1);
-
-    fixture.store.close();
-  });
-
   test("retries push conflicts from prepare-worktree and reruns repair", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway({
@@ -1558,79 +1429,6 @@ describe("FixerLoopRunner", () => {
     const result = await runner.processClaimedItem(claimed);
     expect(result.status).toBe("success");
     expect(github.resolvedThreadIds).toEqual(["thread-1"]);
-
-    fixture.store.close();
-  });
-
-  test("retries head polling failures instead of failing fixer runs permanently", async () => {
-    const fixture = await createFixture();
-    const github = new FakeGitHubGateway({
-      views: [
-        {
-          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
-          checks: [],
-          headSha: "abc123",
-        },
-        {
-          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
-          checks: [],
-          headSha: "abc123",
-        },
-        "error",
-        {
-          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
-          checks: [],
-          headSha: "abc123",
-        },
-        {
-          comments: [{ id: "c1", threadId: "thread-1", state: "UNRESOLVED" }],
-          checks: [],
-          headSha: "commit-1",
-        },
-        { comments: [], checks: [], headSha: "commit-1" },
-        { comments: [], checks: [], headSha: "commit-1" },
-        { comments: [], checks: [], headSha: "commit-1" },
-      ],
-    });
-    const git = new FakeGitGateway();
-    const agent = new FakeAgentExecutor([
-      completedAgentResult("fixed-attempt-1"),
-      completedAgentResult("fixed-attempt-2"),
-    ]);
-    const runner = new FixerLoopRunner({
-      store: fixture.store,
-      scheduler: fixture.queue,
-      github,
-      git,
-      agentExecutor: agent,
-      logger: createCapturingLogger().logger,
-      now: () => fixture.now,
-      sleep: async () => {},
-      validationRunner: async (): Promise<FixerValidationResult> => ({
-        passed: true,
-        summary: "ok",
-      }),
-    });
-
-    await runner.discoverPullRequests({
-      projectId: "project_1",
-      repo: "acme/looper",
-    });
-    const firstClaim = fixture.queue.claimNext("fixer-1");
-    if (!firstClaim) throw new Error("Expected first fixer claim");
-
-    const first = await runner.processClaimedItem(firstClaim);
-    expect(first.status).toBe("failed");
-    expect(first.failureKind).toBe("retryable_after_resume");
-    expect(first.summary).toContain("temporary GitHub failure");
-
-    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
-    const retryClaim = fixture.queue.claimNext("fixer-1");
-    if (!retryClaim) throw new Error("Expected retry fixer claim");
-
-    const retry = await runner.processClaimedItem(retryClaim);
-    expect(retry.status).toBe("success");
-    expect(agent.starts).toHaveLength(2);
 
     fixture.store.close();
   });

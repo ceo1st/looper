@@ -133,6 +133,7 @@ export interface FixerLoopRunnerOptions {
     projectId: string;
     loopId: string;
     runId: string;
+    subtitle: string;
     body: string;
     dedupeKey: string;
   }) => Promise<void> | void;
@@ -319,10 +320,6 @@ export class FixerLoopRunner {
       if (loop.created) {
         createdLoopIds.push(loop.record.id);
       }
-      if (loop.record.status === "paused") {
-        skipped += 1;
-        continue;
-      }
 
       const headSha = detail.headSha ?? "unknown";
       const fixItemsHash = hashFixItems(fixItems);
@@ -374,78 +371,57 @@ export class FixerLoopRunner {
     const resumedRun = this.createRunContext(loop);
     let run = resumedRun.run;
     let checkpoint = resumedRun.checkpoint;
-    let claimedLockKey =
-      FIXER_STEP_SEQUENCE.indexOf(resumedRun.startStep) >
-      FIXER_STEP_SEQUENCE.indexOf("claim-pr")
-        ? checkpoint.claimedLockKey
-        : undefined;
+    let claimedLockKey: string | undefined;
+
+    this.updateLoop(loop, {
+      status: "running",
+      lastRunAt: run.startedAt,
+      nextRunAt: null,
+    });
+    this.appendEvent({
+      eventType: "loop.started",
+      projectId: project.id,
+      loopId: loop.id,
+      runId: run.id,
+      entityType: "loop",
+      entityId: loop.id,
+      payload: {
+        queueItemId: queueItem.id,
+        resumed: resumedRun.resumed,
+        startStep: resumedRun.startStep,
+      },
+    });
+    this.options.logger.info("fixer loop started", {
+      projectId: project.id,
+      loopId: loop.id,
+      runId: run.id,
+      queueItemId: queueItem.id,
+      taskId: queueItem.taskId,
+      currentStep: resumedRun.startStep,
+      resumed: resumedRun.resumed,
+    });
+    this.appendEvent({
+      eventType: "run.started",
+      projectId: project.id,
+      loopId: loop.id,
+      runId: run.id,
+      entityType: "run",
+      entityId: run.id,
+      payload: {
+        queueItemId: queueItem.id,
+        currentStep: resumedRun.startStep,
+      },
+    });
+    this.options.logger.info("fixer run started", {
+      projectId: project.id,
+      loopId: loop.id,
+      runId: run.id,
+      queueItemId: queueItem.id,
+      taskId: queueItem.taskId,
+      currentStep: resumedRun.startStep,
+    });
 
     try {
-      if (claimedLockKey) {
-        const acquired = this.options.scheduler.acquireBusinessLock({
-          key: claimedLockKey,
-          owner: queueItem.id,
-          reason: "fixer-run-resume",
-          expiresAt: new Date(
-            this.now().getTime() + this.claimTtlMs,
-          ).toISOString(),
-        });
-        if (!acquired) {
-          throw new FixerLoopError(
-            `Pull request lock is already held for ${claimedLockKey}`,
-            "retryable_transient",
-          );
-        }
-      }
-
-      this.updateLoop(loop, {
-        status: "running",
-        lastRunAt: run.startedAt,
-        nextRunAt: null,
-      });
-      this.appendEvent({
-        eventType: "loop.started",
-        projectId: project.id,
-        loopId: loop.id,
-        runId: run.id,
-        entityType: "loop",
-        entityId: loop.id,
-        payload: {
-          queueItemId: queueItem.id,
-          resumed: resumedRun.resumed,
-          startStep: resumedRun.startStep,
-        },
-      });
-      this.options.logger.info("fixer loop started", {
-        projectId: project.id,
-        loopId: loop.id,
-        runId: run.id,
-        queueItemId: queueItem.id,
-        taskId: queueItem.taskId,
-        currentStep: resumedRun.startStep,
-        resumed: resumedRun.resumed,
-      });
-      this.appendEvent({
-        eventType: "run.started",
-        projectId: project.id,
-        loopId: loop.id,
-        runId: run.id,
-        entityType: "run",
-        entityId: run.id,
-        payload: {
-          queueItemId: queueItem.id,
-          currentStep: resumedRun.startStep,
-        },
-      });
-      this.options.logger.info("fixer run started", {
-        projectId: project.id,
-        loopId: loop.id,
-        runId: run.id,
-        queueItemId: queueItem.id,
-        taskId: queueItem.taskId,
-        currentStep: resumedRun.startStep,
-      });
-
       for (const step of FIXER_STEP_SEQUENCE.slice(
         FIXER_STEP_SEQUENCE.indexOf(resumedRun.startStep),
       )) {
@@ -541,7 +517,6 @@ export class FixerLoopRunner {
       await this.cleanupFixerWorktreeIfTerminal({
         checkpoint,
         project,
-        queueItem,
       });
 
       return {
@@ -624,7 +599,6 @@ export class FixerLoopRunner {
         await this.cleanupFixerWorktreeIfTerminal({
           checkpoint,
           project,
-          queueItem,
         });
       }
 
@@ -928,7 +902,8 @@ export class FixerLoopRunner {
       projectId: input.loop.projectId,
       loopId: input.loop.id,
       runId: input.run.id,
-      body: `Fixer agent started for ${requireString(input.queueItem.repo, "queueItem.repo")}#${requireNumber(input.queueItem.prNumber, "queueItem.prNumber")}`,
+      subtitle: `${requireString(input.queueItem.repo, "queueItem.repo")}#${requireNumber(input.queueItem.prNumber, "queueItem.prNumber")}`,
+      body: "Fix started",
       dedupeKey: `runtime.agent.started:fixer:${input.run.id}`,
     });
     const result = await execution.wait();
@@ -1546,12 +1521,7 @@ export class FixerLoopRunner {
     if (existing) {
       const updated = {
         ...existing,
-        status:
-          existing.status === "paused"
-            ? existing.status
-            : existing.status === "running"
-              ? existing.status
-              : "queued",
+        status: existing.status === "running" ? existing.status : "queued",
         nextRunAt: nowIso,
         updatedAt: nowIso,
       };
@@ -1686,17 +1656,11 @@ export class FixerLoopRunner {
   private async cleanupFixerWorktreeIfTerminal(input: {
     checkpoint: FixerCheckpoint;
     project: ProjectRecord;
-    queueItem: QueueItemRecord;
   }): Promise<void> {
     const worktree = input.checkpoint.worktree;
     if (!worktree?.path || !worktree.branch || worktree.cleanedAt) {
       return;
     }
-
-    const pullRequestEntityId = buildPullRequestTargetId(
-      requireString(input.queueItem.repo, "queueItem.repo"),
-      requireNumber(input.queueItem.prNumber, "queueItem.prNumber"),
-    );
 
     worktree.cleanupAttemptedAt = this.nowIso();
     try {
@@ -1712,7 +1676,7 @@ export class FixerLoopRunner {
         eventType: "fixer.worktree.cleaned",
         projectId: input.project.id,
         entityType: "pull_request",
-        entityId: pullRequestEntityId,
+        entityId: input.project.id,
         payload: { path: worktree.path, branch: worktree.branch },
       });
     } catch (error) {
@@ -1720,7 +1684,7 @@ export class FixerLoopRunner {
         eventType: "fixer.worktree.cleanup_failed",
         projectId: input.project.id,
         entityType: "pull_request",
-        entityId: pullRequestEntityId,
+        entityId: input.project.id,
         payload: {
           path: worktree.path,
           branch: worktree.branch,
@@ -1749,21 +1713,11 @@ export class FixerLoopRunner {
   }): Promise<void> {
     let actualHeadSha: string | undefined;
     for (let attempt = 0; attempt < input.attempts; attempt += 1) {
-      let currentPr: GitHubPullRequestDetail;
-      try {
-        currentPr = await this.options.github.viewPullRequest({
-          repo: input.repo,
-          prNumber: input.prNumber,
-          cwd: input.cwd,
-        });
-      } catch (error) {
-        throw new FixerLoopError(
-          error instanceof Error
-            ? error.message
-            : "Failed to poll pull request head",
-          "retryable_after_resume",
-        );
-      }
+      const currentPr = await this.options.github.viewPullRequest({
+        repo: input.repo,
+        prNumber: input.prNumber,
+        cwd: input.cwd,
+      });
       actualHeadSha = currentPr.headSha;
       if (actualHeadSha === input.expectedHeadSha) {
         return;
