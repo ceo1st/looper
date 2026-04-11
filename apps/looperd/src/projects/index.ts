@@ -101,7 +101,7 @@ export class ProjectManager {
     const metadata = parseMetadata(existing?.metadataJson);
     const nextMetadata = {
       ...metadata,
-      repo,
+      repo: repo ?? metadata.repo ?? null,
       worktreeRoot: input.worktreeRoot ?? metadata.worktreeRoot ?? null,
       source: existing ? (metadata.source ?? "api") : "api",
     };
