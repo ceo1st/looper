@@ -4,7 +4,7 @@
 - Use Bun for everything. Root scripts are the source of truth:
   - `bun run dev` -> runs only `apps/looperd`
   - `bun run build` -> builds `apps/looperd`, then `apps/cli`, then `apps/web`
-  - `bun run typecheck` -> `bun x tsc -b` across all three apps
+  - `bun run typecheck` -> `bun x tsc -b --noEmit` across all three apps
   - `bun run lint` -> `bun x @biomejs/biome check .`
   - `bun run test` -> `bun test`
 - Package-scoped commands:
@@ -28,7 +28,7 @@
 - Default runtime artifacts live under `~/.looper/` (`looper.sqlite`, `backups/`, `logs/`).
 
 ## Verified agent-facing conventions
-- TypeScript uses project references from the root `tsconfig.json`; prefer root `bun run typecheck` when changes cross packages.
+- TypeScript uses project references from the root `tsconfig.json`; prefer root `bun run typecheck` when changes cross packages, and it is intentionally `--noEmit` to avoid regenerating `*.tsbuildinfo`.
 - Formatting/linting is Biome with spaces; use Biome-compatible edits and do not hand-format against another style.
 - Generated/build output lives in `apps/*/dist/` and is ignored by git/Biome; do not edit `dist`.
 - There is no verified CI, README, or other repo-local instruction file yet; rely on `package.json`, tsconfig, and app entrypoints over assumptions.

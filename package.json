@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "bun run --cwd apps/looperd dev",
     "build": "bun run --cwd apps/looperd build && bun run --cwd apps/cli build && bun run --cwd apps/web build",
-    "typecheck": "bun x tsc -b",
+    "typecheck": "bun x tsc -b --noEmit",
     "test": "bun test",
     "lint": "bun x @biomejs/biome check ."
   },

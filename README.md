@@ -23,7 +23,7 @@ From the repo root:
 
 - `bun run dev` — run `apps/looperd`
 - `bun run build` — build `apps/looperd`, `apps/cli`, and `apps/web`
-- `bun run typecheck` — TypeScript project references build check
+- `bun run typecheck` — TypeScript project references check without emit
 - `bun run lint` — run Biome
 - `bun run test` — run all Bun tests
 
@@ -141,6 +141,6 @@ Selected CLI config flags:
 
 ## Development notes
 
-- This repo uses TypeScript project references from the root `tsconfig.json`.
+- This repo uses TypeScript project references from the root `tsconfig.json`; root typecheck runs with `--noEmit`.
 - Formatting and linting use Biome with spaces.
 - Build output lives in `apps/*/dist/`; do not edit generated files.
