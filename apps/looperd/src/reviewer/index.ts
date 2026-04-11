@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { AgentResult, AgentRunInput } from "../infra/agent";
+import type { Logger } from "../bootstrap/logger";
 import { CommandExecutionError } from "../infra/command";
 import type {
   GitHubPullRequestDetail,
@@ -65,6 +66,7 @@ export interface ReviewerLoopRunnerOptions {
   scheduler: SchedulerQueue;
   github: ReviewerGitHubGateway;
   agentExecutor: ReviewerAgentExecutor;
+  logger: Logger;
   now?: () => Date;
   agentTimeoutMs?: number;
   claimTtlMs?: number;
@@ -272,6 +274,15 @@ export class ReviewerLoopRunner {
         startStep: resumedRun.startStep,
       },
     });
+    this.options.logger.info("reviewer loop started", {
+      projectId: project.id,
+      loopId: loop.id,
+      runId: run.id,
+      queueItemId: queueItem.id,
+      taskId: queueItem.taskId,
+      currentStep: resumedRun.startStep,
+      resumed: resumedRun.resumed,
+    });
     this.appendEvent({
       eventType: "run.started",
       projectId: project.id,
@@ -283,6 +294,14 @@ export class ReviewerLoopRunner {
         queueItemId: queueItem.id,
         currentStep: resumedRun.startStep,
       },
+    });
+    this.options.logger.info("reviewer run started", {
+      projectId: project.id,
+      loopId: loop.id,
+      runId: run.id,
+      queueItemId: queueItem.id,
+      taskId: queueItem.taskId,
+      currentStep: resumedRun.startStep,
     });
 
     try {
@@ -298,6 +317,14 @@ export class ReviewerLoopRunner {
           entityType: "run",
           entityId: run.id,
           payload: { step },
+        });
+        this.options.logger.info("reviewer step started", {
+          projectId: project.id,
+          loopId: loop.id,
+          runId: run.id,
+          queueItemId: queueItem.id,
+          taskId: queueItem.taskId,
+          currentStep: step,
         });
 
         checkpoint = await this.executeStep({
@@ -323,6 +350,14 @@ export class ReviewerLoopRunner {
           entityId: run.id,
           payload: { step },
         });
+        this.options.logger.info("reviewer step completed", {
+          projectId: project.id,
+          loopId: loop.id,
+          runId: run.id,
+          queueItemId: queueItem.id,
+          taskId: queueItem.taskId,
+          currentStep: step,
+        });
 
         if (checkpoint.skipReason) {
           break;
@@ -347,6 +382,20 @@ export class ReviewerLoopRunner {
         entityId: run.id,
         payload: { summary },
       });
+      this.options.logger.info(
+        checkpoint.skipReason
+          ? "reviewer run skipped"
+          : "reviewer run completed",
+        {
+          projectId: project.id,
+          loopId: loop.id,
+          runId: run.id,
+          queueItemId: queueItem.id,
+          taskId: queueItem.taskId,
+          currentStep: run.currentStep,
+          summary,
+        },
+      );
       this.options.scheduler.complete(queueItem.id);
       this.updateLoop(loop, {
         status: "completed",
@@ -401,6 +450,16 @@ export class ReviewerLoopRunner {
           summary: failure.message,
           failureKind: failure.kind,
         },
+      });
+      this.options.logger.error("reviewer run failed", {
+        projectId: project.id,
+        loopId: loop.id,
+        runId: run.id,
+        queueItemId: queueItem.id,
+        taskId: queueItem.taskId,
+        currentStep: run.currentStep,
+        failureKind: failure.kind,
+        summary: failure.message,
       });
 
       const failedQueueItem = this.options.scheduler.fail(

@@ -34,7 +34,7 @@ export async function createLogger(
     }
 
     const entry = {
-      ts: new Date().toISOString(),
+      ts: formatLocalTimestamp(new Date()),
       level,
       message,
       context,
@@ -60,3 +60,30 @@ export async function createLogger(
     error: (message, context) => write("error", message, context),
   };
 }
+
+function formatLocalTimestamp(date: Date): string {
+  const offsetMinutes = -date.getTimezoneOffset();
+  const shifted = new Date(date.getTime() + offsetMinutes * 60_000);
+  const year = shifted.getUTCFullYear();
+  const month = String(shifted.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(shifted.getUTCDate()).padStart(2, "0");
+  const hours = String(shifted.getUTCHours()).padStart(2, "0");
+  const minutes = String(shifted.getUTCMinutes()).padStart(2, "0");
+  const seconds = String(shifted.getUTCSeconds()).padStart(2, "0");
+  const milliseconds = String(shifted.getUTCMilliseconds()).padStart(3, "0");
+
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const absoluteOffsetMinutes = Math.abs(offsetMinutes);
+  const offsetHours = String(Math.floor(absoluteOffsetMinutes / 60)).padStart(
+    2,
+    "0",
+  );
+  const offsetRemainderMinutes = String(absoluteOffsetMinutes % 60).padStart(
+    2,
+    "0",
+  );
+
+  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}.${milliseconds}${sign}${offsetHours}:${offsetRemainderMinutes}`;
+}
+
+export { formatLocalTimestamp };

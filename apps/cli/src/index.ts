@@ -810,6 +810,8 @@ async function runPrList(context: CliContext) {
       title: item.title as string,
       reviewState: item.reviewState as string,
       checks: item.checksSummary as string,
+      reviewer: (item.reviewer as string | null | undefined) ?? "-",
+      fixer: (item.fixer as string | null | undefined) ?? "-",
       task: (item.task as { id?: string } | null)?.id ?? "-",
     })),
   );

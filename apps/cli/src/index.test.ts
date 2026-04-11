@@ -211,4 +211,51 @@ describe("runCli", () => {
     expect(exitCode).toBe(0);
     expect(lines.at(-1)).toBe("two");
   });
+
+  test("lists pull requests with reviewer and fixer status", async () => {
+    const lines: string[] = [];
+    const exitCode = await runCli(["pr", "list"], {
+      stdout: (line) => lines.push(line),
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_pr_list",
+            data: {
+              items: [
+                {
+                  repo: "acme/looper",
+                  prNumber: 42,
+                  title: "Runtime foundation",
+                  reviewState: "changes_requested",
+                  checksSummary: "green",
+                  reviewer: "running",
+                  fixer: "paused",
+                  task: { id: "task_1" },
+                },
+                {
+                  repo: "acme/looper",
+                  prNumber: 77,
+                  title: null,
+                  reviewState: null,
+                  checksSummary: null,
+                  reviewer: "queued",
+                  fixer: null,
+                  task: null,
+                },
+              ],
+            },
+          }),
+        ),
+    });
+
+    expect(exitCode).toBe(0);
+    const output = lines.join("\n");
+    expect(output).toContain("reviewer");
+    expect(output).toContain("fixer");
+    expect(output).toContain("running");
+    expect(output).toContain("paused");
+    expect(output).toContain("queued");
+  });
 });

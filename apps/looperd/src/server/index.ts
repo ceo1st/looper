@@ -402,10 +402,28 @@ function buildPullRequestsResponse(context: LooperdApiContext) {
   const latestSnapshots = dedupeLatestSnapshots(
     context.store.pullRequestSnapshots.list(),
   );
+  const loops = context.store.loops.list();
+  const tasks = context.store.tasks.list();
+  const identities = collectPullRequestIdentities(
+    latestSnapshots,
+    loops,
+    tasks,
+  );
+  const snapshotByKey = new Map(
+    latestSnapshots.map((snapshot) => [
+      `${snapshot.repo}#${snapshot.prNumber}`,
+      snapshot,
+    ]),
+  );
 
   return {
-    items: latestSnapshots.map((snapshot) =>
-      serializePullRequest(context, snapshot),
+    items: identities.map((identity) =>
+      serializePullRequestListItem(
+        context,
+        identity.repo,
+        identity.prNumber,
+        snapshotByKey.get(`${identity.repo}#${identity.prNumber}`),
+      ),
     ),
   };
 }
@@ -1069,12 +1087,11 @@ function buildPullRequestStatusResponse(
   context: LooperdApiContext,
   snapshot: PullRequestSnapshotRecord,
 ) {
-  const loopMatches = context.store.loops
-    .list()
-    .filter(
-      (loop) =>
-        loop.repo === snapshot.repo && loop.prNumber === snapshot.prNumber,
-    );
+  const loopMatches = findPullRequestLoops(
+    context,
+    snapshot.repo,
+    snapshot.prNumber,
+  );
   const runMatches = loopMatches.flatMap((loop) =>
     context.store.runs.listByLoop(loop.id),
   );
@@ -1092,6 +1109,8 @@ function buildPullRequestStatusResponse(
     checksSummary: snapshot.checksSummary,
     unresolvedThreadCount: snapshot.unresolvedThreadCount ?? 0,
     capturedAt: snapshot.capturedAt,
+    reviewer: findLatestLoopStatus(loopMatches, "reviewer"),
+    fixer: findLatestLoopStatus(loopMatches, "fixer"),
     loopStatus: summarizeRunAndLoopState(loopMatches, runMatches),
     task: taskMatch
       ? {
@@ -1101,6 +1120,72 @@ function buildPullRequestStatusResponse(
         }
       : null,
   };
+}
+
+function findPullRequestLoops(
+  context: LooperdApiContext,
+  repo: string,
+  prNumber: number,
+) {
+  return context.store.loops
+    .list()
+    .filter((loop) => loop.repo === repo && loop.prNumber === prNumber);
+}
+
+function findLatestLoopStatus(
+  loops: { type: string; status: string }[],
+  type: "reviewer" | "fixer",
+) {
+  return loops.find((loop) => loop.type === type)?.status ?? null;
+}
+
+function collectPullRequestIdentities(
+  snapshots: PullRequestSnapshotRecord[],
+  loops: ReturnType<Store["loops"]["list"]>,
+  tasks: ReturnType<Store["tasks"]["list"]>,
+) {
+  const seen = new Set<string>();
+  const identities: Array<{
+    repo: string;
+    prNumber: number;
+    projectId: string;
+  }> = [];
+
+  const appendIdentity = (item: {
+    repo?: string | null;
+    prNumber?: number | null;
+    projectId: string;
+  }) => {
+    if (!item.repo || !item.prNumber) {
+      return;
+    }
+
+    const key = `${item.repo}#${item.prNumber}`;
+    if (seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+    identities.push({
+      repo: item.repo,
+      prNumber: item.prNumber,
+      projectId: item.projectId,
+    });
+  };
+
+  for (const snapshot of snapshots) {
+    appendIdentity(snapshot);
+  }
+
+  for (const loop of loops) {
+    appendIdentity(loop);
+  }
+
+  for (const task of tasks) {
+    appendIdentity(task);
+  }
+
+  return identities;
 }
 
 function summarizeRunAndLoopState(
@@ -1137,28 +1222,43 @@ function serializePullRequest(
   context: LooperdApiContext,
   snapshot: PullRequestSnapshotRecord,
 ) {
+  return serializePullRequestListItem(
+    context,
+    snapshot.repo,
+    snapshot.prNumber,
+    snapshot,
+  );
+}
+
+function serializePullRequestListItem(
+  context: LooperdApiContext,
+  repo: string,
+  prNumber: number,
+  snapshot: PullRequestSnapshotRecord | undefined,
+) {
+  const loopMatches = findPullRequestLoops(context, repo, prNumber);
   const task = context.store.tasks
     .list()
     .find(
-      (candidate) =>
-        candidate.repo === snapshot.repo &&
-        candidate.prNumber === snapshot.prNumber,
+      (candidate) => candidate.repo === repo && candidate.prNumber === prNumber,
     );
 
   return {
-    repo: snapshot.repo,
-    prNumber: snapshot.prNumber,
-    projectId: snapshot.projectId,
-    headSha: snapshot.headSha,
-    baseSha: snapshot.baseSha,
-    title: snapshot.title,
-    body: snapshot.body,
-    author: snapshot.author,
-    diffRef: snapshot.diffRef,
-    checksSummary: snapshot.checksSummary,
-    unresolvedThreadCount: snapshot.unresolvedThreadCount ?? 0,
-    reviewState: snapshot.reviewState,
-    capturedAt: snapshot.capturedAt,
+    repo,
+    prNumber,
+    projectId: snapshot?.projectId ?? task?.projectId ?? null,
+    headSha: snapshot?.headSha ?? null,
+    baseSha: snapshot?.baseSha ?? null,
+    title: snapshot?.title ?? null,
+    body: snapshot?.body ?? null,
+    author: snapshot?.author ?? null,
+    diffRef: snapshot?.diffRef ?? null,
+    checksSummary: snapshot?.checksSummary ?? null,
+    unresolvedThreadCount: snapshot?.unresolvedThreadCount ?? 0,
+    reviewState: snapshot?.reviewState ?? null,
+    capturedAt: snapshot?.capturedAt ?? null,
+    reviewer: findLatestLoopStatus(loopMatches, "reviewer"),
+    fixer: findLatestLoopStatus(loopMatches, "fixer"),
     task: task
       ? {
           id: task.id,

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { AgentResult, AgentRunInput } from "../infra/agent";
+import type { Logger } from "../bootstrap/logger";
 import { SchedulerQueue } from "../scheduler/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import {
@@ -166,6 +167,24 @@ function completedAgentResult(summary: string): AgentResult {
   };
 }
 
+function createCapturingLogger() {
+  const entries: Array<{
+    level: "info" | "error";
+    message: string;
+    context?: Record<string, unknown>;
+  }> = [];
+  const logger: Logger = {
+    debug: () => {},
+    warn: () => {},
+    info: (message, context) =>
+      entries.push({ level: "info", message, context }),
+    error: (message, context) =>
+      entries.push({ level: "error", message, context }),
+  };
+
+  return { logger, entries };
+}
+
 describe("FixerLoopRunner", () => {
   test("discovers and completes a full successful fixer flow", async () => {
     const fixture = await createFixture();
@@ -178,12 +197,14 @@ describe("FixerLoopRunner", () => {
     });
     const git = new FakeGitGateway();
     const agent = new FakeAgentExecutor([completedAgentResult("fixed")]);
+    const logs = createCapturingLogger();
     const runner = new FixerLoopRunner({
       store: fixture.store,
       scheduler: fixture.queue,
       github,
       git,
       agentExecutor: agent,
+      logger: logs.logger,
       now: () => fixture.now,
       validationRunner: async (): Promise<FixerValidationResult> => ({
         passed: true,
@@ -209,6 +230,21 @@ describe("FixerLoopRunner", () => {
     const run = fixture.store.runs.listByLoop(result.loopId)[0];
     const checkpoint = JSON.parse(run?.checkpointJson ?? "{}");
     expect(checkpoint.recheck.remainingFixItems).toHaveLength(0);
+    expect(
+      logs.entries.some((entry) => entry.message === "fixer loop started"),
+    ).toBe(true);
+    expect(
+      logs.entries.some((entry) => entry.message === "fixer run started"),
+    ).toBe(true);
+    expect(
+      logs.entries.some((entry) => entry.message === "fixer step started"),
+    ).toBe(true);
+    expect(
+      logs.entries.some((entry) => entry.message === "fixer step completed"),
+    ).toBe(true);
+    expect(
+      logs.entries.some((entry) => entry.message === "fixer run completed"),
+    ).toBe(true);
 
     fixture.store.close();
   });
@@ -225,12 +261,14 @@ describe("FixerLoopRunner", () => {
     });
     const git = new FakeGitGateway();
     const agent = new FakeAgentExecutor([completedAgentResult("fixed")]);
+    const logs = createCapturingLogger();
     const runner = new FixerLoopRunner({
       store: fixture.store,
       scheduler: fixture.queue,
       github,
       git,
       agentExecutor: agent,
+      logger: logs.logger,
       now: () => fixture.now,
       validationRunner: async (): Promise<FixerValidationResult> => ({
         passed: true,
@@ -251,6 +289,16 @@ describe("FixerLoopRunner", () => {
     expect(firstResult.failureKind).toBe("retryable_after_resume");
     expect(agent.starts).toHaveLength(1);
     expect(git.pushCalls).toBe(1);
+    const failedLog = logs.entries.find(
+      (entry) =>
+        entry.level === "error" && entry.message === "fixer run failed",
+    );
+    expect(failedLog?.context).toMatchObject({
+      projectId: "project_1",
+      queueItemId: firstClaim.id,
+      failureKind: "retryable_after_resume",
+      currentStep: "recheck",
+    });
 
     fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
     const retryClaim = fixture.queue.claimNext("fixer-1");
@@ -307,6 +355,7 @@ describe("FixerLoopRunner", () => {
       github,
       git,
       agentExecutor: agent,
+      logger: createCapturingLogger().logger,
       now: () => fixture.now,
     });
 
@@ -336,6 +385,7 @@ describe("FixerLoopRunner", () => {
       github,
       git,
       agentExecutor: agent,
+      logger: createCapturingLogger().logger,
       now: () => fixture.now,
       validationRunner: async (): Promise<FixerValidationResult> => ({
         passed: true,
@@ -382,6 +432,7 @@ describe("FixerLoopRunner", () => {
       github,
       git,
       agentExecutor: agent,
+      logger: createCapturingLogger().logger,
       now: () => fixture.now,
       validationRunner: async (): Promise<FixerValidationResult> => ({
         passed: true,
@@ -423,6 +474,7 @@ describe("FixerLoopRunner", () => {
       github,
       git,
       agentExecutor: agent,
+      logger: createCapturingLogger().logger,
       now: () => fixture.now,
       validationRunner: async (): Promise<FixerValidationResult> => ({
         passed: true,
@@ -483,6 +535,7 @@ describe("FixerLoopRunner", () => {
       github,
       git,
       agentExecutor: agent,
+      logger: createCapturingLogger().logger,
       now: () => fixture.now,
       validationRunner: async (): Promise<FixerValidationResult> => ({
         passed: true,

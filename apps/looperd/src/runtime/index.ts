@@ -170,6 +170,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
           scheduler: this.scheduler,
           github,
           agentExecutor,
+          logger: this.options.logger,
           allowAutoApprove: this.options.config.defaults.allowAutoApprove,
         });
       }
@@ -186,6 +187,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
           github,
           git,
           agentExecutor,
+          logger: this.options.logger,
           allowAutoCommit: this.options.config.defaults.allowAutoCommit,
           allowAutoPush: this.options.config.defaults.allowAutoPush,
           allowRiskyFixes: this.options.config.defaults.allowRiskyFixes,
@@ -199,6 +201,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
           github,
           git,
           agentExecutor,
+          logger: this.options.logger,
           allowAutoCommit: this.options.config.defaults.allowAutoCommit,
           allowAutoPush: this.options.config.defaults.allowAutoPush,
         });

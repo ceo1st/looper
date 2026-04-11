@@ -4,6 +4,7 @@ import { isAbsolute, join } from "node:path";
 
 import type { OpenPrStrategy } from "../config/index";
 import type { AgentResult, AgentRunInput } from "../infra/agent";
+import type { Logger } from "../bootstrap/logger";
 import { CommandExecutionError, runCommand } from "../infra/command";
 import { ProtectedBranchError } from "../infra/git";
 import type { SchedulerQueue } from "../scheduler/index";
@@ -80,6 +81,7 @@ export interface WorkerLoopRunnerOptions {
   git: WorkerGitGateway;
   github: WorkerGitHubGateway;
   agentExecutor: WorkerAgentExecutor;
+  logger: Logger;
   now?: () => Date;
   agentTimeoutMs?: number;
   claimTtlMs?: number;
@@ -247,6 +249,15 @@ export class WorkerLoopRunner {
         startStep: resumedRun.startStep,
       },
     });
+    this.options.logger.info("worker loop started", {
+      projectId: project.id,
+      loopId: loop.id,
+      runId: run.id,
+      taskId: task.id,
+      queueItemId: queueItem.id,
+      currentStep: resumedRun.startStep,
+      resumed: resumedRun.resumed,
+    });
     this.appendEvent({
       eventType: "run.started",
       projectId: project.id,
@@ -258,6 +269,14 @@ export class WorkerLoopRunner {
         queueItemId: queueItem.id,
         currentStep: resumedRun.startStep,
       },
+    });
+    this.options.logger.info("worker run started", {
+      projectId: project.id,
+      loopId: loop.id,
+      runId: run.id,
+      taskId: task.id,
+      queueItemId: queueItem.id,
+      currentStep: resumedRun.startStep,
     });
 
     try {
@@ -273,6 +292,14 @@ export class WorkerLoopRunner {
           entityType: "run",
           entityId: run.id,
           payload: { step },
+        });
+        this.options.logger.info("worker step started", {
+          projectId: project.id,
+          loopId: loop.id,
+          runId: run.id,
+          taskId: task.id,
+          queueItemId: queueItem.id,
+          currentStep: step,
         });
 
         checkpoint = await this.executeStep({
@@ -299,6 +326,14 @@ export class WorkerLoopRunner {
           entityId: run.id,
           payload: { step },
         });
+        this.options.logger.info("worker step completed", {
+          projectId: project.id,
+          loopId: loop.id,
+          runId: run.id,
+          taskId: task.id,
+          queueItemId: queueItem.id,
+          currentStep: step,
+        });
 
         if (checkpoint.skipReason) {
           break;
@@ -320,6 +355,18 @@ export class WorkerLoopRunner {
         entityId: run.id,
         payload: { summary },
       });
+      this.options.logger.info(
+        checkpoint.skipReason ? "worker run skipped" : "worker run completed",
+        {
+          projectId: project.id,
+          loopId: loop.id,
+          runId: run.id,
+          taskId: task.id,
+          queueItemId: queueItem.id,
+          currentStep: run.currentStep,
+          summary,
+        },
+      );
       this.options.scheduler.complete(queueItem.id);
 
       const requeuedItem = this.handlePostRunSuccess({
@@ -378,6 +425,16 @@ export class WorkerLoopRunner {
           summary: failure.message,
           failureKind: failure.kind,
         },
+      });
+      this.options.logger.error("worker run failed", {
+        projectId: project.id,
+        loopId: loop.id,
+        runId: run.id,
+        taskId: task.id,
+        queueItemId: queueItem.id,
+        currentStep: run.currentStep,
+        failureKind: failure.kind,
+        summary: failure.message,
       });
 
       const failedQueueItem = this.options.scheduler.fail(

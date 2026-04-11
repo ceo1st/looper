@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import type { AgentResult, AgentRunInput } from "../infra/agent";
+import type { Logger } from "../bootstrap/logger";
 import { CommandExecutionError, runCommand } from "../infra/command";
 import type {
   GitHubPullRequestDetail,
@@ -75,6 +76,7 @@ export interface FixerLoopRunnerOptions {
   github: FixerGitHubGateway;
   git: FixerGitGateway;
   agentExecutor: FixerAgentExecutor;
+  logger: Logger;
   now?: () => Date;
   agentTimeoutMs?: number;
   claimTtlMs?: number;
@@ -290,6 +292,15 @@ export class FixerLoopRunner {
         startStep: resumedRun.startStep,
       },
     });
+    this.options.logger.info("fixer loop started", {
+      projectId: project.id,
+      loopId: loop.id,
+      runId: run.id,
+      queueItemId: queueItem.id,
+      taskId: queueItem.taskId,
+      currentStep: resumedRun.startStep,
+      resumed: resumedRun.resumed,
+    });
     this.appendEvent({
       eventType: "run.started",
       projectId: project.id,
@@ -301,6 +312,14 @@ export class FixerLoopRunner {
         queueItemId: queueItem.id,
         currentStep: resumedRun.startStep,
       },
+    });
+    this.options.logger.info("fixer run started", {
+      projectId: project.id,
+      loopId: loop.id,
+      runId: run.id,
+      queueItemId: queueItem.id,
+      taskId: queueItem.taskId,
+      currentStep: resumedRun.startStep,
     });
 
     try {
@@ -316,6 +335,14 @@ export class FixerLoopRunner {
           entityType: "run",
           entityId: run.id,
           payload: { step },
+        });
+        this.options.logger.info("fixer step started", {
+          projectId: project.id,
+          loopId: loop.id,
+          runId: run.id,
+          queueItemId: queueItem.id,
+          taskId: queueItem.taskId,
+          currentStep: step,
         });
         checkpoint = await this.executeStep({
           step,
@@ -340,6 +367,14 @@ export class FixerLoopRunner {
           entityId: run.id,
           payload: { step },
         });
+        this.options.logger.info("fixer step completed", {
+          projectId: project.id,
+          loopId: loop.id,
+          runId: run.id,
+          queueItemId: queueItem.id,
+          taskId: queueItem.taskId,
+          currentStep: step,
+        });
         if (checkpoint.skipReason) {
           break;
         }
@@ -362,6 +397,18 @@ export class FixerLoopRunner {
         entityId: run.id,
         payload: { summary },
       });
+      this.options.logger.info(
+        checkpoint.skipReason ? "fixer run skipped" : "fixer run completed",
+        {
+          projectId: project.id,
+          loopId: loop.id,
+          runId: run.id,
+          queueItemId: queueItem.id,
+          taskId: queueItem.taskId,
+          currentStep: run.currentStep,
+          summary,
+        },
+      );
       this.options.scheduler.complete(queueItem.id);
       this.updateLoop(loop, {
         status: "completed",
@@ -416,6 +463,16 @@ export class FixerLoopRunner {
           summary: failure.message,
           failureKind: failure.kind,
         },
+      });
+      this.options.logger.error("fixer run failed", {
+        projectId: project.id,
+        loopId: loop.id,
+        runId: run.id,
+        queueItemId: queueItem.id,
+        taskId: queueItem.taskId,
+        currentStep: run.currentStep,
+        failureKind: failure.kind,
+        summary: failure.message,
       });
 
       const failedQueueItem = this.options.scheduler.fail(

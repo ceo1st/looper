@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { AgentResult, AgentRunInput } from "../infra/agent";
+import type { Logger } from "../bootstrap/logger";
 import { SchedulerQueue } from "../scheduler/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import type { WorktreeRecord } from "../storage/types";
@@ -238,6 +239,24 @@ function completedAgentResult(
   };
 }
 
+function createCapturingLogger() {
+  const entries: Array<{
+    level: "info" | "error";
+    message: string;
+    context?: Record<string, unknown>;
+  }> = [];
+  const logger: Logger = {
+    debug: () => {},
+    warn: () => {},
+    info: (message, context) =>
+      entries.push({ level: "info", message, context }),
+    error: (message, context) =>
+      entries.push({ level: "error", message, context }),
+  };
+
+  return { logger, entries };
+}
+
 describe("WorkerLoopRunner", () => {
   test("opens a pull request after a successful worker run", async () => {
     const fixture = await createFixture();
@@ -248,12 +267,14 @@ describe("WorkerLoopRunner", () => {
         "abc123",
       ]),
     ]);
+    const logs = createCapturingLogger();
     const runner = new WorkerLoopRunner({
       store: fixture.store,
       scheduler: fixture.queue,
       git,
       github,
       agentExecutor: agent,
+      logger: logs.logger,
       now: () => fixture.now,
       validationRunner: async (): Promise<WorkerValidationResult> => ({
         passed: true,
@@ -281,6 +302,21 @@ describe("WorkerLoopRunner", () => {
     );
     expect(fixture.store.taskItems.getById("item_1")?.status).toBe("done");
     expect(fixture.store.taskItems.getById("item_2")?.status).toBe("done");
+    expect(
+      logs.entries.some((entry) => entry.message === "worker loop started"),
+    ).toBe(true);
+    expect(
+      logs.entries.some((entry) => entry.message === "worker run started"),
+    ).toBe(true);
+    expect(
+      logs.entries.some((entry) => entry.message === "worker step started"),
+    ).toBe(true);
+    expect(
+      logs.entries.some((entry) => entry.message === "worker step completed"),
+    ).toBe(true);
+    expect(
+      logs.entries.some((entry) => entry.message === "worker run completed"),
+    ).toBe(true);
 
     fixture.store.close();
   });
@@ -298,6 +334,7 @@ describe("WorkerLoopRunner", () => {
       git,
       github,
       agentExecutor: agent,
+      logger: createCapturingLogger().logger,
       now: () => fixture.now,
       validationRunner: async (): Promise<WorkerValidationResult> => ({
         passed: false,
@@ -348,12 +385,14 @@ describe("WorkerLoopRunner", () => {
         "abc123",
       ]),
     ]);
+    const logs = createCapturingLogger();
     const runner = new WorkerLoopRunner({
       store: fixture.store,
       scheduler: fixture.queue,
       git,
       github,
       agentExecutor: agent,
+      logger: logs.logger,
       now: () => fixture.now,
       validationRunner: async (): Promise<WorkerValidationResult> => ({
         passed: true,
@@ -372,6 +411,17 @@ describe("WorkerLoopRunner", () => {
     expect(firstResult.status).toBe("failed");
     expect(firstResult.failureKind).toBe("retryable_after_resume");
     expect(agent.starts).toHaveLength(1);
+    const failedLog = logs.entries.find(
+      (entry) =>
+        entry.level === "error" && entry.message === "worker run failed",
+    );
+    expect(failedLog?.context).toMatchObject({
+      projectId: "project_1",
+      queueItemId: firstClaim.id,
+      taskId: "task_1",
+      failureKind: "retryable_after_resume",
+      currentStep: "open-pr",
+    });
 
     const retryClaim = fixture.queue.claimNext("worker-1");
     if (!retryClaim) {
@@ -401,6 +451,7 @@ describe("WorkerLoopRunner", () => {
       git,
       github,
       agentExecutor: agent,
+      logger: createCapturingLogger().logger,
       now: () => fixture.now,
       validationRunner: async (): Promise<WorkerValidationResult> => ({
         passed: true,
@@ -443,6 +494,7 @@ describe("WorkerLoopRunner", () => {
       git,
       github,
       agentExecutor: agent,
+      logger: createCapturingLogger().logger,
       now: () => fixture.now,
       validationRunner: async (): Promise<WorkerValidationResult> => ({
         passed: true,

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { AgentResult, AgentRunInput } from "../infra/agent";
+import type { Logger } from "../bootstrap/logger";
 import { SchedulerQueue } from "../scheduler/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import type { PullRequestSnapshotRecord } from "../storage/types";
@@ -211,6 +212,24 @@ function completedAgentResult(summary: string): AgentResult {
   };
 }
 
+function createCapturingLogger() {
+  const entries: Array<{
+    level: "info" | "error";
+    message: string;
+    context?: Record<string, unknown>;
+  }> = [];
+  const logger: Logger = {
+    debug: () => {},
+    warn: () => {},
+    info: (message, context) =>
+      entries.push({ level: "info", message, context }),
+    error: (message, context) =>
+      entries.push({ level: "error", message, context }),
+  };
+
+  return { logger, entries };
+}
+
 describe("ReviewerLoopRunner", () => {
   test("discovers PRs and completes a full reviewer run", async () => {
     const fixture = await createFixture();
@@ -218,11 +237,13 @@ describe("ReviewerLoopRunner", () => {
     const agent = new FakeAgentExecutor([
       completedAgentResult("Looks good overall"),
     ]);
+    const logs = createCapturingLogger();
     const runner = new ReviewerLoopRunner({
       store: fixture.store,
       scheduler: fixture.queue,
       github,
       agentExecutor: agent,
+      logger: logs.logger,
       now: () => fixture.now,
     });
 
@@ -257,6 +278,21 @@ describe("ReviewerLoopRunner", () => {
         .listByEntity("pull_request", "acme/looper#42")
         .some((event) => event.eventType === "pr.review.posted"),
     ).toBe(true);
+    expect(
+      logs.entries.some((entry) => entry.message === "reviewer loop started"),
+    ).toBe(true);
+    expect(
+      logs.entries.some((entry) => entry.message === "reviewer run started"),
+    ).toBe(true);
+    expect(
+      logs.entries.some((entry) => entry.message === "reviewer step started"),
+    ).toBe(true);
+    expect(
+      logs.entries.some((entry) => entry.message === "reviewer step completed"),
+    ).toBe(true);
+    expect(
+      logs.entries.some((entry) => entry.message === "reviewer run completed"),
+    ).toBe(true);
 
     fixture.store.close();
   });
@@ -268,11 +304,13 @@ describe("ReviewerLoopRunner", () => {
     const agent = new FakeAgentExecutor([
       completedAgentResult("Please add tests"),
     ]);
+    const logs = createCapturingLogger();
     const runner = new ReviewerLoopRunner({
       store: fixture.store,
       scheduler: fixture.queue,
       github,
       agentExecutor: agent,
+      logger: logs.logger,
       now: () => fixture.now,
     });
 
@@ -296,6 +334,17 @@ describe("ReviewerLoopRunner", () => {
     expect(firstRun?.lastCompletedStep).toBe("review");
     expect(firstCheckpoint.pendingReview.body).toContain("Please add tests");
     expect(fixture.store.queue.getById(firstClaim.id)?.status).toBe("queued");
+    const failedLog = logs.entries.find(
+      (entry) =>
+        entry.level === "error" && entry.message === "reviewer run failed",
+    );
+    expect(failedLog).toBeDefined();
+    expect(failedLog?.context).toMatchObject({
+      projectId: "project_1",
+      queueItemId: firstClaim.id,
+      failureKind: "retryable_after_resume",
+      currentStep: "publish",
+    });
 
     fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
     const retryClaim = fixture.queue.claimNext("reviewer-worker-1");
@@ -336,6 +385,7 @@ describe("ReviewerLoopRunner", () => {
       scheduler: fixture.queue,
       github,
       agentExecutor: agent,
+      logger: createCapturingLogger().logger,
       now: () => fixture.now,
     });
 
@@ -362,6 +412,7 @@ describe("ReviewerLoopRunner", () => {
       scheduler: fixture.queue,
       github,
       agentExecutor: agent,
+      logger: createCapturingLogger().logger,
       now: () => fixture.now,
     });
 
@@ -385,6 +436,7 @@ describe("ReviewerLoopRunner", () => {
       scheduler: fixture.queue,
       github,
       agentExecutor: agent,
+      logger: createCapturingLogger().logger,
       now: () => fixture.now,
     });
 
@@ -438,6 +490,7 @@ describe("ReviewerLoopRunner", () => {
       scheduler: fixture.queue,
       github,
       agentExecutor: agent,
+      logger: createCapturingLogger().logger,
       now: () => fixture.now,
     });
 

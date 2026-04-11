@@ -212,6 +212,23 @@ describe("createLooperdApi", () => {
   test("returns events and pull request detail routes", async () => {
     const { api, store, rootDir } = await createFixture();
 
+    store.loops.upsert({
+      id: "loop_2",
+      projectId: "project_1",
+      type: "fixer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      repo: "acme/looper",
+      prNumber: 42,
+      status: "paused",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: null,
+      createdAt: "2026-04-11T12:01:00.000Z",
+      updatedAt: "2026-04-11T12:01:00.000Z",
+    });
+
     const eventsResponse = await api.handle(
       new Request("http://localhost/api/v1/events/loop/loop_1"),
     );
@@ -229,7 +246,32 @@ describe("createLooperdApi", () => {
     };
     expect(prBody.data.repo).toBe("acme/looper");
     expect(prBody.data.prNumber).toBe(42);
+    expect((prBody.data as { reviewer?: string }).reviewer).toBe("running");
+    expect((prBody.data as { fixer?: string }).fixer).toBe("paused");
     expect(prBody.data.task?.id).toBe("task_1");
+
+    const prListResponse = await api.handle(
+      new Request("http://localhost/api/v1/pull-requests"),
+    );
+    const prListBody = (await prListResponse.json()) as {
+      data: {
+        items: Array<{
+          repo: string;
+          prNumber: number;
+          reviewState: string | null;
+          checksSummary: string | null;
+          reviewer: string | null;
+          fixer: string | null;
+        }>;
+      };
+    };
+    const listItem = prListBody.data.items.find(
+      (item) => item.repo === "acme/looper" && item.prNumber === 42,
+    );
+    expect(listItem?.reviewState).toBe("changes_requested");
+    expect(listItem?.checksSummary).toBe("green");
+    expect(listItem?.reviewer).toBe("running");
+    expect(listItem?.fixer).toBe("paused");
 
     const prStatusResponse = await api.handle(
       new Request(
@@ -237,9 +279,64 @@ describe("createLooperdApi", () => {
       ),
     );
     const prStatusBody = (await prStatusResponse.json()) as {
-      data: { loopStatus: { latestRunStatus: string } };
+      data: {
+        loopStatus: { latestRunStatus: string };
+        reviewer: string | null;
+        fixer: string | null;
+      };
     };
     expect(prStatusBody.data.loopStatus.latestRunStatus).toBe("running");
+    expect(prStatusBody.data.reviewer).toBe("running");
+    expect(prStatusBody.data.fixer).toBe("paused");
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("lists PR identities from loops when snapshot is missing", async () => {
+    const { api, store, rootDir } = await createFixture();
+
+    store.loops.upsert({
+      id: "loop_no_snapshot",
+      projectId: "project_1",
+      type: "reviewer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:77",
+      repo: "acme/looper",
+      prNumber: 77,
+      status: "queued",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: null,
+      createdAt: "2026-04-11T12:02:00.000Z",
+      updatedAt: "2026-04-11T12:02:00.000Z",
+    });
+
+    const prListResponse = await api.handle(
+      new Request("http://localhost/api/v1/pull-requests"),
+    );
+    const prListBody = (await prListResponse.json()) as {
+      data: {
+        items: Array<{
+          repo: string;
+          prNumber: number;
+          reviewState: string | null;
+          checksSummary: string | null;
+          reviewer: string | null;
+          fixer: string | null;
+        }>;
+      };
+    };
+
+    const missingSnapshotItem = prListBody.data.items.find(
+      (item) => item.repo === "acme/looper" && item.prNumber === 77,
+    );
+    expect(missingSnapshotItem).toBeDefined();
+    expect(missingSnapshotItem?.reviewState).toBeNull();
+    expect(missingSnapshotItem?.checksSummary).toBeNull();
+    expect(missingSnapshotItem?.reviewer).toBe("queued");
+    expect(missingSnapshotItem?.fixer).toBeNull();
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });
