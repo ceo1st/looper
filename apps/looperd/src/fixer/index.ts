@@ -133,6 +133,7 @@ export interface FixerLoopRunnerOptions {
     projectId: string;
     loopId: string;
     runId: string;
+    subtitle: string;
     body: string;
     dedupeKey: string;
   }) => Promise<void> | void;
@@ -901,7 +902,8 @@ export class FixerLoopRunner {
       projectId: input.loop.projectId,
       loopId: input.loop.id,
       runId: input.run.id,
-      body: `Fixer agent started for ${requireString(input.queueItem.repo, "queueItem.repo")}#${requireNumber(input.queueItem.prNumber, "queueItem.prNumber")}`,
+      subtitle: `${requireString(input.queueItem.repo, "queueItem.repo")}#${requireNumber(input.queueItem.prNumber, "queueItem.prNumber")}`,
+      body: "Fix started",
       dedupeKey: `runtime.agent.started:fixer:${input.run.id}`,
     });
     const result = await execution.wait();

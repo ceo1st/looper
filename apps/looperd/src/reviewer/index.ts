@@ -73,6 +73,7 @@ export interface ReviewerLoopRunnerOptions {
     projectId: string;
     loopId: string;
     runId: string;
+    subtitle: string;
     body: string;
     dedupeKey: string;
   }) => Promise<void> | void;
@@ -718,7 +719,8 @@ export class ReviewerLoopRunner {
       projectId: input.project.id,
       loopId: input.loop.id,
       runId: input.run.id,
-      body: `Reviewer agent started for ${repo}#${prNumber}`,
+      subtitle: `${repo}#${prNumber}`,
+      body: "Review started",
       dedupeKey: `runtime.agent.started:reviewer:${input.run.id}`,
     });
     const result = await execution.wait();

@@ -88,6 +88,7 @@ export interface WorkerLoopRunnerOptions {
     projectId: string;
     loopId: string;
     runId: string;
+    subtitle: string;
     body: string;
     dedupeKey: string;
   }) => Promise<void> | void;
@@ -711,7 +712,8 @@ export class WorkerLoopRunner {
       projectId: input.project.id,
       loopId: input.loop.id,
       runId: input.run.id,
-      body: `Worker agent started for task ${input.task.id}`,
+      subtitle: input.task.id,
+      body: "Task started",
       dedupeKey: `runtime.agent.started:worker:${input.run.id}`,
     });
     const result = await execution.wait();

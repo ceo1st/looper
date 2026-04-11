@@ -491,6 +491,7 @@ describe("FixerLoopRunner", () => {
       projectId: string;
       loopId: string;
       runId: string;
+      subtitle: string;
       body: string;
       dedupeKey: string;
     }> = [];
@@ -523,9 +524,8 @@ describe("FixerLoopRunner", () => {
     await runner.processClaimedItem(claimed);
 
     expect(notifications).toHaveLength(1);
-    expect(notifications[0]?.body).toBe(
-      "Fixer agent started for acme/looper#42",
-    );
+    expect(notifications[0]?.subtitle).toBe("acme/looper#42");
+    expect(notifications[0]?.body).toBe("Fix started");
     expect(notifications[0]?.dedupeKey).toMatch(
       /^runtime\.agent\.started:fixer:/,
     );
