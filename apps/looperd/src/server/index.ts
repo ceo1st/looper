@@ -3,8 +3,8 @@ import { randomUUID } from "node:crypto";
 import type { Logger } from "../bootstrap/logger";
 import type { LooperConfig } from "../config/index";
 import {
-  LOOP_TARGET_TYPES,
   LOOP_STATUSES,
+  LOOP_TARGET_TYPES,
   LOOP_TYPES,
   assertTaskStatusTransition,
   assertUniqueActiveLoop,

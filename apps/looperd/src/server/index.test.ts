@@ -906,7 +906,9 @@ describe("createLooperdApi", () => {
         .list()
         .some((loop) => loop.targetId === "task:task_no_agent_start"),
     ).toBe(false);
-    expect(store.queue.findActiveByDedupe("worker:task_no_agent_start")).toBeNull();
+    expect(
+      store.queue.findActiveByDedupe("worker:task_no_agent_start"),
+    ).toBeNull();
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });
