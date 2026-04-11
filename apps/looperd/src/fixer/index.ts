@@ -133,7 +133,6 @@ export interface FixerLoopRunnerOptions {
     projectId: string;
     loopId: string;
     runId: string;
-    subtitle: string;
     body: string;
     dedupeKey: string;
   }) => Promise<void> | void;
@@ -902,8 +901,7 @@ export class FixerLoopRunner {
       projectId: input.loop.projectId,
       loopId: input.loop.id,
       runId: input.run.id,
-      subtitle: `${requireString(input.queueItem.repo, "queueItem.repo")}#${requireNumber(input.queueItem.prNumber, "queueItem.prNumber")}`,
-      body: "Fix started",
+      body: `Fixer agent started for ${requireString(input.queueItem.repo, "queueItem.repo")}#${requireNumber(input.queueItem.prNumber, "queueItem.prNumber")}`,
       dedupeKey: `runtime.agent.started:fixer:${input.run.id}`,
     });
     const result = await execution.wait();
@@ -1713,11 +1711,21 @@ export class FixerLoopRunner {
   }): Promise<void> {
     let actualHeadSha: string | undefined;
     for (let attempt = 0; attempt < input.attempts; attempt += 1) {
-      const currentPr = await this.options.github.viewPullRequest({
-        repo: input.repo,
-        prNumber: input.prNumber,
-        cwd: input.cwd,
-      });
+      let currentPr;
+      try {
+        currentPr = await this.options.github.viewPullRequest({
+          repo: input.repo,
+          prNumber: input.prNumber,
+          cwd: input.cwd,
+        });
+      } catch (error) {
+        throw new FixerLoopError(
+          error instanceof Error
+            ? error.message
+            : "Failed to poll pull request head",
+          "retryable_after_resume",
+        );
+      }
       actualHeadSha = currentPr.headSha;
       if (actualHeadSha === input.expectedHeadSha) {
         return;

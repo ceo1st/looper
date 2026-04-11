@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import type { Logger } from "../bootstrap/logger";
 import type { LooperConfig } from "../config/index";
 import {
+  LOOP_STATUSES,
+  LOOP_TYPES,
   assertTaskStatusTransition,
   assertUniqueActiveLoop,
   createLoop,
@@ -638,6 +640,8 @@ function startTask(context: LooperdApiContext, taskId: string) {
     throw new ApiError("TASK_NOT_FOUND", 404, `Task not found: ${taskId}`);
   }
 
+  validateTaskStartPrerequisites(context, task);
+
   const now = new Date().toISOString();
   let loop = task.loopId ? context.store.loops.getById(task.loopId) : null;
 
@@ -771,9 +775,9 @@ async function buildLoopsCreateResponse(
     );
   }
 
-  const type = readRequiredString(body, "type");
+  const type = readLoopType(body);
   const targetType = readRequiredString(body, "targetType");
-  const status = readOptionalString(body, "status") ?? "running";
+  const status = readLoopStatus(body);
 
   if (
     (type === "reviewer" || type === "fixer") &&
@@ -876,6 +880,41 @@ function createLoopRecord(input: {
   return record;
 }
 
+function validateTaskStartPrerequisites(
+  context: LooperdApiContext,
+  task: ReturnType<Store["tasks"]["getById"]> extends infer T
+    ? Exclude<T, null>
+    : never,
+) {
+  if (!task.repo) {
+    throw new ApiError(
+      "VALIDATION_FAILED",
+      400,
+      `Task ${task.id} must define repo before it can be started`,
+    );
+  }
+
+  const metadata = parsePayloadJson(task.metadataJson ?? "null") as Record<
+    string,
+    unknown
+  > | null;
+  if (typeof metadata?.specPath !== "string" || metadata.specPath.length === 0) {
+    throw new ApiError(
+      "VALIDATION_FAILED",
+      400,
+      `Task ${task.id} must define specPath before it can be started`,
+    );
+  }
+
+  if (context.store.taskItems.listByTask(task.id).length === 0) {
+    throw new ApiError(
+      "VALIDATION_FAILED",
+      400,
+      `Task ${task.id} must have at least one checklist item before it can be started`,
+    );
+  }
+}
+
 function serializeTask(
   context: LooperdApiContext,
   task: ReturnType<Store["tasks"]["getById"]> extends infer T
@@ -946,6 +985,32 @@ function readTaskItems(
       updatedAt: now,
     });
   });
+}
+
+function readLoopType(body: Record<string, unknown>) {
+  const type = readRequiredString(body, "type");
+  if (!LOOP_TYPES.includes(type as (typeof LOOP_TYPES)[number])) {
+    throw new ApiError(
+      "VALIDATION_FAILED",
+      400,
+      `type must be one of: ${LOOP_TYPES.join(", ")}`,
+    );
+  }
+
+  return type;
+}
+
+function readLoopStatus(body: Record<string, unknown>) {
+  const status = readOptionalString(body, "status") ?? "running";
+  if (!LOOP_STATUSES.includes(status as (typeof LOOP_STATUSES)[number])) {
+    throw new ApiError(
+      "VALIDATION_FAILED",
+      400,
+      `status must be one of: ${LOOP_STATUSES.join(", ")}`,
+    );
+  }
+
+  return status;
 }
 
 function readRequiredValue(

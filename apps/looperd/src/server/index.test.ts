@@ -435,6 +435,7 @@ describe("createLooperdApi", () => {
           projectId: "project_1",
           title: "Implement CLI route",
           description: "Create API endpoint",
+          repo: "acme/looper",
           specPath: "specs/cli.md",
           items: ["wire client", "add tests"],
         }),
@@ -579,6 +580,93 @@ describe("createLooperdApi", () => {
     expect(body.data.id).toBe("looper");
     expect(body.data.repo).toBe("powerformer/looper");
     expect(body.data.discoveredPullRequests).toBe(1);
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("rejects task start when worker preflight prerequisites are missing", async () => {
+    const { api, store, rootDir } = await createFixture();
+
+    store.tasks.upsert({
+      id: "task_missing_preflight",
+      projectId: "project_1",
+      title: "Missing worker inputs",
+      description: null,
+      status: "pending",
+      loopId: null,
+      repo: null,
+      prNumber: null,
+      metadataJson: null,
+      createdAt: "2026-04-11T12:00:00.000Z",
+      updatedAt: "2026-04-11T12:00:00.000Z",
+    });
+
+    const response = await api.handle(
+      new Request("http://localhost/api/v1/tasks/task_missing_preflight/start", {
+        method: "POST",
+      }),
+    );
+    const body = (await response.json()) as {
+      error: { code: string; message: string };
+    };
+
+    expect(response.status).toBe(400);
+    expect(body.error.code).toBe("VALIDATION_FAILED");
+    expect(body.error.message).toContain("must define repo");
+    expect(store.tasks.getById("task_missing_preflight")?.status).toBe("pending");
+    expect(
+      store.loops
+        .list()
+        .some((loop) => loop.targetId === "task:task_missing_preflight"),
+    ).toBe(false);
+    expect(store.queue.findActiveByDedupe("worker:task_missing_preflight")).toBeNull();
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("returns validation errors for invalid loop type and status", async () => {
+    const { api, store, rootDir } = await createFixture();
+
+    const invalidTypeResponse = await api.handle(
+      new Request("http://localhost/api/v1/loops", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          type: "invalid",
+          targetType: "task",
+          taskId: "task_1",
+        }),
+      }),
+    );
+    const invalidTypeBody = (await invalidTypeResponse.json()) as {
+      error: { code: string; message: string };
+    };
+    expect(invalidTypeResponse.status).toBe(400);
+    expect(invalidTypeBody.error.code).toBe("VALIDATION_FAILED");
+    expect(invalidTypeBody.error.message).toContain("type must be one of");
+
+    const invalidStatusResponse = await api.handle(
+      new Request("http://localhost/api/v1/loops", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          type: "worker",
+          targetType: "task",
+          taskId: "task_1",
+          status: "invalid",
+        }),
+      }),
+    );
+    const invalidStatusBody = (await invalidStatusResponse.json()) as {
+      error: { code: string; message: string };
+    };
+    expect(invalidStatusResponse.status).toBe(400);
+    expect(invalidStatusBody.error.code).toBe("VALIDATION_FAILED");
+    expect(invalidStatusBody.error.message).toContain("status must be one of");
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });

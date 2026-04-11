@@ -22,6 +22,7 @@ import type {
   AgentExecutionRecord,
   EventLogRecord,
   LoopRecord,
+  QueueItemRecord,
   RunRecord,
 } from "../storage/types";
 import { WorkerLoopRunner } from "../worker/index";
@@ -189,8 +190,8 @@ class BasicLooperdRuntime implements LooperdRuntime {
                 loopId: input.loopId,
                 runId: input.runId,
                 level: "info",
-                title: "Looper Reviewer",
-                subtitle: input.subtitle,
+                title: "Reviewer Started",
+                subtitle: "reviewer",
                 body: input.body,
                 entityType: "agent_execution",
                 entityId: input.executionId,
@@ -221,8 +222,8 @@ class BasicLooperdRuntime implements LooperdRuntime {
                 loopId: input.loopId,
                 runId: input.runId,
                 level: "info",
-                title: "Looper Fixer",
-                subtitle: input.subtitle,
+                title: "Fixer Started",
+                subtitle: "fixer",
                 body: input.body,
                 entityType: "agent_execution",
                 entityId: input.executionId,
@@ -250,8 +251,8 @@ class BasicLooperdRuntime implements LooperdRuntime {
                 loopId: input.loopId,
                 runId: input.runId,
                 level: "info",
-                title: "Looper Worker",
-                subtitle: input.subtitle,
+                title: "Worker Started",
+                subtitle: "worker",
                 body: input.body,
                 entityType: "agent_execution",
                 entityId: input.executionId,
@@ -316,9 +317,9 @@ class BasicLooperdRuntime implements LooperdRuntime {
 
       await this.notifySystemEvent({
         level: "success",
-        title: "Looper",
-        subtitle: "Service",
-        body: "Started",
+        title: "Looperd Status Changed",
+        subtitle: "system",
+        body: "Service started",
         entityType: "notification",
         entityId: "looperd.started",
         dedupeKey: "looperd.started:system:looperd",
@@ -330,9 +331,9 @@ class BasicLooperdRuntime implements LooperdRuntime {
       ) {
         await this.notifySystemEvent({
           level: "info",
-          title: "Looper",
-          subtitle: "Service",
-          body: "Recovery completed",
+          title: "Looperd Status Changed",
+          subtitle: "system",
+          body: "Service recovery completed",
           entityType: "notification",
           entityId: "looperd.recovered",
           dedupeKey: "looperd.recovered:system:looperd",
@@ -687,6 +688,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
       return;
     }
 
+    const claimedItems: QueueItemRecord[] = [];
     for (
       let count = 0;
       count < this.options.config.scheduler.maxConcurrentRuns;
@@ -699,135 +701,147 @@ class BasicLooperdRuntime implements LooperdRuntime {
           next.type !== "fixer" &&
           next.type !== "worker")
       ) {
-        return;
+        break;
       }
 
       const claimed = this.scheduler.claimNext(`looperd-${next.type}`);
       if (!claimed) {
-        return;
+        break;
       }
 
-      if (claimed.type === "reviewer" && this.reviewerRunner) {
-        try {
-          const result = await this.reviewerRunner.processClaimedItem(claimed);
-          if (
-            result.status === "failed" &&
-            shouldNotifyRunFailure(claimed.type, result)
-          ) {
-            void this.notifySystemEvent({
-              projectId: claimed.projectId ?? undefined,
-              loopId: result.loopId,
-              runId: result.runId,
-              level: "failure",
-              title: "Looper Reviewer",
-              subtitle: `${claimed.repo}#${claimed.prNumber}`,
-              body: `Run failed: ${result.summary}`,
-              entityType: "run",
-              entityId: result.runId,
-              dedupeKey: `runtime.run.failed:reviewer:${result.runId}`,
-            });
-          }
-        } catch (error) {
-          void this.notifySystemEvent({
-            projectId: claimed.projectId ?? undefined,
-            loopId: claimed.loopId ?? undefined,
-            level: "failure",
-            title: "Looper Reviewer",
-            subtitle: `${claimed.repo}#${claimed.prNumber}`,
-            body: `Scheduling failed: ${error instanceof Error ? error.message : String(error)}`,
-            entityType: "queue_item",
-            entityId: claimed.id,
-            dedupeKey: `runtime.queue.failed:reviewer:${claimed.id}`,
-          });
-          throw error;
-        }
-        continue;
-      }
-
-      if (claimed.type === "fixer" && this.fixerRunner) {
-        try {
-          const result = await this.fixerRunner.processClaimedItem(claimed);
-          if (
-            result.status === "failed" &&
-            shouldNotifyRunFailure(claimed.type, result)
-          ) {
-            void this.notifySystemEvent({
-              projectId: claimed.projectId ?? undefined,
-              loopId: result.loopId,
-              runId: result.runId,
-              level: "failure",
-              title: "Looper Fixer",
-              subtitle: `${claimed.repo}#${claimed.prNumber}`,
-              body: `Run failed: ${result.summary}`,
-              entityType: "run",
-              entityId: result.runId,
-              dedupeKey: `runtime.run.failed:fixer:${result.runId}`,
-            });
-          }
-        } catch (error) {
-          void this.notifySystemEvent({
-            projectId: claimed.projectId ?? undefined,
-            loopId: claimed.loopId ?? undefined,
-            level: "failure",
-            title: "Looper Fixer",
-            subtitle: `${claimed.repo}#${claimed.prNumber}`,
-            body: `Scheduling failed: ${error instanceof Error ? error.message : String(error)}`,
-            entityType: "queue_item",
-            entityId: claimed.id,
-            dedupeKey: `runtime.queue.failed:fixer:${claimed.id}`,
-          });
-          throw error;
-        }
-        continue;
-      }
-
-      if (claimed.type === "worker" && this.workerRunner) {
-        try {
-          const result = await this.workerRunner.processClaimedItem(claimed);
-          if (
-            result.status === "failed" &&
-            shouldNotifyRunFailure(claimed.type, result)
-          ) {
-            void this.notifySystemEvent({
-              projectId: claimed.projectId ?? undefined,
-              loopId: result.loopId,
-              runId: result.runId,
-              level: "failure",
-              title: "Looper Worker",
-              subtitle: claimed.taskId ?? claimed.targetId,
-              body: `Run failed: ${result.summary}`,
-              entityType: "run",
-              entityId: result.runId,
-              dedupeKey: `runtime.run.failed:worker:${result.runId}`,
-            });
-          }
-        } catch (error) {
-          void this.notifySystemEvent({
-            projectId: claimed.projectId ?? undefined,
-            loopId: claimed.loopId ?? undefined,
-            level: "failure",
-            title: "Looper Worker",
-            subtitle: claimed.taskId ?? claimed.targetId,
-            body: `Scheduling failed: ${error instanceof Error ? error.message : String(error)}`,
-            entityType: "queue_item",
-            entityId: claimed.id,
-            dedupeKey: `runtime.queue.failed:worker:${claimed.id}`,
-          });
-          throw error;
-        }
-        continue;
-      }
-
-      this.options.logger.warn("claimed unsupported scheduler item", {
-        queueItemId: claimed.id,
-        type: claimed.type,
-      });
-      this.scheduler.fail(
-        claimed.id,
-        "non_retryable",
-        `No runtime runner configured for queue item type: ${claimed.type}`,
-      );
+      claimedItems.push(claimed);
     }
+
+    if (claimedItems.length === 0) {
+      return;
+    }
+
+    const results = await Promise.allSettled(
+      claimedItems.map((claimed) => this.processClaimedSchedulerItem(claimed)),
+    );
+
+    const rejected = results.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    if (rejected) {
+      throw rejected.reason;
+    }
+  }
+
+  private async processClaimedSchedulerItem(
+    claimed: QueueItemRecord,
+  ): Promise<void> {
+    if (claimed.type === "reviewer" && this.reviewerRunner) {
+      try {
+        const result = await this.reviewerRunner.processClaimedItem(claimed);
+        if (result.status === "failed" && shouldNotifyRunFailure(claimed.type, result)) {
+          void this.notifySystemEvent({
+            projectId: claimed.projectId ?? undefined,
+            loopId: result.loopId,
+            runId: result.runId,
+            level: "failure",
+            title: "Looperd Run Failed",
+            subtitle: `reviewer:${result.loopId}`,
+            body: `Reviewer run ${result.runId} failed for ${claimed.targetId}: ${result.summary}`,
+            entityType: "run",
+            entityId: result.runId,
+            dedupeKey: `runtime.run.failed:reviewer:${result.runId}`,
+          });
+        }
+      } catch (error) {
+        void this.notifySystemEvent({
+          projectId: claimed.projectId ?? undefined,
+          loopId: claimed.loopId ?? undefined,
+          level: "failure",
+          title: "Looperd Scheduling Failed",
+          subtitle: `reviewer:${claimed.loopId ?? claimed.id}`,
+          body: `Reviewer processing failed for ${claimed.targetId}: ${error instanceof Error ? error.message : String(error)}`,
+          entityType: "queue_item",
+          entityId: claimed.id,
+          dedupeKey: `runtime.queue.failed:reviewer:${claimed.id}`,
+        });
+        throw error;
+      }
+      return;
+    }
+
+    if (claimed.type === "fixer" && this.fixerRunner) {
+      try {
+        const result = await this.fixerRunner.processClaimedItem(claimed);
+        if (result.status === "failed" && shouldNotifyRunFailure(claimed.type, result)) {
+          void this.notifySystemEvent({
+            projectId: claimed.projectId ?? undefined,
+            loopId: result.loopId,
+            runId: result.runId,
+            level: "failure",
+            title: "Looperd Run Failed",
+            subtitle: `fixer:${result.loopId}`,
+            body: `Fixer run ${result.runId} failed for ${claimed.targetId}: ${result.summary}`,
+            entityType: "run",
+            entityId: result.runId,
+            dedupeKey: `runtime.run.failed:fixer:${result.runId}`,
+          });
+        }
+      } catch (error) {
+        void this.notifySystemEvent({
+          projectId: claimed.projectId ?? undefined,
+          loopId: claimed.loopId ?? undefined,
+          level: "failure",
+          title: "Looperd Scheduling Failed",
+          subtitle: `fixer:${claimed.loopId ?? claimed.id}`,
+          body: `Fixer processing failed for ${claimed.targetId}: ${error instanceof Error ? error.message : String(error)}`,
+          entityType: "queue_item",
+          entityId: claimed.id,
+          dedupeKey: `runtime.queue.failed:fixer:${claimed.id}`,
+        });
+        throw error;
+      }
+      return;
+    }
+
+    if (claimed.type === "worker" && this.workerRunner) {
+      try {
+        const result = await this.workerRunner.processClaimedItem(claimed);
+        if (result.status === "failed" && shouldNotifyRunFailure(claimed.type, result)) {
+          void this.notifySystemEvent({
+            projectId: claimed.projectId ?? undefined,
+            loopId: result.loopId,
+            runId: result.runId,
+            level: "failure",
+            title: "Looperd Run Failed",
+            subtitle: `worker:${result.loopId}`,
+            body: `Worker run ${result.runId} failed for ${claimed.targetId}: ${result.summary}`,
+            entityType: "run",
+            entityId: result.runId,
+            dedupeKey: `runtime.run.failed:worker:${result.runId}`,
+          });
+        }
+      } catch (error) {
+        void this.notifySystemEvent({
+          projectId: claimed.projectId ?? undefined,
+          loopId: claimed.loopId ?? undefined,
+          level: "failure",
+          title: "Looperd Scheduling Failed",
+          subtitle: `worker:${claimed.loopId ?? claimed.id}`,
+          body: `Worker processing failed for ${claimed.targetId}: ${error instanceof Error ? error.message : String(error)}`,
+          entityType: "queue_item",
+          entityId: claimed.id,
+          dedupeKey: `runtime.queue.failed:worker:${claimed.id}`,
+        });
+        throw error;
+      }
+      return;
+    }
+
+    this.options.logger.warn("claimed unsupported scheduler item", {
+      queueItemId: claimed.id,
+      type: claimed.type,
+    });
+    this.scheduler?.fail(
+      claimed.id,
+      "non_retryable",
+      `No runtime runner configured for queue item type: ${claimed.type}`,
+    );
   }
 
   private async resolveProjectRepo(

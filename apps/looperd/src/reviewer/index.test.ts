@@ -356,7 +356,6 @@ describe("ReviewerLoopRunner", () => {
       projectId: string;
       loopId: string;
       runId: string;
-      subtitle: string;
       body: string;
       dedupeKey: string;
     }> = [];
@@ -384,8 +383,9 @@ describe("ReviewerLoopRunner", () => {
     await runner.processClaimedItem(claimed);
 
     expect(notifications).toHaveLength(1);
-    expect(notifications[0]?.subtitle).toBe("acme/looper#42");
-    expect(notifications[0]?.body).toBe("Review started");
+    expect(notifications[0]?.body).toBe(
+      "Reviewer agent started for acme/looper#42",
+    );
     expect(notifications[0]?.dedupeKey).toMatch(
       /^runtime\.agent\.started:reviewer:/,
     );
