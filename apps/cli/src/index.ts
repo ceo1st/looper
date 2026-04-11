@@ -347,7 +347,7 @@ function createCli(runtime: CliRuntime) {
     .option("--project <projectId>", "Filter by project id")
     .example((name) => `  $ ${name} ps`)
     .example((name) => `  $ ${name} ps --type reviewer --project project_1`)
-    .action(async (_args, options) => {
+    .action(async (options) => {
       await dispatch(createContext(runtime, ["ps"], options));
     });
 

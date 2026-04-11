@@ -18,20 +18,6 @@ function createConfig() {
   };
 }
 
-async function withPatchedObjectEntries<T>(
-  fallback: Record<string, unknown>,
-  fn: () => Promise<T>,
-): Promise<T> {
-  const original = Object.entries;
-  Object.entries = ((value: unknown) =>
-    original(value ?? fallback)) as typeof Object.entries;
-  try {
-    return await fn();
-  } finally {
-    Object.entries = original;
-  }
-}
-
 describe("runCli", () => {
   test("renders status as json", async () => {
     const lines: string[] = [];
@@ -276,8 +262,7 @@ describe("runCli", () => {
   test("prints active runs as json for ps --json", async () => {
     const lines: string[] = [];
     const requests: string[] = [];
-    const exitCode = await withPatchedObjectEntries({ json: true }, async () =>
-      runCli(["ps", "--json"], {
+    const exitCode = await runCli(["ps", "--json"], {
         stdout: (line) => lines.push(line),
         loadConfigImpl: async () => createConfig() as never,
         fetchImpl: async (input) => {
@@ -318,8 +303,7 @@ describe("runCli", () => {
             }),
           );
         },
-      }),
-    );
+      });
 
     expect(exitCode).toBe(0);
     expect(requests[0]).toContain("/api/v1/runs/active");
@@ -333,8 +317,7 @@ describe("runCli", () => {
     Date.now = () => Date.parse("2026-04-11T12:05:00.000Z");
 
     try {
-      const exitCode = await withPatchedObjectEntries({}, async () =>
-        runCli(["ps"], {
+      const exitCode = await runCli(["ps"], {
           stdout: (line) => lines.push(line),
           loadConfigImpl: async () => createConfig() as never,
           fetchImpl: async () =>
@@ -373,8 +356,7 @@ describe("runCli", () => {
                 },
               }),
             ),
-        }),
-      );
+        });
 
       expect(exitCode).toBe(0);
       expect(lines[0]).toContain("type");
@@ -400,8 +382,7 @@ describe("runCli", () => {
 
   test("prints ps empty state", async () => {
     const lines: string[] = [];
-    const exitCode = await withPatchedObjectEntries({}, async () =>
-      runCli(["ps"], {
+    const exitCode = await runCli(["ps"], {
         stdout: (line) => lines.push(line),
         loadConfigImpl: async () => createConfig() as never,
         fetchImpl: async () =>
@@ -412,8 +393,7 @@ describe("runCli", () => {
               data: { items: [] },
             }),
           ),
-      }),
-    );
+      });
 
     expect(exitCode).toBe(0);
     expect(lines).toEqual(["No running loops."]);
@@ -421,10 +401,9 @@ describe("runCli", () => {
 
   test("composes ps query params from --type and --project", async () => {
     const requests: string[] = [];
-    const exitCode = await withPatchedObjectEntries(
-      { type: "reviewer", project: "project_1" },
-      () =>
-        runCli(["ps", "--type", "reviewer", "--project", "project_1"], {
+    const exitCode = await runCli(
+      ["ps", "--type", "reviewer", "--project", "project_1"],
+      {
           stdout: () => {},
           loadConfigImpl: async () => createConfig() as never,
           fetchImpl: async (input) => {
@@ -437,7 +416,7 @@ describe("runCli", () => {
               }),
             );
           },
-        }),
+        },
     );
 
     expect(exitCode).toBe(0);
