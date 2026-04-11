@@ -36,6 +36,7 @@ export interface ReviewerGitHubGateway {
     cwd?: string;
     limit?: number;
   }): Promise<GitHubPullRequestSummary[]>;
+  getCurrentUserLogin(input?: { cwd?: string }): Promise<string | undefined>;
   viewPullRequest(input: {
     repo: string;
     prNumber: number;
@@ -161,6 +162,14 @@ export class ReviewerLoopRunner {
       cwd: project.repoPath,
       limit: input.limit,
     });
+    const currentLogin = await this.resolveCurrentGhLogin(project.repoPath);
+    if (!currentLogin) {
+      return {
+        queueItems: [],
+        createdLoopIds: [],
+        skipped: openPullRequests.length,
+      };
+    }
 
     const queueItems: QueueItemRecord[] = [];
     const createdLoopIds: string[] = [];
@@ -169,7 +178,8 @@ export class ReviewerLoopRunner {
     for (const pullRequest of openPullRequests) {
       if (
         pullRequest.isDraft ||
-        normalizePrState(pullRequest.state) !== "open"
+        normalizePrState(pullRequest.state) !== "open" ||
+        !isCurrentUserRequested(pullRequest.reviewRequests, currentLogin)
       ) {
         skipped += 1;
         continue;
@@ -200,6 +210,18 @@ export class ReviewerLoopRunner {
     }
 
     return { queueItems, createdLoopIds, skipped };
+  }
+
+  private async resolveCurrentGhLogin(
+    cwd: string,
+  ): Promise<string | undefined> {
+    try {
+      return normalizeLogin(
+        await this.options.github.getCurrentUserLogin({ cwd }),
+      );
+    } catch {
+      return undefined;
+    }
   }
 
   public async processNext(
@@ -1065,6 +1087,20 @@ function requireNumber(
 
 function normalizePrState(value: string | undefined): "open" | "other" {
   return value?.toLowerCase() === "open" ? "open" : "other";
+}
+
+function normalizeLogin(login: string | undefined): string | undefined {
+  const normalized = login?.trim().toLowerCase();
+  return normalized && normalized.length > 0 ? normalized : undefined;
+}
+
+function isCurrentUserRequested(
+  requestedReviewers: string[] | undefined,
+  currentLogin: string,
+): boolean {
+  return (requestedReviewers ?? []).some(
+    (login) => normalizeLogin(login) === currentLogin,
+  );
 }
 
 function toReviewBody(result: AgentResult): string | null {

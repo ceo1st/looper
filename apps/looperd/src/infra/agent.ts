@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import type { AgentConfig } from "../config/index";
+import type { AgentConfig, AgentVendor } from "../config/index";
 import type { Store } from "../storage/store";
 import type { AgentExecutionRecord } from "../storage/types";
 
@@ -50,10 +50,12 @@ export interface AgentExecution {
 }
 
 export interface AgentExecutorOptions {
-  config: AgentConfig;
+  config: AgentConfig & { vendor: AgentVendor };
   store?: Store;
   now?: () => Date;
 }
+
+type ConfiguredAgentConfig = AgentConfig & { vendor: AgentVendor };
 
 const COMPLETION_MARKER = "__LOOPER_RESULT__=";
 
@@ -338,7 +340,7 @@ export class ConfiguredAgentExecutor {
   }
 }
 
-function resolveCommand(config: AgentConfig): string {
+function resolveCommand(config: ConfiguredAgentConfig): string {
   const override = config.params?.command;
   if (typeof override === "string" && override.length > 0) {
     return override;
@@ -354,7 +356,7 @@ function resolveCommand(config: AgentConfig): string {
   }
 }
 
-function resolveArgs(config: AgentConfig): string[] {
+function resolveArgs(config: ConfiguredAgentConfig): string[] {
   const args = config.params?.args;
   return Array.isArray(args)
     ? args.filter((value): value is string => typeof value === "string")

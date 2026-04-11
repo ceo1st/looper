@@ -72,6 +72,9 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
       isDraft?: boolean;
       state?: string;
       reviewDecision?: string;
+      reviewRequests?: string[];
+      currentUserLogin?: string;
+      failCurrentUserLookup?: boolean;
     } = {},
   ) {}
 
@@ -88,6 +91,7 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
         isDraft: this.options.isDraft ?? false,
         reviewDecision: this.options.reviewDecision,
         author: "octocat",
+        reviewRequests: this.options.reviewRequests ?? ["octocat"],
       },
       {
         number: 99,
@@ -96,8 +100,17 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
         isDraft: true,
         reviewDecision: undefined,
         author: "octocat",
+        reviewRequests: this.options.reviewRequests ?? ["octocat"],
       },
     ];
+  }
+
+  public async getCurrentUserLogin(): Promise<string | undefined> {
+    if (this.options.failCurrentUserLookup) {
+      throw new Error("gh auth unavailable");
+    }
+
+    return this.options.currentUserLogin ?? "octocat";
   }
 
   public async viewPullRequest() {
@@ -114,6 +127,7 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
       headSha: this.options.headSha ?? "abc123",
       baseSha: "base123",
       author: "octocat",
+      reviewRequests: this.options.reviewRequests ?? ["octocat"],
       comments: [],
       reviews: [],
       checks: [{ conclusion: "SUCCESS" }],
@@ -306,6 +320,81 @@ describe("ReviewerLoopRunner", () => {
     ).toMatchObject({
       lastPublishedHeadSha: "abc123",
     });
+
+    fixture.store.close();
+  });
+
+  test("auto-discovery enqueues only when current user is requested", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      currentUserLogin: "OctoCat",
+      reviewRequests: ["OCTOCAT"],
+    });
+    const agent = new FakeAgentExecutor([completedAgentResult("unused")]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      now: () => fixture.now,
+    });
+
+    const discovery = await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+
+    expect(discovery.queueItems).toHaveLength(1);
+    expect(discovery.skipped).toBe(1);
+
+    fixture.store.close();
+  });
+
+  test("auto-discovery skips PRs when current user is not requested", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      currentUserLogin: "octocat",
+      reviewRequests: ["hubot"],
+    });
+    const agent = new FakeAgentExecutor([completedAgentResult("unused")]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      now: () => fixture.now,
+    });
+
+    const discovery = await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+
+    expect(discovery.queueItems).toHaveLength(0);
+    expect(discovery.skipped).toBe(2);
+
+    fixture.store.close();
+  });
+
+  test("auto-discovery fails closed when current user cannot be resolved", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({ failCurrentUserLookup: true });
+    const agent = new FakeAgentExecutor([completedAgentResult("unused")]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      now: () => fixture.now,
+    });
+
+    const discovery = await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+
+    expect(discovery.queueItems).toHaveLength(0);
+    expect(discovery.skipped).toBe(2);
 
     fixture.store.close();
   });

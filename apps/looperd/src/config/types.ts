@@ -46,7 +46,7 @@ export interface SchedulerConfig {
 }
 
 export interface AgentConfig {
-  vendor: AgentVendor;
+  vendor?: AgentVendor;
   model?: string;
   params?: Record<string, unknown>;
   env?: Record<string, string>;

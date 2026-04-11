@@ -19,6 +19,7 @@ export interface GitHubPullRequestSummary {
   headRefName?: string;
   baseRefName?: string;
   author?: string;
+  reviewRequests: string[];
 }
 
 export interface GitHubPullRequestDetail extends GitHubPullRequestSummary {
@@ -85,6 +86,7 @@ export class GhCliGitHubGateway {
           "headRefName",
           "baseRefName",
           "author",
+          "reviewRequests",
         ].join(","),
       ],
       input.cwd,
@@ -100,6 +102,7 @@ export class GhCliGitHubGateway {
       headRefName: asOptionalString(item.headRefName),
       baseRefName: asOptionalString(item.baseRefName),
       author: extractAuthor(item.author),
+      reviewRequests: extractReviewRequestLogins(item.reviewRequests),
     }));
   }
 
@@ -129,6 +132,7 @@ export class GhCliGitHubGateway {
           "headRefOid",
           "baseRefOid",
           "author",
+          "reviewRequests",
           "comments",
           "reviews",
           "statusCheckRollup",
@@ -151,6 +155,7 @@ export class GhCliGitHubGateway {
       headSha: asOptionalString(parsed.headRefOid),
       baseSha: asOptionalString(parsed.baseRefOid),
       author: extractAuthor(parsed.author),
+      reviewRequests: extractReviewRequestLogins(parsed.reviewRequests),
       comments: asArrayValue(parsed.comments),
       reviews: asArrayValue(parsed.reviews),
       checks: asArrayValue(parsed.statusCheckRollup),
@@ -218,6 +223,16 @@ export class GhCliGitHubGateway {
       url,
       number: parsePrNumberFromUrl(url),
     };
+  }
+
+  public async getCurrentUserLogin(input?: {
+    cwd?: string;
+  }): Promise<string | undefined> {
+    const result = await this.runGh(
+      ["api", "user", "--jq", ".login"],
+      input?.cwd,
+    );
+    return asOptionalString(result.stdout.trim());
   }
 
   public async capturePullRequestSnapshot(input: {
@@ -340,6 +355,43 @@ function extractAuthor(value: unknown): string | undefined {
 
   const author = value as Record<string, unknown>;
   return asOptionalString(author.login) ?? asOptionalString(author.name);
+}
+
+function extractReviewRequestLogins(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map(extractReviewRequestLogin)
+    .filter((login): login is string => Boolean(login));
+}
+
+function extractReviewRequestLogin(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const entry = value as Record<string, unknown>;
+  const directType = asOptionalString(entry.__typename);
+  const directLogin = asOptionalString(entry.login);
+  if (directType === "User" && directLogin) {
+    return directLogin;
+  }
+
+  const requestedReviewer = entry.requestedReviewer;
+  if (!requestedReviewer || typeof requestedReviewer !== "object") {
+    return undefined;
+  }
+
+  const reviewer = requestedReviewer as Record<string, unknown>;
+  const reviewerType = asOptionalString(reviewer.__typename);
+  const reviewerLogin = asOptionalString(reviewer.login);
+  if (reviewerType === "User" && reviewerLogin) {
+    return reviewerLogin;
+  }
+
+  return undefined;
 }
 
 function parsePrNumberFromUrl(url: string): number | undefined {

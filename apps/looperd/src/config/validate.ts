@@ -137,7 +137,7 @@ export async function validateLooperConfig(
     });
   }
 
-  if (!AGENT_VENDORS.includes(config.agent.vendor)) {
+  if (config.agent.vendor && !AGENT_VENDORS.includes(config.agent.vendor)) {
     issues.push({
       path: "agent.vendor",
       message: `must be one of: ${AGENT_VENDORS.join(", ")}`,

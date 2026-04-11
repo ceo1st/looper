@@ -16,6 +16,7 @@ async function createFixture() {
   config.daemon.logDir = `${rootDir}/logs`;
   config.daemon.workingDirectory = rootDir;
   config.server.authMode = "none";
+  config.agent.vendor = "opencode";
 
   const logger = await createLogger(config.logging, config.daemon.logDir);
   const store = new SqliteStore({
@@ -474,6 +475,86 @@ describe("createLooperdApi", () => {
     expect(body.data.id).toBe("looper");
     expect(body.data.repo).toBe("powerformer/looper");
     expect(body.data.discoveredPullRequests).toBe(1);
+
+    store.close();
+    await rm(rootDir, { recursive: true, force: true });
+  });
+
+  test("rejects reviewer/fixer create and start when no coding agent is configured", async () => {
+    const { api, store, rootDir } = await createFixture();
+    store.loops.upsert({
+      id: "loop_fixer_no_agent",
+      projectId: "project_1",
+      type: "fixer",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:99",
+      repo: "acme/looper",
+      prNumber: 99,
+      status: "paused",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: null,
+      createdAt: "2026-04-11T12:00:00.000Z",
+      updatedAt: "2026-04-11T12:00:00.000Z",
+    });
+
+    const configWithoutAgent = createDefaultLooperConfig(rootDir);
+    configWithoutAgent.agent.vendor = undefined;
+    const apiWithoutAgent = createLooperdApi({
+      config: configWithoutAgent,
+      logger: await createLogger(
+        configWithoutAgent.logging,
+        `${rootDir}/logs-no-agent`,
+      ),
+      store,
+      getStartedAt: () => new Date("2026-04-11T12:00:00.000Z"),
+      getRecoverySummary: () => ({ expiredLocksReleased: 0 }),
+    });
+
+    const createFixerResponse = await apiWithoutAgent.handle(
+      new Request("http://localhost/api/v1/loops", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          type: "fixer",
+          targetType: "pull_request",
+          repo: "acme/looper",
+          prNumber: 88,
+        }),
+      }),
+    );
+    const createFixerBody = (await createFixerResponse.json()) as {
+      error: { code: string; message: string };
+    };
+    expect(createFixerResponse.status).toBe(400);
+    expect(createFixerBody.error.code).toBe("AGENT_NOT_CONFIGURED");
+
+    const startFixerResponse = await apiWithoutAgent.handle(
+      new Request("http://localhost/api/v1/loops/loop_fixer_no_agent/start", {
+        method: "POST",
+      }),
+    );
+    const startFixerBody = (await startFixerResponse.json()) as {
+      error: { code: string; message: string };
+    };
+    expect(startFixerResponse.status).toBe(400);
+    expect(startFixerBody.error.code).toBe("AGENT_NOT_CONFIGURED");
+
+    const createWorkerResponse = await apiWithoutAgent.handle(
+      new Request("http://localhost/api/v1/loops", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          type: "worker",
+          targetType: "task",
+          taskId: "task_1",
+        }),
+      }),
+    );
+    expect(createWorkerResponse.status).toBe(200);
 
     store.close();
     await rm(rootDir, { recursive: true, force: true });

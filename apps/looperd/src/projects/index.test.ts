@@ -52,12 +52,14 @@ describe("ProjectManager", () => {
             title: "PR 1",
             isDraft: false,
             state: "OPEN",
+            reviewRequests: [],
           },
           {
             number: 2,
             title: "Draft PR",
             isDraft: true,
             state: "OPEN",
+            reviewRequests: [],
           },
         ],
         capturePullRequestSnapshot: async ({ projectId, repo, prNumber }) => ({

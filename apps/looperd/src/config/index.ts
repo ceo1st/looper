@@ -4,6 +4,7 @@ export { detectToolPaths } from "./tools";
 export {
   ConfigValidationError,
   type AgentConfig,
+  type AgentVendor,
   type DaemonConfig,
   type DeepPartial,
   type DefaultsConfig,

@@ -24,7 +24,6 @@ export function createDefaultLooperConfig(cwd = process.cwd()): LooperConfig {
       retryBaseDelayMs: 5_000,
     },
     agent: {
-      vendor: "opencode",
       env: {},
       params: {},
     },

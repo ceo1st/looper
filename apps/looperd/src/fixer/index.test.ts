@@ -84,6 +84,7 @@ class FakeGitHubGateway implements FixerGitHubGateway {
       title: `PR ${pr.number}`,
       state: pr.state ?? "OPEN",
       isDraft: pr.isDraft ?? false,
+      reviewRequests: [],
     }));
   }
 
@@ -113,6 +114,7 @@ class FakeGitHubGateway implements FixerGitHubGateway {
       headSha: next.headSha ?? "abc123",
       baseSha: "base123",
       author: "octocat",
+      reviewRequests: [],
       comments: next.comments ?? [],
       reviews: [],
       checks: next.checks ?? [],
@@ -467,6 +469,7 @@ describe("FixerLoopRunner", () => {
       headSha: "abc123",
       baseSha: "base123",
       author: "octocat",
+      reviewRequests: [],
       comments: [],
       reviews: [],
       checks: [],

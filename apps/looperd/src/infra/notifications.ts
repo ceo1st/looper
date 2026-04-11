@@ -8,6 +8,7 @@ import { escapeAppleScriptString, runCommand } from "./command";
 export interface NotificationGatewayOptions {
   config: NotificationConfig;
   osascriptPath?: string;
+  logFilePath?: string;
   store: Store;
   now?: () => Date;
 }
@@ -152,7 +153,15 @@ export class NotificationGateway {
     try {
       await runCommand({
         command: this.options.osascriptPath,
-        args: ["-e", buildAppleScript(payload, this.options.config)],
+        args: [
+          "-e",
+          buildAppleScript(
+            payload,
+            this.options.config,
+            this.options.logFilePath,
+          ),
+        ],
+        timeoutMs: 35_000,
       });
 
       const record: NotificationRecord = {
@@ -229,9 +238,16 @@ export class NotificationGateway {
 function buildAppleScript(
   payload: SystemNotificationPayload,
   config: NotificationConfig,
+  logFilePath?: string,
 ): string {
   const body = escapeAppleScriptString(payload.body);
   const title = escapeAppleScriptString(payload.title);
+
+  if (payload.level === "failure" && logFilePath) {
+    const openLogPath = escapeAppleScriptString(logFilePath);
+    return `set dialogResult to display dialog "${body}" with title "${title}" buttons {"Open Log", "Dismiss"} default button "Dismiss" cancel button "Dismiss" giving up after 30\nif gave up of dialogResult is false and button returned of dialogResult is "Open Log" then\n  do shell script "open " & quoted form of "${openLogPath}"\nend if`;
+  }
+
   const subtitle = payload.subtitle
     ? ` subtitle "${escapeAppleScriptString(payload.subtitle)}"`
     : "";

@@ -100,6 +100,7 @@ describe("loadLooperConfig", () => {
     expect(loaded.config.tools.bunPath).toBe("/env/bun");
     expect(loaded.config.tools.gitPath).toBe("/cli/git");
     expect(loaded.config.tools.ghPath).toBe("/env/gh");
+    expect(loaded.config.agent.vendor).toBeUndefined();
     expect(loaded.config.defaults.allowAutoCommit).toBe(false);
     expect(loaded.config.defaults.allowAutoPush).toBe(false);
     expect(loaded.config.defaults.allowAutoApprove).toBe(true);

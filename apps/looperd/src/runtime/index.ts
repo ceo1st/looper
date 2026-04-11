@@ -5,20 +5,36 @@ import { fileURLToPath } from "node:url";
 
 import type { Logger } from "../bootstrap/logger";
 import type { LooperConfig } from "../config/index";
+import { FixerLoopRunner } from "../fixer/index";
+import type { AgentResult } from "../infra/agent";
 import {
+  ConfiguredAgentExecutor,
   GhCliGitHubGateway,
   GitWorktreeGateway,
   NotificationGateway,
 } from "../infra/index";
 import { ProjectManager } from "../projects/index";
+import { ReviewerLoopRunner } from "../reviewer/index";
+import { SchedulerQueue } from "../scheduler/index";
 import { type LooperdApiServer, createLooperdApiServer } from "../server/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
+import { WorkerLoopRunner } from "../worker/index";
 import type {
   AgentExecutionRecord,
   EventLogRecord,
   LoopRecord,
   RunRecord,
 } from "../storage/types";
+
+interface RuntimeAgentExecution {
+  wait(): Promise<AgentResult>;
+}
+
+interface RuntimeAgentExecutor {
+  start(
+    input: Parameters<ConfiguredAgentExecutor["start"]>[0],
+  ): Promise<RuntimeAgentExecution>;
+}
 
 export interface RecoverySummary {
   startedAt?: string;
@@ -44,6 +60,22 @@ export interface LooperdRuntime {
 export interface CreateLooperdRuntimeOptions {
   config: LooperConfig;
   logger: Logger;
+  github?: Pick<
+    GhCliGitHubGateway,
+    | "listOpenPullRequests"
+    | "getCurrentUserLogin"
+    | "viewPullRequest"
+    | "capturePullRequestSnapshot"
+    | "submitReview"
+    | "createPullRequest"
+  >;
+  git?: Pick<
+    GitWorktreeGateway,
+    "detectGitHubRepo" | "push" | "createWorktree"
+  >;
+  agentExecutor?: RuntimeAgentExecutor;
+  enableReviewer?: boolean;
+  enableFixer?: boolean;
 }
 
 const MIGRATIONS_DIR = resolveMigrationsDir();
@@ -66,6 +98,13 @@ class BasicLooperdRuntime implements LooperdRuntime {
   private stopped = false;
   private store?: SqliteStore;
   private server?: LooperdApiServer;
+  private scheduler?: SchedulerQueue;
+  private git?: CreateLooperdRuntimeOptions["git"];
+  private reviewerRunner?: ReviewerLoopRunner;
+  private fixerRunner?: FixerLoopRunner;
+  private workerRunner?: WorkerLoopRunner;
+  private schedulerTimer?: ReturnType<typeof setInterval>;
+  private schedulerTickRunning = false;
   private recoverySummary: RecoverySummary = createEmptyRecoverySummary();
 
   constructor(private readonly options: CreateLooperdRuntimeOptions) {
@@ -95,6 +134,76 @@ class BasicLooperdRuntime implements LooperdRuntime {
       this.syncConfiguredProjects();
       this.recoverySummary = this.runRecoveryPipeline();
 
+      this.scheduler = new SchedulerQueue({
+        store,
+        retryMaxAttempts: this.options.config.scheduler.retryMaxAttempts,
+        retryBaseDelayMs: this.options.config.scheduler.retryBaseDelayMs,
+      });
+
+      const github =
+        this.options.github ??
+        (this.options.config.tools.ghPath
+          ? new GhCliGitHubGateway({
+              ghPath: this.options.config.tools.ghPath,
+            })
+          : undefined);
+      const git =
+        this.options.git ??
+        (this.options.config.tools.gitPath
+          ? new GitWorktreeGateway({
+              gitPath: this.options.config.tools.gitPath,
+              store,
+            })
+          : undefined);
+      const agentExecutor = isAgentConfigured(this.options.config)
+        ? (this.options.agentExecutor ??
+          new ConfiguredAgentExecutor({
+            config: this.options.config.agent,
+            store,
+          }))
+        : undefined;
+      this.git = git;
+
+      if (github && agentExecutor && this.options.enableReviewer !== false) {
+        this.reviewerRunner = new ReviewerLoopRunner({
+          store,
+          scheduler: this.scheduler,
+          github,
+          agentExecutor,
+          allowAutoApprove: this.options.config.defaults.allowAutoApprove,
+        });
+      }
+
+      if (
+        github &&
+        git &&
+        agentExecutor &&
+        this.options.enableFixer !== false
+      ) {
+        this.fixerRunner = new FixerLoopRunner({
+          store,
+          scheduler: this.scheduler,
+          github,
+          git,
+          agentExecutor,
+          allowAutoCommit: this.options.config.defaults.allowAutoCommit,
+          allowAutoPush: this.options.config.defaults.allowAutoPush,
+          allowRiskyFixes: this.options.config.defaults.allowRiskyFixes,
+        });
+      }
+
+      if (github && git && agentExecutor) {
+        this.workerRunner = new WorkerLoopRunner({
+          store,
+          scheduler: this.scheduler,
+          github,
+          git,
+          agentExecutor,
+          allowAutoCommit: this.options.config.defaults.allowAutoCommit,
+          allowAutoPush: this.options.config.defaults.allowAutoPush,
+        });
+      }
+
       const projects =
         this.options.config.tools.gitPath && this.options.config.tools.ghPath
           ? new ProjectManager({
@@ -123,6 +232,9 @@ class BasicLooperdRuntime implements LooperdRuntime {
         this.server.getPort() ?? this.options.config.server.port;
 
       this.startedAt = new Date();
+      await this.runSchedulerTick();
+      this.startSchedulerLoop();
+
       this.appendEvent({
         id: randomUUID(),
         eventType: "looperd.started",
@@ -195,10 +307,19 @@ class BasicLooperdRuntime implements LooperdRuntime {
         payloadJson: JSON.stringify({ reason }),
         createdAt: stoppedAt,
       });
+      if (this.schedulerTimer) {
+        clearInterval(this.schedulerTimer);
+        this.schedulerTimer = undefined;
+      }
       await this.server?.stop();
     } finally {
       this.store?.close();
       this.server = undefined;
+      this.scheduler = undefined;
+      this.git = undefined;
+      this.reviewerRunner = undefined;
+      this.fixerRunner = undefined;
+      this.workerRunner = undefined;
       this.store = undefined;
       this.resolveShutdown();
     }
@@ -407,6 +528,9 @@ class BasicLooperdRuntime implements LooperdRuntime {
   }
 
   private async notifySystemEvent(input: {
+    projectId?: string;
+    loopId?: string;
+    runId?: string;
     level: "info" | "warning" | "action_required" | "success" | "failure";
     title: string;
     subtitle: string;
@@ -422,6 +546,7 @@ class BasicLooperdRuntime implements LooperdRuntime {
     const gateway = new NotificationGateway({
       config: this.options.config.notifications,
       osascriptPath: this.options.config.tools.osascriptPath,
+      logFilePath: join(this.options.config.daemon.logDir, "looperd.log"),
       store: this.store,
     });
     await gateway.notify(input);
@@ -440,6 +565,240 @@ class BasicLooperdRuntime implements LooperdRuntime {
       ...record,
     });
   }
+
+  private startSchedulerLoop(): void {
+    const pollIntervalMs =
+      this.options.config.scheduler.pollIntervalSeconds * 1_000;
+    this.schedulerTimer = setInterval(() => {
+      void this.runSchedulerTick();
+    }, pollIntervalMs);
+  }
+
+  private async runSchedulerTick(): Promise<void> {
+    if (this.schedulerTickRunning || !this.store || !this.scheduler) {
+      return;
+    }
+
+    this.schedulerTickRunning = true;
+    try {
+      await this.discoverPullRequests();
+      await this.processScheduledWork();
+    } catch (error) {
+      this.options.logger.warn("looperd scheduler tick failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      this.schedulerTickRunning = false;
+    }
+  }
+
+  private async discoverPullRequests(): Promise<void> {
+    if (!this.store) {
+      return;
+    }
+
+    for (const project of this.store.projects.list()) {
+      if (project.archived) {
+        continue;
+      }
+
+      const repo = await this.resolveProjectRepo(project);
+      if (!repo) {
+        continue;
+      }
+
+      if (this.reviewerRunner) {
+        await this.reviewerRunner.discoverPullRequests({
+          projectId: project.id,
+          repo,
+        });
+      }
+
+      if (this.fixerRunner) {
+        await this.fixerRunner.discoverPullRequests({
+          projectId: project.id,
+          repo,
+        });
+      }
+    }
+  }
+
+  private async processScheduledWork(): Promise<void> {
+    if (!this.scheduler) {
+      return;
+    }
+
+    for (
+      let count = 0;
+      count < this.options.config.scheduler.maxConcurrentRuns;
+      count += 1
+    ) {
+      const next = this.scheduler.listScheduled(1)[0];
+      if (
+        !next ||
+        (next.type !== "reviewer" &&
+          next.type !== "fixer" &&
+          next.type !== "worker")
+      ) {
+        return;
+      }
+
+      const claimed = this.scheduler.claimNext(`looperd-${next.type}`);
+      if (!claimed) {
+        return;
+      }
+
+      if (claimed.type === "reviewer" && this.reviewerRunner) {
+        try {
+          const result = await this.reviewerRunner.processClaimedItem(claimed);
+          if (result.status === "failed") {
+            void this.notifySystemEvent({
+              projectId: claimed.projectId ?? undefined,
+              loopId: result.loopId,
+              runId: result.runId,
+              level: "failure",
+              title: "looperd 运行失败",
+              subtitle: `reviewer:${result.loopId}`,
+              body: `Reviewer run ${result.runId} failed for ${claimed.targetId}: ${result.summary}`,
+              entityType: "run",
+              entityId: result.runId,
+              dedupeKey: `runtime.run.failed:reviewer:${result.runId}`,
+            });
+          }
+        } catch (error) {
+          void this.notifySystemEvent({
+            projectId: claimed.projectId ?? undefined,
+            loopId: claimed.loopId ?? undefined,
+            level: "failure",
+            title: "looperd 调度失败",
+            subtitle: `reviewer:${claimed.loopId ?? claimed.id}`,
+            body: `Reviewer processing failed for ${claimed.targetId}: ${error instanceof Error ? error.message : String(error)}`,
+            entityType: "queue_item",
+            entityId: claimed.id,
+            dedupeKey: `runtime.queue.failed:reviewer:${claimed.id}`,
+          });
+          throw error;
+        }
+        continue;
+      }
+
+      if (claimed.type === "fixer" && this.fixerRunner) {
+        try {
+          const result = await this.fixerRunner.processClaimedItem(claimed);
+          if (result.status === "failed") {
+            void this.notifySystemEvent({
+              projectId: claimed.projectId ?? undefined,
+              loopId: result.loopId,
+              runId: result.runId,
+              level: "failure",
+              title: "looperd 运行失败",
+              subtitle: `fixer:${result.loopId}`,
+              body: `Fixer run ${result.runId} failed for ${claimed.targetId}: ${result.summary}`,
+              entityType: "run",
+              entityId: result.runId,
+              dedupeKey: `runtime.run.failed:fixer:${result.runId}`,
+            });
+          }
+        } catch (error) {
+          void this.notifySystemEvent({
+            projectId: claimed.projectId ?? undefined,
+            loopId: claimed.loopId ?? undefined,
+            level: "failure",
+            title: "looperd 调度失败",
+            subtitle: `fixer:${claimed.loopId ?? claimed.id}`,
+            body: `Fixer processing failed for ${claimed.targetId}: ${error instanceof Error ? error.message : String(error)}`,
+            entityType: "queue_item",
+            entityId: claimed.id,
+            dedupeKey: `runtime.queue.failed:fixer:${claimed.id}`,
+          });
+          throw error;
+        }
+        continue;
+      }
+
+      if (claimed.type === "worker" && this.workerRunner) {
+        try {
+          const result = await this.workerRunner.processClaimedItem(claimed);
+          if (result.status === "failed") {
+            void this.notifySystemEvent({
+              projectId: claimed.projectId ?? undefined,
+              loopId: result.loopId,
+              runId: result.runId,
+              level: "failure",
+              title: "looperd 运行失败",
+              subtitle: `worker:${result.loopId}`,
+              body: `Worker run ${result.runId} failed for ${claimed.targetId}: ${result.summary}`,
+              entityType: "run",
+              entityId: result.runId,
+              dedupeKey: `runtime.run.failed:worker:${result.runId}`,
+            });
+          }
+        } catch (error) {
+          void this.notifySystemEvent({
+            projectId: claimed.projectId ?? undefined,
+            loopId: claimed.loopId ?? undefined,
+            level: "failure",
+            title: "looperd 调度失败",
+            subtitle: `worker:${claimed.loopId ?? claimed.id}`,
+            body: `Worker processing failed for ${claimed.targetId}: ${error instanceof Error ? error.message : String(error)}`,
+            entityType: "queue_item",
+            entityId: claimed.id,
+            dedupeKey: `runtime.queue.failed:worker:${claimed.id}`,
+          });
+          throw error;
+        }
+        continue;
+      }
+
+      this.options.logger.warn("claimed unsupported scheduler item", {
+        queueItemId: claimed.id,
+        type: claimed.type,
+      });
+      this.scheduler.fail(
+        claimed.id,
+        "non_retryable",
+        `No runtime runner configured for queue item type: ${claimed.type}`,
+      );
+    }
+  }
+
+  private async resolveProjectRepo(
+    project: ReturnType<SqliteStore["projects"]["list"]>[number],
+  ): Promise<string | null> {
+    const metadata = parseProjectMetadata(project.metadataJson);
+    const existingRepo = readMetadataString(metadata.repo);
+    if (existingRepo) {
+      return existingRepo;
+    }
+
+    if (!this.git) {
+      return null;
+    }
+
+    try {
+      const detectedRepo = await this.git.detectGitHubRepo(project.repoPath);
+      if (!detectedRepo || !this.store) {
+        return detectedRepo;
+      }
+
+      this.store.projects.upsert({
+        ...project,
+        metadataJson: JSON.stringify({
+          ...metadata,
+          repo: detectedRepo,
+        }),
+        updatedAt: new Date().toISOString(),
+      });
+      return detectedRepo;
+    } catch (error) {
+      this.options.logger.warn("failed to resolve project repo for scheduler", {
+        projectId: project.id,
+        repoPath: project.repoPath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
 }
 
 function createEmptyRecoverySummary(): RecoverySummary {
@@ -455,6 +814,12 @@ function createEmptyRecoverySummary(): RecoverySummary {
   };
 }
 
+function isAgentConfigured(config: LooperConfig): config is LooperConfig & {
+  agent: { vendor: NonNullable<LooperConfig["agent"]["vendor"]> };
+} {
+  return Boolean(config.agent.vendor);
+}
+
 function shouldRequeueLoop(loop: LoopRecord, latestRun: RunRecord): boolean {
   if (loop.status === "paused") {
     return false;
@@ -465,6 +830,27 @@ function shouldRequeueLoop(loop: LoopRecord, latestRun: RunRecord): boolean {
   }
 
   return loop.status === "running" || latestRun.status === "interrupted";
+}
+
+function parseProjectMetadata(
+  metadataJson?: string | null,
+): Record<string, unknown> {
+  if (!metadataJson) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(metadataJson) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function readMetadataString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 export function createLooperdRuntime(

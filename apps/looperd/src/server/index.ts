@@ -462,6 +462,18 @@ function mutateLoopStatus(
     throw new ApiError("LOOP_NOT_FOUND", 404, `Loop not found: ${loopId}`);
   }
 
+  if (
+    status === "running" &&
+    (loop.type === "reviewer" || loop.type === "fixer") &&
+    !isCodingAgentConfigured(context.config)
+  ) {
+    throw new ApiError(
+      "AGENT_NOT_CONFIGURED",
+      400,
+      `Cannot start ${loop.type} loop without config.agent.vendor`,
+    );
+  }
+
   const now = new Date().toISOString();
   const updated: typeof loop = {
     ...loop,
@@ -728,6 +740,17 @@ async function buildLoopsCreateResponse(
   const type = readRequiredString(body, "type");
   const targetType = readRequiredString(body, "targetType");
   const status = readOptionalString(body, "status") ?? "running";
+
+  if (
+    (type === "reviewer" || type === "fixer") &&
+    !isCodingAgentConfigured(context.config)
+  ) {
+    throw new ApiError(
+      "AGENT_NOT_CONFIGURED",
+      400,
+      `Cannot create ${type} loop without config.agent.vendor`,
+    );
+  }
 
   const loop = createLoopRecord({
     context,
@@ -1207,6 +1230,10 @@ function jsonResponse<T>(status: number, payload: ApiResponse<T>): Response {
       "content-type": "application/json; charset=utf-8",
     },
   });
+}
+
+function isCodingAgentConfigured(config: LooperConfig): boolean {
+  return Boolean(config.agent.vendor);
 }
 
 function toApiError(error: unknown): ApiError {
