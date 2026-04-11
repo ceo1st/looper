@@ -497,6 +497,15 @@ function mutateLoopStatus(
   }
 
   const now = new Date().toISOString();
+  if (status === "paused") {
+    new SchedulerQueue({
+      store: context.store,
+      retryMaxAttempts: context.config.scheduler.retryMaxAttempts,
+      retryBaseDelayMs: context.config.scheduler.retryBaseDelayMs,
+      now: () => new Date(now),
+    }).cancelByLoop(loopId, "loop paused");
+  }
+
   const updated: typeof loop = {
     ...loop,
     status,

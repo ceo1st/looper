@@ -416,6 +416,7 @@ describe("createLooperdApi", () => {
     };
     expect(pauseLoopResponse.status).toBe(200);
     expect(pauseLoopBody.data.status).toBe("paused");
+    expect(store.queue.getById("queue_1")?.status).toBe("cancelled");
 
     const startLoopResponse = await api.handle(
       new Request("http://localhost/api/v1/loops/loop_1/start", {

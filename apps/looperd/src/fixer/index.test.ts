@@ -577,8 +577,11 @@ describe("FixerLoopRunner", () => {
       repo: "acme/looper",
     });
 
+    expect(discovery.queueItems).toHaveLength(0);
     expect(discovery.createdLoopIds).toHaveLength(0);
+    expect(discovery.skipped).toBe(1);
     expect(fixture.store.loops.getById("loop_paused")?.status).toBe("paused");
+    expect(fixture.store.queue.list()).toHaveLength(0);
 
     fixture.store.close();
   });

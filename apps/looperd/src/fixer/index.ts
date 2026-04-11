@@ -319,6 +319,10 @@ export class FixerLoopRunner {
       if (loop.created) {
         createdLoopIds.push(loop.record.id);
       }
+      if (loop.record.status === "paused") {
+        skipped += 1;
+        continue;
+      }
 
       const headSha = detail.headSha ?? "unknown";
       const fixItemsHash = hashFixItems(fixItems);
