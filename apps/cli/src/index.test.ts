@@ -60,10 +60,22 @@ describe("runCli", () => {
         stdout: () => {},
         loadConfigImpl: async () => createConfig() as never,
         fetchImpl: async (input, init) => {
+          const url = String(input);
           requests.push({
-            url: String(input),
+            url,
             body: init?.body as string | null,
           });
+          if (url.endsWith("/api/v1/projects")) {
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                requestId: "req_projects_create_mode",
+                data: {
+                  items: [{ id: "project_1", repoPath: "/tmp/project" }],
+                },
+              }),
+            );
+          }
           return new Response(
             JSON.stringify({
               ok: true,
@@ -76,10 +88,442 @@ describe("runCli", () => {
     );
 
     expect(exitCode).toBe(0);
-    expect(requests).toHaveLength(1);
-    expect(requests[0]?.url).toContain("/api/v1/workers");
-    expect(requests[0]?.body).toContain('"prompt":"Implement CLI flow"');
-    expect(requests[0]?.body).toContain('"specPath":"spec.md"');
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.url).toContain("/api/v1/workers");
+    expect(requests[1]?.body).toContain('"prompt":"Implement CLI flow"');
+    expect(requests[1]?.body).toContain('"specPath":"spec.md"');
+  });
+
+  test("infers project from cwd for work create mode", async () => {
+    const requests: Array<{
+      method: string;
+      url: string;
+      body?: string | null;
+    }> = [];
+    const exitCode = await runCli(
+      [
+        "work",
+        "--spec",
+        "spec.md",
+        "--prompt",
+        "Implement CLI flow",
+        "--repo",
+        "acme/looper",
+        "--base-branch",
+        "main",
+      ],
+      {
+        cwd: "/tmp/repos/looper/packages/cli",
+        stdout: () => {},
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async (input, init) => {
+          const url = String(input);
+          requests.push({
+            method: init?.method ?? "GET",
+            url,
+            body: init?.body as string | null,
+          });
+
+          if (url.endsWith("/api/v1/projects")) {
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                requestId: "req_projects_1",
+                data: {
+                  items: [
+                    {
+                      id: "project_inferred",
+                      repoPath: "/tmp/repos/looper",
+                    },
+                  ],
+                },
+              }),
+            );
+          }
+
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_worker_inferred",
+              data: {
+                id: "loop_2",
+                title: "Implement CLI flow",
+                status: "running",
+              },
+            }),
+          );
+        },
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(requests[0]?.url).toContain("/api/v1/projects");
+    expect(requests[1]?.url).toContain("/api/v1/workers");
+    expect(requests[1]?.body).toContain('"projectId":"project_inferred"');
+  });
+
+  test("prefers a unique --repo match over an ambiguous cwd match", async () => {
+    let workerRequestCount = 0;
+    const exitCode = await runCli(
+      [
+        "work",
+        "--spec",
+        "spec.md",
+        "--prompt",
+        "Implement CLI flow",
+        "--repo",
+        "acme/looper",
+        "--base-branch",
+        "main",
+      ],
+      {
+        cwd: "/tmp/repos/looper",
+        stdout: () => {},
+        stderr: () => {},
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.endsWith("/api/v1/projects")) {
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                requestId: "req_projects_ambiguous_cwd",
+                data: {
+                  items: [
+                    {
+                      id: "project_1",
+                      repoPath: "/tmp/repos/project-one",
+                      repo: "acme/looper",
+                      worktreeRoot: "/tmp/repos/looper",
+                    },
+                    {
+                      id: "project_2",
+                      repoPath: "/tmp/repos/project-two",
+                      repo: "acme/looper-alt",
+                      worktreeRoot: "/tmp/repos/looper",
+                    },
+                  ],
+                },
+              }),
+            );
+          }
+
+          workerRequestCount += 1;
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_worker_repo_match",
+              data: {
+                id: "loop_repo_match",
+                title: "Implement CLI flow",
+                status: "running",
+              },
+            }),
+          );
+        },
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(workerRequestCount).toBe(1);
+  });
+
+  test("fails work create when --repo has no matching project instead of falling back to cwd", async () => {
+    let workerRequestCount = 0;
+    const exitCode = await runCli(
+      [
+        "work",
+        "--spec",
+        "spec.md",
+        "--prompt",
+        "Implement CLI flow",
+        "--repo",
+        "acme/other",
+        "--base-branch",
+        "main",
+      ],
+      {
+        cwd: "/tmp/repos/looper/packages/cli",
+        stdout: () => {},
+        stderr: () => {},
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.endsWith("/api/v1/projects")) {
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                requestId: "req_projects_missing_repo_hint",
+                data: {
+                  items: [
+                    {
+                      id: "project_cwd",
+                      repoPath: "/tmp/repos/looper",
+                      repo: "acme/looper",
+                    },
+                  ],
+                },
+              }),
+            );
+          }
+
+          workerRequestCount += 1;
+          return new Response(
+            JSON.stringify({ ok: true, requestId: "unexpected" }),
+          );
+        },
+      },
+    );
+
+    expect(exitCode).toBe(1);
+    expect(workerRequestCount).toBe(0);
+  });
+
+  test("creates worker from numeric --pr input", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(["work", "--pr", "42"], {
+      cwd: "/tmp/repos/looper",
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({
+          url,
+          body: init?.body as string | null,
+        });
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_projects_2",
+              data: {
+                items: [
+                  {
+                    id: "project_1",
+                    repoPath: "/tmp/repos/looper",
+                    repo: "acme/looper",
+                  },
+                ],
+              },
+            }),
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_worker_pr",
+            data: {
+              id: "loop_worker_pr",
+              title: "Implement acme/looper#42",
+              status: "running",
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests[1]?.url).toContain("/api/v1/workers");
+    expect(requests[1]?.body).toContain('"repo":"acme/looper"');
+    expect(requests[1]?.body).toContain('"prNumber":42');
+  });
+
+  test("creates worker from qualified --pr input", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(["work", "--pr", "acme/looper#42"], {
+      cwd: "/tmp/repos/looper",
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({
+          url,
+          body: init?.body as string | null,
+        });
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_projects_qualified_pr",
+              data: {
+                items: [{ id: "project_1", repoPath: "/tmp/repos/looper" }],
+              },
+            }),
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_worker_qualified_pr",
+            data: {
+              id: "loop_worker_pr_qualified",
+              title: "Implement acme/looper#42",
+              status: "running",
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests[1]?.body).toContain('"repo":"acme/looper"');
+    expect(requests[1]?.body).toContain('"prNumber":42');
+  });
+
+  test("creates worker from numeric --issue input", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(["work", "--issue", "123"], {
+      cwd: "/tmp/repos/looper",
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({
+          url,
+          body: init?.body as string | null,
+        });
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_projects_3",
+              data: {
+                items: [
+                  {
+                    id: "project_1",
+                    repoPath: "/tmp/repos/looper",
+                    repo: "acme/looper",
+                  },
+                ],
+              },
+            }),
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_worker_issue",
+            data: {
+              id: "loop_worker_issue",
+              title: "Implement acme/looper#123",
+              status: "running",
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests[1]?.url).toContain("/api/v1/workers");
+    expect(requests[1]?.body).toContain('"repo":"acme/looper"');
+    expect(requests[1]?.body).toContain('"issueNumber":123');
+  });
+
+  test("creates worker from qualified --issue input", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(["work", "--issue", "acme/looper#123"], {
+      cwd: "/tmp/repos/looper",
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({
+          url,
+          body: init?.body as string | null,
+        });
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_projects_qualified_issue",
+              data: {
+                items: [
+                  {
+                    id: "project_1",
+                    repoPath: "/tmp/repos/looper",
+                    repo: "acme/looper",
+                  },
+                ],
+              },
+            }),
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_worker_qualified_issue",
+            data: {
+              id: "loop_worker_issue_qualified",
+              title: "Implement acme/looper#123",
+              status: "running",
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests[1]?.body).toContain('"repo":"acme/looper"');
+    expect(requests[1]?.body).toContain('"issueNumber":123');
+  });
+
+  test("prefers qualified issue repo over cwd project", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(["work", "--issue", "acme/other#123"], {
+      cwd: "/tmp/repos/looper",
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({
+          url,
+          body: init?.body as string | null,
+        });
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_projects_qualified_issue_repo_priority",
+              data: {
+                items: [
+                  {
+                    id: "project_1",
+                    repoPath: "/tmp/repos/looper",
+                    repo: "acme/looper",
+                  },
+                  {
+                    id: "project_2",
+                    repoPath: "/tmp/repos/other",
+                    repo: "acme/other",
+                  },
+                ],
+              },
+            }),
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_worker_qualified_issue_repo_priority",
+            data: {
+              id: "loop_worker_issue_repo_priority",
+              title: "Implement acme/other#123",
+              status: "running",
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests[1]?.body).toContain('"projectId":"project_2"');
+    expect(requests[1]?.body).toContain('"repo":"acme/other"');
+    expect(requests[1]?.body).toContain('"issueNumber":123');
   });
 
   test("creates reviewer loop from PR reference", async () => {
@@ -125,36 +569,321 @@ describe("runCli", () => {
     expect(requests[1]).toContain("POST http://127.0.0.1:4310/api/v1/loops");
   });
 
-  test("creates planner work item from issue number", async () => {
+  test("creates planner work item from numeric issue reference", async () => {
     const requests: Array<{ url: string; body?: string | null }> = [];
-    const exitCode = await runCli(
-      ["plan", "--project", "project_1", "--issue", "123"],
-      {
-        stdout: () => {},
-        loadConfigImpl: async () => createConfig() as never,
-        fetchImpl: async (input, init) => {
-          requests.push({
-            url: String(input),
-            body: init?.body as string | null,
-          });
+    const exitCode = await runCli(["plan", "123"], {
+      cwd: "/tmp/repos/looper",
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({
+          url,
+          body: init?.body as string | null,
+        });
+        if (url.endsWith("/api/v1/projects")) {
           return new Response(
             JSON.stringify({
               ok: true,
-              requestId: "req_plan_1",
+              requestId: "req_plan_projects_1",
               data: {
-                id: "loop_plan_1",
-                issueNumber: 123,
-                status: "running",
+                items: [
+                  {
+                    id: "project_1",
+                    repoPath: "/tmp/repos/looper",
+                    repo: "acme/looper",
+                  },
+                ],
               },
             }),
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_plan_1",
+            data: {
+              id: "loop_plan_1",
+              issueNumber: 123,
+              status: "running",
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests[1]?.url).toContain("/api/v1/planners");
+    expect(requests[1]?.body).toContain('"projectId":"project_1"');
+    expect(requests[1]?.body).toContain('"issueNumber":123');
+  });
+
+  test("creates planner work item from qualified issue reference", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(["plan", "acme/looper#123"], {
+      cwd: "/tmp/elsewhere",
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({
+          url,
+          body: init?.body as string | null,
+        });
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_plan_projects_2",
+              data: {
+                items: [
+                  {
+                    id: "project_1",
+                    repoPath: "/tmp/repos/looper",
+                    repo: "acme/looper",
+                  },
+                ],
+              },
+            }),
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_plan_2",
+            data: {
+              id: "loop_plan_2",
+              issueNumber: 123,
+              status: "running",
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests[1]?.url).toContain("/api/v1/planners");
+    expect(requests[1]?.body).toContain('"projectId":"project_1"');
+    expect(requests[1]?.body).toContain('"issueNumber":123');
+  });
+
+  test("prefers qualified planner issue repo over cwd project", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(["plan", "acme/other#123"], {
+      cwd: "/tmp/repos/looper",
+      stdout: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({
+          url,
+          body: init?.body as string | null,
+        });
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_plan_projects_repo_priority",
+              data: {
+                items: [
+                  {
+                    id: "project_1",
+                    repoPath: "/tmp/repos/looper",
+                    repo: "acme/looper",
+                  },
+                  {
+                    id: "project_2",
+                    repoPath: "/tmp/repos/other",
+                    repo: "acme/other",
+                  },
+                ],
+              },
+            }),
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            requestId: "req_plan_repo_priority",
+            data: {
+              id: "loop_plan_repo_priority",
+              issueNumber: 123,
+              status: "running",
+            },
+          }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests[1]?.url).toContain("/api/v1/planners");
+    expect(requests[1]?.body).toContain('"projectId":"project_2"');
+    expect(requests[1]?.body).toContain('"issueNumber":123');
+  });
+
+  test("rejects explicit project when qualified issue repo does not match", async () => {
+    let workerRequestCount = 0;
+    const exitCode = await runCli(
+      ["work", "--issue", "acme/other#123", "--project", "project_1"],
+      {
+        cwd: "/tmp/repos/looper",
+        stdout: () => {},
+        stderr: () => {},
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.endsWith("/api/v1/projects")) {
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                requestId: "req_projects_explicit_mismatch_issue",
+                data: {
+                  items: [
+                    {
+                      id: "project_1",
+                      repoPath: "/tmp/repos/looper",
+                      repo: "acme/looper",
+                    },
+                  ],
+                },
+              }),
+            );
+          }
+
+          workerRequestCount += 1;
+          return new Response(
+            JSON.stringify({ ok: true, requestId: "unexpected" }),
           );
         },
       },
     );
 
-    expect(exitCode).toBe(0);
-    expect(requests[0]?.url).toContain("/api/v1/planners");
-    expect(requests[0]?.body).toContain('"issueNumber":123');
+    expect(exitCode).toBe(1);
+    expect(workerRequestCount).toBe(0);
+  });
+
+  test("fails planner creation when qualified issue repo has no matching project", async () => {
+    let plannerRequestCount = 0;
+    const exitCode = await runCli(["plan", "acme/other#123"], {
+      cwd: "/tmp/repos/looper",
+      stdout: () => {},
+      stderr: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_plan_projects_missing_qualified_repo",
+              data: {
+                items: [
+                  {
+                    id: "project_1",
+                    repoPath: "/tmp/repos/looper",
+                    repo: "acme/looper",
+                  },
+                ],
+              },
+            }),
+          );
+        }
+
+        plannerRequestCount += 1;
+        return new Response(
+          JSON.stringify({ ok: true, requestId: "unexpected" }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(plannerRequestCount).toBe(0);
+  });
+
+  test("fails planner creation when cwd matches multiple projects equally", async () => {
+    let plannerRequestCount = 0;
+    const exitCode = await runCli(["plan", "123"], {
+      cwd: "/tmp/repos/looper",
+      stdout: () => {},
+      stderr: () => {},
+      loadConfigImpl: async () => createConfig() as never,
+      fetchImpl: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/api/v1/projects")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_plan_projects_ambiguous_cwd",
+              data: {
+                items: [
+                  {
+                    id: "project_1",
+                    repoPath: "/tmp/repos/project-one",
+                    repo: "acme/looper",
+                    worktreeRoot: "/tmp/repos/looper",
+                  },
+                  {
+                    id: "project_2",
+                    repoPath: "/tmp/repos/project-two",
+                    repo: "acme/looper-alt",
+                    worktreeRoot: "/tmp/repos/looper",
+                  },
+                ],
+              },
+            }),
+          );
+        }
+
+        plannerRequestCount += 1;
+        return new Response(
+          JSON.stringify({ ok: true, requestId: "unexpected" }),
+        );
+      },
+    });
+
+    expect(exitCode).toBe(1);
+    expect(plannerRequestCount).toBe(0);
+  });
+
+  test("rejects explicit project when qualified planner issue repo does not match", async () => {
+    let plannerRequestCount = 0;
+    const exitCode = await runCli(
+      ["plan", "acme/other#123", "--project", "project_1"],
+      {
+        cwd: "/tmp/repos/looper",
+        stdout: () => {},
+        stderr: () => {},
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.endsWith("/api/v1/projects")) {
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                requestId: "req_plan_projects_explicit_mismatch",
+                data: {
+                  items: [
+                    {
+                      id: "project_1",
+                      repoPath: "/tmp/repos/looper",
+                      repo: "acme/looper",
+                    },
+                  ],
+                },
+              }),
+            );
+          }
+
+          plannerRequestCount += 1;
+          return new Response(
+            JSON.stringify({ ok: true, requestId: "unexpected" }),
+          );
+        },
+      },
+    );
+
+    expect(exitCode).toBe(1);
+    expect(plannerRequestCount).toBe(0);
   });
 
   test("adds project and requests discovery", async () => {

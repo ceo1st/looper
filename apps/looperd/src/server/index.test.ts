@@ -426,6 +426,179 @@ describe("createLooperdApi", () => {
       status: "queued",
     });
 
+    const createWorkerFromPrResponse = await api.handle(
+      new Request("http://localhost/api/v1/workers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          repo: "acme/looper",
+          prNumber: 42,
+        }),
+      }),
+    );
+    const createWorkerFromPrBody =
+      (await createWorkerFromPrResponse.json()) as {
+        data: {
+          id: string;
+          status: string;
+          repo: string;
+          prNumber: number;
+        };
+      };
+    expect(createWorkerFromPrResponse.status).toBe(200);
+    expect(createWorkerFromPrBody.data.status).toBe("running");
+    expect(createWorkerFromPrBody.data.repo).toBe("acme/looper");
+    expect(createWorkerFromPrBody.data.prNumber).toBe(42);
+    expect(
+      store.queue.findActiveByDedupe("worker:project_1:acme/looper:42"),
+    ).toMatchObject({
+      loopId: createWorkerFromPrBody.data.id,
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      prNumber: 42,
+      lockKey: "pr:acme/looper:42",
+      status: "queued",
+    });
+
+    store.projects.upsert({
+      id: "project_2",
+      name: "Looper mirror",
+      repoPath: "/tmp/looper-mirror",
+      baseBranch: "main",
+      archived: false,
+      metadataJson: JSON.stringify({ repo: "acme/looper" }),
+      createdAt: "2026-04-11T12:04:00.000Z",
+      updatedAt: "2026-04-11T12:04:00.000Z",
+    });
+
+    const createWorkerFromSamePrSecondProjectResponse = await api.handle(
+      new Request("http://localhost/api/v1/workers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_2",
+          repo: "acme/looper",
+          prNumber: 42,
+        }),
+      }),
+    );
+    const createWorkerFromSamePrSecondProjectBody =
+      (await createWorkerFromSamePrSecondProjectResponse.json()) as {
+        data: {
+          id: string;
+          status: string;
+          repo: string;
+          prNumber: number;
+        };
+      };
+    expect(createWorkerFromSamePrSecondProjectResponse.status).toBe(200);
+    expect(
+      store.queue.findActiveByDedupe("worker:project_2:acme/looper:42"),
+    ).toMatchObject({
+      loopId: createWorkerFromSamePrSecondProjectBody.data.id,
+      projectId: "project_2",
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:42",
+      prNumber: 42,
+      lockKey: "pr:acme/looper:42",
+      status: "queued",
+    });
+
+    store.pullRequestSnapshots.upsert({
+      id: "snapshot_2",
+      projectId: "project_2",
+      repo: "acme/looper",
+      prNumber: 42,
+      headSha: "def456",
+      baseSha: "base123",
+      title: "Runtime foundation",
+      body: "Adds recovery and API",
+      author: "octocat",
+      diffRef: null,
+      checksSummary: "green",
+      unresolvedThreadCount: 1,
+      reviewState: "changes_requested",
+      payloadJson: JSON.stringify({ title: "Runtime foundation" }),
+      capturedAt: "2026-04-11T12:05:00.000Z",
+      createdAt: "2026-04-11T12:05:00.000Z",
+    });
+
+    const ambiguousPrWorkerResponse = await api.handle(
+      new Request("http://localhost/api/v1/workers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          repo: "acme/looper",
+          prNumber: 42,
+        }),
+      }),
+    );
+    const ambiguousPrWorkerBody = (await ambiguousPrWorkerResponse.json()) as {
+      error: { code: string; message: string };
+    };
+    expect(ambiguousPrWorkerResponse.status).toBe(409);
+    expect(ambiguousPrWorkerBody.error.code).toBe("PROJECT_AMBIGUOUS");
+
+    store.loops.upsert({
+      id: "loop_planner_issue_125",
+      projectId: "project_1",
+      type: "planner",
+      targetType: "issue",
+      targetId: "issue:acme/looper:125",
+      repo: "acme/looper",
+      prNumber: 77,
+      status: "running",
+      configJson: null,
+      metadataJson: JSON.stringify({
+        prNumber: 77,
+        specPath: "specs/issue-125.md",
+      }),
+      lastRunAt: "2026-04-11T12:03:00.000Z",
+      nextRunAt: "2026-04-11T12:03:00.000Z",
+      createdAt: "2026-04-11T12:03:00.000Z",
+      updatedAt: "2026-04-11T12:03:00.000Z",
+    });
+
+    const createWorkerFromIssueResponse = await api.handle(
+      new Request("http://localhost/api/v1/workers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          issueNumber: 125,
+        }),
+      }),
+    );
+    const createWorkerFromIssueBody =
+      (await createWorkerFromIssueResponse.json()) as {
+        data: {
+          id: string;
+          status: string;
+          issueNumber: number;
+          prNumber: number;
+          specPath: string;
+        };
+      };
+    expect(createWorkerFromIssueResponse.status).toBe(200);
+    expect(createWorkerFromIssueBody.data.status).toBe("running");
+    expect(createWorkerFromIssueBody.data.issueNumber).toBe(125);
+    expect(createWorkerFromIssueBody.data.prNumber).toBe(77);
+    expect(createWorkerFromIssueBody.data.specPath).toBe("specs/issue-125.md");
+    expect(
+      store.queue.findActiveByDedupe("worker:project_1:acme/looper:77"),
+    ).toMatchObject({
+      loopId: createWorkerFromIssueBody.data.id,
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:77",
+      prNumber: 77,
+      lockKey: "pr:acme/looper:77",
+      status: "queued",
+    });
+
     const validationResponse = await api.handle(
       new Request("http://localhost/api/v1/workers", {
         method: "POST",
@@ -434,6 +607,32 @@ describe("createLooperdApi", () => {
       }),
     );
     expect(validationResponse.status).toBe(400);
+
+    const missingPrResponse = await api.handle(
+      new Request("http://localhost/api/v1/workers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          repo: "acme/looper",
+          prNumber: 999,
+        }),
+      }),
+    );
+    expect(missingPrResponse.status).toBe(404);
+
+    const missingIssueResponse = await api.handle(
+      new Request("http://localhost/api/v1/workers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          repo: "acme/looper",
+          issueNumber: 999,
+        }),
+      }),
+    );
+    expect(missingIssueResponse.status).toBe(404);
 
     const createLoopResponse = await api.handle(
       new Request("http://localhost/api/v1/loops", {
