@@ -125,6 +125,38 @@ describe("runCli", () => {
     expect(requests[1]).toContain("POST http://127.0.0.1:4310/api/v1/loops");
   });
 
+  test("creates planner work item from issue number", async () => {
+    const requests: Array<{ url: string; body?: string | null }> = [];
+    const exitCode = await runCli(
+      ["plan", "--project", "project_1", "--issue", "123"],
+      {
+        stdout: () => {},
+        loadConfigImpl: async () => createConfig() as never,
+        fetchImpl: async (input, init) => {
+          requests.push({
+            url: String(input),
+            body: init?.body as string | null,
+          });
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              requestId: "req_plan_1",
+              data: {
+                id: "loop_plan_1",
+                issueNumber: 123,
+                status: "running",
+              },
+            }),
+          );
+        },
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(requests[0]?.url).toContain("/api/v1/planners");
+    expect(requests[0]?.body).toContain('"issueNumber":123');
+  });
+
   test("adds project and requests discovery", async () => {
     const requests: Array<{ url: string; body?: string | null }> = [];
     const exitCode = await runCli(["project", "add", "/tmp/repos/looper"], {
@@ -276,14 +308,15 @@ describe("runCli", () => {
                   runId: "run_1",
                   loopId: "loop_1",
                   projectId: "project_1",
-                  type: "worker",
+                  type: "planner",
                   status: "running",
-                  currentStep: "execute",
+                  currentStep: "plan",
                   startedAt: "2026-04-11T12:00:00.000Z",
                   target: {
-                    type: "project",
-                    projectId: "project_1",
-                    label: "project_1",
+                    type: "issue",
+                    repo: "acme/looper",
+                    issueNumber: 77,
+                    label: "acme/looper#77",
                   },
                   agent: {
                     active: true,
@@ -307,6 +340,8 @@ describe("runCli", () => {
     expect(exitCode).toBe(0);
     expect(requests[0]).toContain("/api/v1/runs/active");
     expect(lines.join("\n")).toContain('"runId": "run_1"');
+    expect(lines.join("\n")).toContain('"type": "issue"');
+    expect(lines.join("\n")).toContain('"issueNumber": 77');
     expect(lines.join("\n")).toContain('"activeCount": 1');
   });
 

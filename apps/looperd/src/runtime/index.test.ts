@@ -52,9 +52,22 @@ class FakeGitHubGateway {
     [];
   public createPullRequestCalls = 0;
   public resolvedThreadIds: string[] = [];
+  public removedLabels: Array<{
+    repo: string;
+    prNumber: number;
+    labels: string[];
+  }> = [];
+  public reviewerRequests: Array<{
+    repo: string;
+    prNumber: number;
+    reviewers: string[];
+  }> = [];
   private fixerViewIndex = 0;
 
-  public async listOpenPullRequests() {
+  public async listOpenPullRequests(input?: { label?: string }) {
+    if (input?.label === "looper:spec-ready") {
+      return [];
+    }
     return [
       {
         number: 42,
@@ -62,10 +75,28 @@ class FakeGitHubGateway {
         state: "OPEN",
         isDraft: false,
         reviewDecision: "CHANGES_REQUESTED",
+        labels: [],
         author: "octocat",
         reviewRequests: ["octocat"],
       },
     ];
+  }
+
+  public async listOpenIssues() {
+    return [];
+  }
+
+  public async viewIssue() {
+    return {
+      number: 123,
+      title: "Planner issue",
+      body: "body",
+      url: "https://example.test/issues/123",
+      state: "OPEN",
+      author: "octocat",
+      assignees: ["octocat"],
+      labels: ["looper:plan"],
+    };
   }
 
   public async viewPullRequest() {
@@ -98,6 +129,7 @@ class FakeGitHubGateway {
       state: "OPEN",
       isDraft: false,
       reviewDecision: "CHANGES_REQUESTED",
+      labels: [],
       headRefName: "feature/runtime",
       baseRefName: "main",
       headSha: "abc123",
@@ -156,6 +188,24 @@ class FakeGitHubGateway {
     };
   }
 
+  public async addPullRequestLabels(): Promise<void> {}
+
+  public async removePullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
+  }): Promise<void> {
+    this.removedLabels.push(input);
+  }
+
+  public async addPullRequestReviewers(input: {
+    repo: string;
+    prNumber: number;
+    reviewers: string[];
+  }): Promise<void> {
+    this.reviewerRequests.push(input);
+  }
+
   public async resolveReviewThread(input: {
     repo: string;
     threadId: string;
@@ -172,7 +222,7 @@ class FakeGitGateway {
   public cleanupCalls = 0;
   public pushError?: string;
 
-  public async detectGitHubRepo(): Promise<string | null> {
+  public async detectGitHubRepo(_repoPath: string): Promise<string | null> {
     return "powerformer/looper";
   }
 
@@ -519,6 +569,100 @@ describe("createLooperdRuntime", () => {
     expect(agentExecutor.starts).toHaveLength(1);
     expect(github.submitCalls.length).toBeGreaterThan(0);
     verifyStore.close();
+
+    await runtime.stop("test");
+  });
+
+  test("auto-discovers planner work whenever planner runner exists", async () => {
+    const fixture = await createFixture();
+    fixture.config.agent.vendor = "opencode";
+    const now = new Date(Date.now() - 1_000).toISOString();
+    const seedStore = new SqliteStore({
+      dbPath: fixture.config.storage.dbPath,
+      backupDir: fixture.config.storage.backupDir,
+    });
+    seedStore.initialize({ autoMigrate: true });
+    seedStore.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath: fixture.rootDir,
+      baseBranch: "main",
+      archived: false,
+      metadataJson: JSON.stringify({ repo: "powerformer/looper" }),
+      createdAt: now,
+      updatedAt: now,
+    });
+    seedStore.loops.upsert({
+      id: "loop_planner_1",
+      projectId: "project_1",
+      type: "planner",
+      targetType: "issue",
+      targetId: "issue:powerformer/looper:123",
+      repo: "powerformer/looper",
+      prNumber: null,
+      status: "queued",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: null,
+      nextRunAt: now,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const scheduler = new SchedulerQueue({
+      store: seedStore,
+      retryMaxAttempts: 3,
+      retryBaseDelayMs: 0,
+    });
+    scheduler.enqueue({
+      id: "queue_planner_1",
+      projectId: "project_1",
+      loopId: "loop_planner_1",
+      type: "planner",
+      targetType: "issue",
+      targetId: "issue:powerformer/looper:123",
+      repo: "powerformer/looper",
+      dedupeKey: "planner:powerformer/looper:123",
+      payloadJson: JSON.stringify({ issueNumber: 123 }),
+      availableAt: now,
+    });
+    seedStore.close();
+
+    let discoverCalls = 0;
+    const processedQueueItemIds: string[] = [];
+    const plannerRunner = {
+      discoverIssues: async () => {
+        discoverCalls += 1;
+        return { queueItems: [], createdLoopIds: [], skipped: 0 };
+      },
+      processClaimedItem: async (queueItem: { id: string; type: string }) => {
+        processedQueueItemIds.push(queueItem.id);
+        return {
+          loopId: "loop_planner_1",
+          runId: "run_planner_1",
+          queueItemId: queueItem.id,
+          status: "success" as const,
+          summary: "planned",
+        };
+      },
+    };
+
+    const runtime = createLooperdRuntime({
+      config: fixture.config,
+      logger: fixture.logger,
+      github: new FakeGitHubGateway(),
+      git: new FakeGitGateway(),
+      agentExecutor: new FakeAgentExecutor([]),
+      plannerRunner: plannerRunner as never,
+      enablePlanner: false,
+      enableReviewer: false,
+      enableFixer: false,
+    });
+
+    await runtime.start();
+    await Bun.sleep(50);
+
+    expect(discoverCalls).toBeGreaterThan(0);
+    expect(processedQueueItemIds).toEqual(["queue_planner_1"]);
 
     await runtime.stop("test");
   });
@@ -1049,6 +1193,84 @@ describe("createLooperdRuntime", () => {
         record.body.includes("worker agent crashed"),
       ),
     ).toBe(true);
+
+    verifyStore.close();
+    await runtime.stop("test");
+  });
+
+  test("clears cached repo metadata when configured repoPath changes", async () => {
+    const fixture = await createFixture();
+    const oldRepoPath = join(fixture.rootDir, "old-repo");
+    const newRepoPath = join(fixture.rootDir, "new-repo");
+    await Promise.all([
+      mkdir(oldRepoPath, { recursive: true }),
+      mkdir(newRepoPath, { recursive: true }),
+    ]);
+
+    fixture.config.projects = [
+      {
+        id: "project_1",
+        name: "Looper",
+        repoPath: newRepoPath,
+        baseBranch: "main",
+      },
+    ];
+
+    const seedStore = new SqliteStore({
+      dbPath: fixture.config.storage.dbPath,
+      backupDir: fixture.config.storage.backupDir,
+    });
+    seedStore.initialize({ autoMigrate: true });
+    seedStore.projects.upsert({
+      id: "project_1",
+      name: "Looper",
+      repoPath: oldRepoPath,
+      baseBranch: "main",
+      archived: false,
+      metadataJson: JSON.stringify({
+        repo: "stale/looper",
+        worktreeRoot: "/tmp/worktrees",
+      }),
+      createdAt: "2026-04-11T12:00:00.000Z",
+      updatedAt: "2026-04-11T12:00:00.000Z",
+    });
+    seedStore.close();
+
+    const git = new FakeGitGateway();
+    const detectedPaths: string[] = [];
+    git.detectGitHubRepo = async (repoPath: string) => {
+      detectedPaths.push(repoPath);
+      return "fresh/looper";
+    };
+
+    const runtime = createLooperdRuntime({
+      config: fixture.config,
+      logger: fixture.logger,
+      github: new FakeGitHubGateway(),
+      git,
+      agentExecutor: new FakeAgentExecutor([]),
+      enableReviewer: false,
+      enableFixer: false,
+      enablePlanner: false,
+    });
+
+    await runtime.start();
+
+    const verifyStore = new SqliteStore({
+      dbPath: fixture.config.storage.dbPath,
+    });
+    verifyStore.initialize();
+
+    const project = verifyStore.projects.getById("project_1");
+    expect(detectedPaths).toContain(newRepoPath);
+    expect(project?.repoPath).toBe(newRepoPath);
+    expect(project?.metadataJson).toBe(
+      JSON.stringify({
+        repo: "fresh/looper",
+        worktreeRoot: null,
+        source: "config",
+      }),
+    );
 
     verifyStore.close();
     await runtime.stop("test");

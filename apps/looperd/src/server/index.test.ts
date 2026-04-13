@@ -32,7 +32,7 @@ async function createFixture() {
     repoPath: "/tmp/looper",
     baseBranch: "main",
     archived: false,
-    metadataJson: null,
+    metadataJson: JSON.stringify({ repo: "acme/looper" }),
     createdAt: now,
     updatedAt: now,
   });
@@ -156,6 +156,7 @@ describe("createLooperdApi", () => {
       data: {
         storage: { schemaVersion: string };
         scheduler: { queuedItems: number; totalRuns: number };
+        loops: { planner: { running: number } };
         safety: {
           allowAutoCommit: boolean;
           allowAutoPush: boolean;
@@ -169,10 +170,11 @@ describe("createLooperdApi", () => {
     expect(statusResponse.status).toBe(200);
     expect(statusBody.ok).toBe(true);
     expect(statusBody.data.storage.schemaVersion).toBe(
-      "0004_worker_project_target",
+      "0005_planner_issue_target",
     );
     expect(statusBody.data.scheduler.queuedItems).toBe(1);
     expect(statusBody.data.scheduler.totalRuns).toBe(1);
+    expect(statusBody.data.loops.planner.running).toBe(0);
     expect(statusBody.data.safety.allowAutoCommit).toBe(true);
     expect(statusBody.data.safety.allowAutoPush).toBe(true);
     expect(statusBody.data.safety.allowAutoApprove).toBe(false);
@@ -455,6 +457,54 @@ describe("createLooperdApi", () => {
     expect(createLoopBody.data.prNumber).toBe(43);
     expect(createLoopBody.data.status).toBe("running");
 
+    const createPlannerResponse = await api.handle(
+      new Request("http://localhost/api/v1/planners", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          issueNumber: 123,
+        }),
+      }),
+    );
+    const createPlannerBody = (await createPlannerResponse.json()) as {
+      data: { type: string; issueNumber: number; status: string };
+    };
+    expect(createPlannerResponse.status).toBe(200);
+    expect(createPlannerBody.data.type).toBe("planner");
+    expect(createPlannerBody.data.issueNumber).toBe(123);
+    expect(createPlannerBody.data.status).toBe("running");
+
+    const createGenericPlannerResponse = await api.handle(
+      new Request("http://localhost/api/v1/loops", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_1",
+          type: "planner",
+          targetType: "issue",
+          targetId: "issue:acme/looper:124",
+          repo: "acme/looper",
+        }),
+      }),
+    );
+    const createGenericPlannerBody =
+      (await createGenericPlannerResponse.json()) as {
+        data: {
+          type: string;
+          targetType: string;
+          targetId: string;
+          repo: string;
+        };
+      };
+    expect(createGenericPlannerResponse.status).toBe(200);
+    expect(createGenericPlannerBody.data.type).toBe("planner");
+    expect(createGenericPlannerBody.data.targetType).toBe("issue");
+    expect(createGenericPlannerBody.data.targetId).toBe(
+      "issue:acme/looper:124",
+    );
+    expect(createGenericPlannerBody.data.repo).toBe("acme/looper");
+
     store.close();
     await rm(rootDir, { recursive: true, force: true });
   });
@@ -694,6 +744,38 @@ describe("createLooperdApi", () => {
       updatedAt: "2026-04-11T12:02:30.000Z",
     });
 
+    store.loops.upsert({
+      id: "loop_planner_1",
+      projectId: "project_1",
+      type: "planner",
+      targetType: "issue",
+      targetId: "issue:acme/looper:77",
+      repo: "acme/looper",
+      prNumber: null,
+      status: "running",
+      configJson: null,
+      metadataJson: null,
+      lastRunAt: "2026-04-11T12:02:45.000Z",
+      nextRunAt: "2026-04-11T12:02:45.000Z",
+      createdAt: "2026-04-11T12:02:45.000Z",
+      updatedAt: "2026-04-11T12:02:45.000Z",
+    });
+    store.runs.upsert({
+      id: "run_planner_1",
+      loopId: "loop_planner_1",
+      status: "running",
+      currentStep: "plan",
+      lastCompletedStep: null,
+      checkpointJson: null,
+      summary: null,
+      errorMessage: null,
+      startedAt: "2026-04-11T12:02:45.000Z",
+      lastHeartbeatAt: "2026-04-11T12:02:50.000Z",
+      endedAt: null,
+      createdAt: "2026-04-11T12:02:45.000Z",
+      updatedAt: "2026-04-11T12:02:50.000Z",
+    });
+
     // fallback label should use project id when project metadata is unavailable
     store.loops.upsert({
       id: "loop_worker_fallback",
@@ -832,7 +914,12 @@ describe("createLooperdApi", () => {
           runId: string;
           type: string;
           currentStep: string | null;
-          target: { type: string; label: string; projectId?: string };
+          target: {
+            type: string;
+            label: string;
+            projectId?: string;
+            issueNumber?: number;
+          };
           agent: {
             executionId: string;
             activeCount: number;
@@ -847,6 +934,7 @@ describe("createLooperdApi", () => {
       "run_worker_1",
       "run_fixer_1",
       "run_1",
+      "run_planner_1",
       "run_worker_fallback",
     ]);
 
@@ -894,6 +982,20 @@ describe("createLooperdApi", () => {
       },
     });
 
+    const planner = body.data.items.find(
+      (item) => item.runId === "run_planner_1",
+    );
+    expect(planner).toMatchObject({
+      type: "planner",
+      currentStep: "plan",
+      target: {
+        type: "issue",
+        issueNumber: 77,
+        label: "acme/looper#77",
+      },
+      agent: null,
+    });
+
     const fallbackTaskTarget = body.data.items.find(
       (item) => item.runId === "run_worker_fallback",
     );
@@ -920,7 +1022,7 @@ describe("createLooperdApi", () => {
     const projectFilteredBody = (await projectFiltered.json()) as {
       data: { items: Array<{ runId: string }> };
     };
-    expect(projectFilteredBody.data.items).toHaveLength(4);
+    expect(projectFilteredBody.data.items).toHaveLength(5);
 
     const prFiltered = await api.handle(
       new Request(

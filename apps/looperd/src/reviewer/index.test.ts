@@ -65,7 +65,20 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
     event: string;
     body?: string;
   }> = [];
+  public addedLabels: Array<{
+    repo: string;
+    prNumber: number;
+    labels: string[];
+  }> = [];
+  public removedLabels: Array<{
+    repo: string;
+    prNumber: number;
+    labels: string[];
+  }> = [];
   public submitFailuresRemaining = 0;
+  public addLabelFailuresRemaining = 0;
+  public nextReviewDecisionAfterSubmit: string | undefined;
+  private readonly currentLabels: string[];
 
   constructor(
     private readonly options: {
@@ -73,24 +86,29 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
       isDraft?: boolean;
       state?: string;
       reviewDecision?: string;
+      labels?: string[];
       reviewRequests?: string[];
       currentUserLogin?: string;
       failCurrentUserLookup?: boolean;
     } = {},
-  ) {}
+  ) {
+    this.currentLabels = [...(this.options.labels ?? [])];
+  }
 
-  public async listOpenPullRequests(_input: {
+  public async listOpenPullRequests(input: {
     repo: string;
     cwd?: string;
     limit?: number;
+    label?: string;
   }) {
-    return [
+    const pullRequests = [
       {
         number: 42,
         title: "Review me",
         state: this.options.state ?? "OPEN",
         isDraft: this.options.isDraft ?? false,
         reviewDecision: this.options.reviewDecision,
+        labels: [...this.currentLabels],
         author: "octocat",
         reviewRequests: this.options.reviewRequests ?? ["octocat"],
       },
@@ -100,10 +118,17 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
         state: "OPEN",
         isDraft: true,
         reviewDecision: undefined,
+        labels: [],
         author: "octocat",
         reviewRequests: this.options.reviewRequests ?? ["octocat"],
       },
     ];
+
+    return input.label
+      ? pullRequests.filter((pullRequest) =>
+          pullRequest.labels.includes(input.label ?? ""),
+        )
+      : pullRequests;
   }
 
   public async getCurrentUserLogin(): Promise<string | undefined> {
@@ -123,6 +148,7 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
       state: this.options.state ?? "OPEN",
       isDraft: this.options.isDraft ?? false,
       reviewDecision: this.options.reviewDecision,
+      labels: [...this.currentLabels],
       headRefName: "feature",
       baseRefName: "main",
       headSha: this.options.headSha ?? "abc123",
@@ -171,6 +197,52 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
     if (this.submitFailuresRemaining > 0) {
       this.submitFailuresRemaining -= 1;
       throw new Error("temporary GitHub failure");
+    }
+
+    if (this.nextReviewDecisionAfterSubmit !== undefined) {
+      this.options.reviewDecision = this.nextReviewDecisionAfterSubmit;
+      this.nextReviewDecisionAfterSubmit = undefined;
+    }
+  }
+
+  public async addPullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
+    cwd?: string;
+  }): Promise<void> {
+    if (this.addLabelFailuresRemaining > 0) {
+      this.addLabelFailuresRemaining -= 1;
+      throw new Error("temporary add labels failure");
+    }
+    this.addedLabels.push({
+      repo: input.repo,
+      prNumber: input.prNumber,
+      labels: input.labels,
+    });
+    for (const label of input.labels) {
+      if (!this.currentLabels.includes(label)) {
+        this.currentLabels.push(label);
+      }
+    }
+  }
+
+  public async removePullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
+    cwd?: string;
+  }): Promise<void> {
+    this.removedLabels.push({
+      repo: input.repo,
+      prNumber: input.prNumber,
+      labels: input.labels,
+    });
+    for (const label of input.labels) {
+      const index = this.currentLabels.indexOf(label);
+      if (index >= 0) {
+        this.currentLabels.splice(index, 1);
+      }
     }
   }
 }
@@ -393,6 +465,128 @@ describe("ReviewerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("discovers spec-review PRs by label without promoting after comment review", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      labels: ["looper:spec-reviewing"],
+      reviewRequests: [],
+      currentUserLogin: "someone-else",
+    });
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Spec looks ready to implement"),
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    const discovery = await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    expect(discovery.queueItems).toHaveLength(1);
+
+    const claimed = fixture.queue.claimNext("reviewer-worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed reviewer queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("success");
+    expect(github.submitCalls).toEqual([
+      expect.objectContaining({
+        repo: "acme/looper",
+        prNumber: 42,
+        event: "COMMENT",
+      }),
+    ]);
+    expect(github.removedLabels).toEqual([]);
+    expect(github.addedLabels).toEqual([]);
+
+    fixture.store.close();
+  });
+
+  test("promotes spec-review PRs only after approving review", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      labels: ["looper:spec-reviewing"],
+      reviewRequests: [],
+      currentUserLogin: "someone-else",
+      reviewDecision: "CHANGES_REQUESTED",
+    });
+    github.submitFailuresRemaining = 1;
+    github.nextReviewDecisionAfterSubmit = "APPROVED";
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Spec looks ready to implement"),
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      allowAutoApprove: true,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const firstClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!firstClaim) {
+      throw new Error("Expected first reviewer claim");
+    }
+
+    const firstResult = await runner.processClaimedItem(firstClaim);
+    expect(firstResult.status).toBe("failed");
+
+    const failedRun = fixture.store.runs.listByLoop(firstResult.loopId)[0];
+    if (!failedRun) {
+      throw new Error("Expected failed reviewer run");
+    }
+    const failedCheckpoint = JSON.parse(failedRun.checkpointJson ?? "{}");
+    failedCheckpoint.pendingReview.event = "APPROVE";
+    fixture.store.runs.upsert({
+      ...failedRun,
+      checkpointJson: JSON.stringify(failedCheckpoint),
+    });
+
+    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
+    const retryClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!retryClaim) {
+      throw new Error("Expected retry reviewer claim");
+    }
+
+    const retryResult = await runner.processClaimedItem(retryClaim);
+    expect(retryResult.status).toBe("success");
+    expect(github.submitCalls.at(-1)).toMatchObject({
+      repo: "acme/looper",
+      prNumber: 42,
+      event: "APPROVE",
+    });
+    expect(github.removedLabels).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        labels: ["looper:spec-reviewing"],
+      },
+    ]);
+    expect(github.addedLabels).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        labels: ["looper:spec-ready"],
+      },
+    ]);
+
+    fixture.store.close();
+  });
+
   test("retries publish from checkpoint without rerunning review", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway();
@@ -469,6 +663,86 @@ describe("ReviewerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("retries spec label promotion when ready-label add fails after reviewing-label removal", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      labels: ["looper:spec-reviewing"],
+      reviewRequests: [],
+      currentUserLogin: "someone-else",
+    });
+    github.submitFailuresRemaining = 1;
+    github.addLabelFailuresRemaining = 1;
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Spec looks ready to implement"),
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      allowAutoApprove: true,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const firstClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!firstClaim) {
+      throw new Error("Expected first reviewer claim");
+    }
+    const firstResult = await runner.processClaimedItem(firstClaim);
+
+    expect(firstResult.status).toBe("failed");
+    expect(firstResult.failureKind).toBe("retryable_after_resume");
+    expect(github.removedLabels).toHaveLength(0);
+    expect(github.addedLabels).toHaveLength(0);
+
+    const failedRun = fixture.store.runs.listByLoop(firstResult.loopId)[0];
+    if (!failedRun) {
+      throw new Error("Expected failed reviewer run");
+    }
+    const failedCheckpoint = JSON.parse(failedRun.checkpointJson ?? "{}");
+    failedCheckpoint.pendingReview.event = "APPROVE";
+    fixture.store.runs.upsert({
+      ...failedRun,
+      checkpointJson: JSON.stringify(failedCheckpoint),
+    });
+
+    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
+    const promoteClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!promoteClaim) {
+      throw new Error("Expected promotion reviewer claim");
+    }
+    const promoteResult = await runner.processClaimedItem(promoteClaim);
+
+    expect(promoteResult.status).toBe("failed");
+    expect(promoteResult.failureKind).toBe("retryable_after_resume");
+    expect(github.removedLabels).toHaveLength(1);
+    expect(github.addedLabels).toHaveLength(0);
+
+    fixture.now.setTime(new Date("2026-04-11T12:00:15.000Z").getTime());
+    const retryClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!retryClaim) {
+      throw new Error("Expected retry reviewer claim");
+    }
+    const retryResult = await runner.processClaimedItem(retryClaim);
+
+    expect(retryResult.status).toBe("success");
+    expect(github.removedLabels).toHaveLength(1);
+    expect(github.addedLabels).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        labels: ["looper:spec-ready"],
+      },
+    ]);
+
+    fixture.store.close();
+  });
+
   test("restarts from discover when PR head changes before publish", async () => {
     const fixture = await createFixture();
     const github = new FakeGitHubGateway();
@@ -484,6 +758,7 @@ describe("ReviewerLoopRunner", () => {
         state: "OPEN",
         isDraft: false,
         reviewDecision: undefined,
+        labels: [],
         headRefName: "feature",
         baseRefName: "main",
         headSha,

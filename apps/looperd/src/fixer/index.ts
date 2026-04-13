@@ -10,6 +10,12 @@ import type {
   GitHubPullRequestDetail,
   GitHubPullRequestSummary,
 } from "../infra/github";
+import {
+  SPEC_READY_LABEL,
+  SPEC_REVIEWING_LABEL,
+  hasLabel,
+  isSpecReviewClean,
+} from "../infra/spec-pr";
 import type { SchedulerQueue } from "../scheduler/index";
 import type { Store } from "../storage/store";
 import type {
@@ -54,6 +60,18 @@ export interface FixerGitHubGateway {
   resolveReviewThread(input: {
     repo: string;
     threadId: string;
+    cwd?: string;
+  }): Promise<void>;
+  addPullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
+    cwd?: string;
+  }): Promise<void>;
+  removePullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
     cwd?: string;
   }): Promise<void>;
 }
@@ -174,6 +192,7 @@ interface FixerCheckpoint {
   detail?: {
     state?: string;
     isDraft?: boolean;
+    labels?: string[];
     headSha?: string;
     headRefName?: string;
     baseRefName?: string;
@@ -664,6 +683,7 @@ export class FixerLoopRunner {
       detail: {
         state: detail.state,
         isDraft: detail.isDraft,
+        labels: detail.labels,
         headSha: detail.headSha,
         headRefName: detail.headRefName,
         baseRefName: detail.baseRefName,
@@ -1342,6 +1362,32 @@ export class FixerLoopRunner {
         prNumber,
         cwd: input.project.repoPath,
       });
+      const checkpointHadSpecReviewing = hasLabel(
+        input.checkpoint.detail?.labels,
+        SPEC_REVIEWING_LABEL,
+      );
+      if (
+        (hasLabel(detail.labels, SPEC_REVIEWING_LABEL) ||
+          checkpointHadSpecReviewing) &&
+        isSpecReviewClean(detail)
+      ) {
+        if (hasLabel(detail.labels, SPEC_REVIEWING_LABEL)) {
+          await this.options.github.removePullRequestLabels({
+            repo,
+            prNumber,
+            labels: [SPEC_REVIEWING_LABEL],
+            cwd: input.project.repoPath,
+          });
+        }
+        if (!hasLabel(detail.labels, SPEC_READY_LABEL)) {
+          await this.options.github.addPullRequestLabels({
+            repo,
+            prNumber,
+            labels: [SPEC_READY_LABEL],
+            cwd: input.project.repoPath,
+          });
+        }
+      }
       return {
         ...input.checkpoint,
         recheck: {

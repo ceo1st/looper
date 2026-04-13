@@ -65,16 +65,37 @@ async function createFixture() {
 class FakeGitHubGateway implements FixerGitHubGateway {
   public viewCalls = 0;
   public resolvedThreadIds: string[] = [];
+  public addedLabels: Array<{
+    repo: string;
+    prNumber: number;
+    labels: string[];
+  }> = [];
+  public removedLabels: Array<{
+    repo: string;
+    prNumber: number;
+    labels: string[];
+  }> = [];
+  public addLabelFailuresRemaining = 0;
+  private readonly currentLabels: string[];
 
   constructor(
     private readonly options: {
       listPrs?: Array<{ number: number; isDraft?: boolean; state?: string }>;
       views: Array<
-        "error" | { comments?: unknown[]; checks?: unknown[]; headSha?: string }
+        | "error"
+        | {
+            comments?: unknown[];
+            checks?: unknown[];
+            headSha?: string;
+            reviewDecision?: string;
+          }
       >;
       resolveFailures?: Record<string, string>;
+      labels?: string[];
     },
-  ) {}
+  ) {
+    this.currentLabels = [...(this.options.labels ?? [])];
+  }
 
   public async listOpenPullRequests(_input: {
     repo: string;
@@ -88,6 +109,7 @@ class FakeGitHubGateway implements FixerGitHubGateway {
       title: `PR ${pr.number}`,
       state: pr.state ?? "OPEN",
       isDraft: pr.isDraft ?? false,
+      labels: [...this.currentLabels],
       reviewRequests: [],
     }));
   }
@@ -112,7 +134,8 @@ class FakeGitHubGateway implements FixerGitHubGateway {
       body: "body",
       state: "OPEN",
       isDraft: false,
-      reviewDecision: "CHANGES_REQUESTED",
+      reviewDecision: next.reviewDecision,
+      labels: [...this.currentLabels],
       headRefName: "feature/fixer",
       baseRefName: "main",
       headSha: next.headSha ?? "abc123",
@@ -135,6 +158,47 @@ class FakeGitHubGateway implements FixerGitHubGateway {
       throw new Error(failure);
     }
     this.resolvedThreadIds.push(input.threadId);
+  }
+
+  public async addPullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
+    cwd?: string;
+  }) {
+    if (this.addLabelFailuresRemaining > 0) {
+      this.addLabelFailuresRemaining -= 1;
+      throw new Error("temporary add labels failure");
+    }
+    this.addedLabels.push({
+      repo: input.repo,
+      prNumber: input.prNumber,
+      labels: input.labels,
+    });
+    for (const label of input.labels) {
+      if (!this.currentLabels.includes(label)) {
+        this.currentLabels.push(label);
+      }
+    }
+  }
+
+  public async removePullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
+    cwd?: string;
+  }) {
+    this.removedLabels.push({
+      repo: input.repo,
+      prNumber: input.prNumber,
+      labels: input.labels,
+    });
+    for (const label of input.labels) {
+      const index = this.currentLabels.indexOf(label);
+      if (index >= 0) {
+        this.currentLabels.splice(index, 1);
+      }
+    }
   }
 }
 
@@ -625,6 +689,98 @@ describe("FixerLoopRunner", () => {
     expect(agent.starts).toHaveLength(1);
     expect(git.pushCalls).toBe(1);
     expect(git.prepareCalls).toBe(1);
+
+    fixture.store.close();
+  });
+
+  test("retries recheck spec label promotion when ready-label add fails after reviewing-label removal", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway({
+      labels: ["looper:spec-reviewing"],
+      views: [
+        {
+          comments: [
+            {
+              id: "c1",
+              threadId: "thread-1",
+              state: "UNRESOLVED",
+              body: "needs fix",
+            },
+          ],
+        },
+        {
+          comments: [
+            {
+              id: "c1",
+              threadId: "thread-1",
+              state: "UNRESOLVED",
+              body: "needs fix",
+            },
+          ],
+        },
+        {
+          comments: [
+            {
+              id: "c1",
+              threadId: "thread-1",
+              state: "UNRESOLVED",
+              body: "needs fix",
+            },
+          ],
+          headSha: "commit-1",
+        },
+        { comments: [], checks: [], headSha: "commit-1" },
+        { comments: [], checks: [], headSha: "commit-1" },
+        { comments: [], checks: [], headSha: "commit-1" },
+      ],
+    });
+    github.addLabelFailuresRemaining = 1;
+    const git = new FakeGitGateway();
+    const agent = new FakeAgentExecutor([completedAgentResult("fixed")]);
+    const runner = new FixerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      git,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<FixerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+      }),
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const firstClaim = fixture.queue.claimNext("fixer-1");
+    if (!firstClaim) {
+      throw new Error("Expected first fixer claim");
+    }
+    const firstResult = await runner.processClaimedItem(firstClaim);
+    expect(firstResult.status).toBe("failed");
+    expect(firstResult.failureKind).toBe("retryable_after_resume");
+    expect(github.removedLabels).toHaveLength(1);
+    expect(github.addedLabels).toHaveLength(0);
+
+    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
+    const retryClaim = fixture.queue.claimNext("fixer-1");
+    if (!retryClaim) {
+      throw new Error("Expected retry fixer claim");
+    }
+    const retryResult = await runner.processClaimedItem(retryClaim);
+    expect(retryResult.status).toBe("success");
+    expect(github.removedLabels).toHaveLength(1);
+    expect(github.addedLabels).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        labels: ["looper:spec-ready"],
+      },
+    ]);
+    expect(agent.starts).toHaveLength(1);
 
     fixture.store.close();
   });
@@ -1535,6 +1691,7 @@ describe("FixerLoopRunner", () => {
       state: "OPEN",
       isDraft: false,
       reviewDecision: "CHANGES_REQUESTED",
+      labels: [],
       headRefName: "feature/fixer",
       baseRefName: "main",
       headSha: "abc123",

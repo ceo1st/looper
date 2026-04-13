@@ -33,6 +33,7 @@ async function createFixture() {
   cleanupPaths.push(rootDir);
   const repoPath = join(rootDir, "repo");
   const worktreeRoot = join(rootDir, "worktrees");
+  const now = new Date("2026-04-11T12:00:00.000Z");
   await mkdir(repoPath, { recursive: true });
   await mkdir(worktreeRoot, { recursive: true });
   await writeFile(
@@ -42,10 +43,10 @@ async function createFixture() {
 
   const store = new SqliteStore({
     dbPath: join(rootDir, "state", "looper.sqlite"),
+    now: () => now,
   });
   store.initialize({ autoMigrate: true });
 
-  const now = new Date("2026-04-11T12:00:00.000Z");
   const nowIso = now.toISOString();
 
   store.projects.upsert({
@@ -138,9 +139,17 @@ class FakeGitGateway implements WorkerGitGateway {
   public async push(): Promise<void> {
     this.pushCalls += 1;
   }
+
+  public async prepareWorktree(): Promise<{
+    headSha?: string;
+    clean: boolean;
+  }> {
+    return { headSha: "abc123", clean: true };
+  }
 }
 
 class FakeGitHubGateway implements WorkerGitHubGateway {
+  public listOpenPullRequestCalls: Array<{ label?: string }> = [];
   public createPullRequestCalls: Array<{
     repo: string;
     headBranch: string;
@@ -149,6 +158,54 @@ class FakeGitHubGateway implements WorkerGitHubGateway {
     body?: string;
     cwd?: string;
   }> = [];
+  public removedLabels: Array<{
+    repo: string;
+    prNumber: number;
+    labels: string[];
+  }> = [];
+  public reviewerRequests: Array<{
+    repo: string;
+    prNumber: number;
+    reviewers: string[];
+  }> = [];
+
+  public async listOpenPullRequests(input: {
+    repo: string;
+    cwd?: string;
+    limit?: number;
+    label?: string;
+  }): Promise<
+    Awaited<ReturnType<WorkerGitHubGateway["listOpenPullRequests"]>>
+  > {
+    this.listOpenPullRequestCalls.push({ label: input.label });
+    return [];
+  }
+
+  public async viewPullRequest(input: {
+    repo: string;
+    prNumber: number;
+    cwd?: string;
+  }) {
+    return {
+      number: input.prNumber,
+      title: "Existing PR",
+      body: "Spec: spec.md",
+      url: `https://example.test/${input.repo}/pull/${input.prNumber}`,
+      state: "OPEN",
+      isDraft: false,
+      reviewDecision: undefined,
+      labels: ["looper:spec-ready"],
+      headRefName: "feature/existing-pr",
+      baseRefName: "main",
+      headSha: "abc123",
+      baseSha: "base123",
+      author: "octocat",
+      reviewRequests: ["octocat"],
+      comments: [],
+      reviews: [],
+      checks: [{ conclusion: "SUCCESS" }],
+    };
+  }
 
   public async createPullRequest(input: {
     repo: string;
@@ -163,6 +220,32 @@ class FakeGitHubGateway implements WorkerGitHubGateway {
       number: 101,
       url: "https://example.test/acme/looper/pull/101",
     };
+  }
+
+  public async removePullRequestLabels(input: {
+    repo: string;
+    prNumber: number;
+    labels: string[];
+    cwd?: string;
+  }): Promise<void> {
+    this.removedLabels.push({
+      repo: input.repo,
+      prNumber: input.prNumber,
+      labels: input.labels,
+    });
+  }
+
+  public async addPullRequestReviewers(input: {
+    repo: string;
+    prNumber: number;
+    reviewers: string[];
+    cwd?: string;
+  }): Promise<void> {
+    this.reviewerRequests.push({
+      repo: input.repo,
+      prNumber: input.prNumber,
+      reviewers: input.reviewers,
+    });
   }
 }
 
@@ -225,6 +308,75 @@ function createCapturingLogger() {
 }
 
 describe("WorkerLoopRunner", () => {
+  function configurePullRequestWorkerLoop(
+    fixture: Awaited<ReturnType<typeof createFixture>>,
+    prNumber: number,
+  ) {
+    fixture.store.loops.upsert({
+      ...(fixture.store.loops.getById("loop_worker_1") ?? {
+        id: "loop_worker_1",
+        projectId: "project_1",
+        type: "worker",
+        targetType: "project",
+        targetId: "project_1",
+        repo: "acme/looper",
+        prNumber: null,
+        status: "queued",
+        configJson: null,
+        metadataJson: null,
+        lastRunAt: null,
+        nextRunAt: fixture.now.toISOString(),
+        createdAt: fixture.now.toISOString(),
+        updatedAt: fixture.now.toISOString(),
+      }),
+      targetType: "pull_request",
+      targetId: `pr:acme/looper:${prNumber}`,
+      repo: "acme/looper",
+      prNumber,
+      metadataJson: JSON.stringify({
+        executionMode: "push-existing",
+        prUrl: `https://example.test/acme/looper/pull/${prNumber}`,
+      }),
+      updatedAt: fixture.now.toISOString(),
+    });
+    fixture.store.queue.upsert({
+      ...(fixture.store.queue.findActiveByDedupe("worker:loop_worker_1") ?? {
+        id: "queue_pr_mode",
+        projectId: "project_1",
+        loopId: "loop_worker_1",
+        type: "worker",
+        targetType: "pull_request",
+        targetId: `pr:acme/looper:${prNumber}`,
+        repo: "acme/looper",
+        prNumber,
+        dedupeKey: "worker:loop_worker_1",
+        priority: 0,
+        status: "queued",
+        availableAt: fixture.now.toISOString(),
+        attempts: 0,
+        maxAttempts: 3,
+        claimedBy: null,
+        claimedAt: null,
+        startedAt: null,
+        finishedAt: null,
+        lockKey: `pr:acme/looper:${prNumber}`,
+        payloadJson: null,
+        lastError: null,
+        lastErrorKind: null,
+        createdAt: fixture.now.toISOString(),
+        updatedAt: fixture.now.toISOString(),
+      }),
+      type: "worker",
+      targetType: "pull_request",
+      targetId: `pr:acme/looper:${prNumber}`,
+      repo: "acme/looper",
+      prNumber,
+      lockKey: `pr:acme/looper:${prNumber}`,
+      payloadJson: null,
+      updatedAt: fixture.now.toISOString(),
+    });
+  }
+
   test("processNext does not claim queue items for other loop types", async () => {
     const fixture = await createFixture();
     const nowIso = fixture.now.toISOString();
@@ -413,6 +565,252 @@ describe("WorkerLoopRunner", () => {
     expect(result.status).toBe("failed");
     expect(github.createPullRequestCalls).toHaveLength(0);
     expect(fixture.store.loops.getById("loop_worker_1")?.status).toBe("paused");
+
+    fixture.store.close();
+  });
+
+  test("discovers spec-ready PRs and pushes to the existing PR branch", async () => {
+    const fixture = await createFixture();
+    configurePullRequestWorkerLoop(fixture, 77);
+
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    github.listOpenPullRequests = async (): Promise<
+      Awaited<ReturnType<WorkerGitHubGateway["listOpenPullRequests"]>>
+    > => {
+      return [
+        {
+          number: 77,
+          title: "Existing PR",
+          state: "OPEN",
+          isDraft: false,
+          reviewDecision: undefined,
+          labels: ["looper:spec-ready"],
+          headRefName: "feature/existing-pr",
+          baseRefName: "main",
+          author: "octocat",
+          reviewRequests: ["octocat"],
+        },
+      ];
+    };
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented existing PR", ["abc123"]),
+    ]);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const discovery = await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    expect(discovery.queueItems).toHaveLength(1);
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("success");
+    expect(git.pushCalls).toBe(1);
+    expect(github.createPullRequestCalls).toHaveLength(0);
+    expect(github.removedLabels).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 77,
+        labels: ["looper:spec-ready"],
+      },
+    ]);
+    expect(github.reviewerRequests).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 77,
+        reviewers: ["octocat"],
+      },
+    ]);
+
+    fixture.store.close();
+  });
+
+  test("discovery does not requeue paused pull-request worker loops", async () => {
+    const fixture = await createFixture();
+    const nowIso = fixture.now.toISOString();
+    fixture.store.loops.upsert({
+      id: "loop_worker_paused_pr",
+      projectId: "project_1",
+      type: "worker",
+      targetType: "pull_request",
+      targetId: "pr:acme/looper:77",
+      repo: "acme/looper",
+      prNumber: 77,
+      status: "paused",
+      configJson: null,
+      metadataJson: JSON.stringify({
+        executionMode: "push-existing",
+        prUrl: "https://example.test/acme/looper/pull/77",
+      }),
+      lastRunAt: nowIso,
+      nextRunAt: null,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+
+    const github = new FakeGitHubGateway();
+    github.listOpenPullRequests = async (): Promise<
+      Awaited<ReturnType<WorkerGitHubGateway["listOpenPullRequests"]>>
+    > => {
+      return [
+        {
+          number: 77,
+          title: "Existing PR",
+          state: "OPEN",
+          isDraft: false,
+          reviewDecision: undefined,
+          labels: ["looper:spec-ready"],
+          headRefName: "feature/existing-pr",
+          baseRefName: "main",
+          author: "octocat",
+          reviewRequests: ["octocat"],
+        },
+      ];
+    };
+
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git: new FakeGitGateway(fixture.worktreeRoot),
+      github,
+      agentExecutor: new FakeAgentExecutor([
+        completedAgentResult("Implemented existing PR", ["abc123"]),
+      ]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const discovery = await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+
+    expect(discovery.queueItems).toHaveLength(0);
+    expect(fixture.store.loops.getById("loop_worker_paused_pr")?.status).toBe(
+      "paused",
+    );
+
+    fixture.store.close();
+  });
+
+  test("keeps spec-ready label when pull_request mode has no resolved spec path", async () => {
+    const fixture = await createFixture();
+    configurePullRequestWorkerLoop(fixture, 78);
+
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    github.viewPullRequest = async (input) => ({
+      number: input.prNumber,
+      title: "Missing spec",
+      body: "No spec here",
+      url: `https://example.test/${input.repo}/pull/${input.prNumber}`,
+      state: "OPEN",
+      isDraft: false,
+      reviewDecision: undefined,
+      labels: ["looper:spec-ready"],
+      headRefName: "feature/missing-spec",
+      baseRefName: "main",
+      headSha: "abc123",
+      baseSha: "base123",
+      author: "octocat",
+      reviewRequests: ["octocat"],
+      comments: [],
+      reviews: [],
+      checks: [{ conclusion: "SUCCESS" }],
+    });
+
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: new FakeAgentExecutor([completedAgentResult("unused")]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("failed");
+    expect(result.failureKind).toBe("manual_intervention");
+    expect(github.removedLabels).toHaveLength(0);
+
+    fixture.store.close();
+  });
+
+  test("keeps spec-ready label when pull_request lock acquisition fails", async () => {
+    const fixture = await createFixture();
+    configurePullRequestWorkerLoop(fixture, 79);
+    fixture.queue.acquireBusinessLock({
+      key: "pr:acme/looper:79",
+      owner: "other-worker",
+      reason: "test-lock",
+      expiresAt: new Date(fixture.now.getTime() + 60_000).toISOString(),
+    });
+
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: new FakeAgentExecutor([completedAgentResult("unused")]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("failed");
+    expect(result.failureKind).toBe("retryable_transient");
+    expect(github.removedLabels).toHaveLength(0);
 
     fixture.store.close();
   });
