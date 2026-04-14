@@ -651,11 +651,18 @@ async function buildWorkersCreateResponse(
   const planner =
     issueNumber == null
       ? null
-      : findPlannerLoopForIssue(context, {
+      : maybeFindPlannerLoopForIssue(context, {
           projectId,
           repo,
           issueNumber,
         });
+  if (issueNumber != null && !planner?.specPath) {
+    throw new ApiError(
+      "VALIDATION_FAILED",
+      400,
+      `issueNumber requires planner-derived specPath; run planner for ${repo}#${issueNumber} first`,
+    );
+  }
   const effectivePrNumber =
     pullRequestTarget?.prNumber ?? planner?.prNumber ?? null;
   const effectiveSpecPath = specPath ?? planner?.specPath ?? null;
@@ -1848,14 +1855,14 @@ function requirePullRequestTarget(
   return { prNumber: snapshot.prNumber };
 }
 
-function findPlannerLoopForIssue(
+function maybeFindPlannerLoopForIssue(
   context: LooperdApiContext,
   input: {
     projectId: string;
     repo: string;
     issueNumber: number;
   },
-): { prNumber: number; specPath: string | null } {
+): { prNumber: number | null; specPath: string | null } | null {
   const targetId = `issue:${input.repo}:${input.issueNumber}`;
   const loop = context.store.loops
     .list()
@@ -1867,22 +1874,11 @@ function findPlannerLoopForIssue(
         candidate.targetId === targetId,
     );
   if (!loop) {
-    throw new ApiError(
-      "PLANNER_NOT_FOUND",
-      404,
-      `No planner loop found for ${input.repo}#${input.issueNumber}`,
-    );
+    return null;
   }
 
   const metadata = parseMetadata(loop.metadataJson);
-  const prNumber = loop.prNumber ?? readNumber(metadata.prNumber);
-  if (!prNumber) {
-    throw new ApiError(
-      "PLANNER_PR_NOT_READY",
-      409,
-      `Planner spec PR is not ready for ${input.repo}#${input.issueNumber}`,
-    );
-  }
+  const prNumber = loop.prNumber ?? readNumber(metadata.prNumber) ?? null;
 
   return {
     prNumber,

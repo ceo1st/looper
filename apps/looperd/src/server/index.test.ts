@@ -649,13 +649,59 @@ describe("createLooperdApi", () => {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          projectId: "project_1",
+          projectId: "project_2",
           repo: "acme/looper",
           issueNumber: 999,
         }),
       }),
     );
-    expect(missingIssueResponse.status).toBe(404);
+    const missingIssueBody = (await missingIssueResponse.json()) as {
+      error: { code: string; message: string };
+    };
+    expect(missingIssueResponse.status).toBe(400);
+    expect(missingIssueBody.error.code).toBe("VALIDATION_FAILED");
+    expect(missingIssueBody.error.message).toContain(
+      "issueNumber requires planner-derived specPath",
+    );
+
+    store.loops.upsert({
+      id: "loop_planner_issue_999",
+      seq: 200,
+      projectId: "project_2",
+      type: "planner",
+      targetType: "issue",
+      targetId: "issue:acme/looper:999",
+      repo: "acme/looper",
+      prNumber: null,
+      status: "running",
+      configJson: null,
+      metadataJson: JSON.stringify({}),
+      lastRunAt: "2026-04-11T12:06:00.000Z",
+      nextRunAt: "2026-04-11T12:06:00.000Z",
+      createdAt: "2026-04-11T12:06:00.000Z",
+      updatedAt: "2026-04-11T12:06:00.000Z",
+    });
+
+    const missingPlannerSpecResponse = await api.handle(
+      new Request("http://localhost/api/v1/workers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project_2",
+          repo: "acme/looper",
+          issueNumber: 999,
+        }),
+      }),
+    );
+    const missingPlannerSpecBody =
+      (await missingPlannerSpecResponse.json()) as {
+        error: { code: string; message: string };
+      };
+    expect(missingPlannerSpecResponse.status).toBe(400);
+    expect(missingPlannerSpecBody.error.code).toBe("VALIDATION_FAILED");
+    expect(missingPlannerSpecBody.error.message).toContain(
+      "issueNumber requires planner-derived specPath",
+    );
 
     const createLoopResponse = await api.handle(
       new Request("http://localhost/api/v1/loops", {
