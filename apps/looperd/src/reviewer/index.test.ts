@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import type { Logger } from "../bootstrap/logger";
 import type { AgentResult, AgentRunInput } from "../infra/agent";
+import { CommandExecutionError } from "../infra/command";
 import { SchedulerQueue } from "../scheduler/index";
 import { SqliteStore } from "../storage/sqlite/sqlite-store";
 import type { PullRequestSnapshotRecord } from "../storage/types";
@@ -64,6 +65,15 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
     prNumber: number;
     event: string;
     body?: string;
+    commitId?: string;
+    comments?: Array<{
+      body: string;
+      path: string;
+      line: number;
+      side: "LEFT" | "RIGHT";
+      startLine?: number;
+      startSide?: "LEFT" | "RIGHT";
+    }>;
   }> = [];
   public addedLabels: Array<{
     repo: string;
@@ -75,10 +85,31 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
     prNumber: number;
     labels: string[];
   }> = [];
+  public prComments: Array<{
+    repo: string;
+    prNumber: number;
+    body: string;
+  }> = [];
+  public addedReactions: Array<{
+    repo: string;
+    prNumber: number;
+    content: "+1" | "eyes";
+  }> = [];
+  public removedReactions: Array<{
+    repo: string;
+    prNumber: number;
+    content: "+1" | "eyes";
+  }> = [];
   public submitFailuresRemaining = 0;
   public addLabelFailuresRemaining = 0;
+  public addReactionFailuresRemaining = 0;
+  public removeReactionFailuresRemaining = 0;
   public nextReviewDecisionAfterSubmit: string | undefined;
   public failingViewPullRequestNumbers = new Set<number>();
+  public failInlineReviewAnchorCallNumbers = new Set<number>();
+  public failPullRequestCommentCallNumbers = new Set<number>();
+  private submitCallCount = 0;
+  private addPullRequestCommentCallCount = 0;
   private readonly currentLabels: string[];
 
   constructor(
@@ -199,8 +230,30 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
     prNumber: number;
     event: "APPROVE" | "COMMENT" | "REQUEST_CHANGES";
     body?: string;
+    commitId?: string;
+    comments?: Array<{
+      body: string;
+      path: string;
+      line: number;
+      side: "LEFT" | "RIGHT";
+      startLine?: number;
+      startSide?: "LEFT" | "RIGHT";
+    }>;
   }): Promise<void> {
+    this.submitCallCount += 1;
     this.submitCalls.push(input);
+    if (
+      (input.comments?.length ?? 0) > 0 &&
+      this.failInlineReviewAnchorCallNumbers.has(this.submitCallCount)
+    ) {
+      throw new CommandExecutionError("Command exited with code 1", {
+        exitCode: 1,
+        stdout: "",
+        stderr:
+          'gh: Validation Failed (HTTP 422)\n{"message":"Validation Failed","errors":["Pull request review thread line must be part of the diff"]}',
+        durationMs: 1,
+      });
+    }
     if (this.submitFailuresRemaining > 0) {
       this.submitFailuresRemaining -= 1;
       throw new Error("temporary GitHub failure");
@@ -252,6 +305,61 @@ class FakeGitHubGateway implements ReviewerGitHubGateway {
       }
     }
   }
+
+  public async addPullRequestComment(input: {
+    repo: string;
+    prNumber: number;
+    body: string;
+    cwd?: string;
+  }): Promise<void> {
+    this.addPullRequestCommentCallCount += 1;
+    if (
+      this.failPullRequestCommentCallNumbers.has(
+        this.addPullRequestCommentCallCount,
+      )
+    ) {
+      throw new Error("temporary PR comment failure");
+    }
+    this.prComments.push({
+      repo: input.repo,
+      prNumber: input.prNumber,
+      body: input.body,
+    });
+  }
+
+  public async addPullRequestReaction(input: {
+    repo: string;
+    prNumber: number;
+    content: "+1" | "eyes";
+    cwd?: string;
+  }): Promise<void> {
+    if (this.addReactionFailuresRemaining > 0) {
+      this.addReactionFailuresRemaining -= 1;
+      throw new Error("temporary add reaction failure");
+    }
+    this.addedReactions.push({
+      repo: input.repo,
+      prNumber: input.prNumber,
+      content: input.content,
+    });
+  }
+
+  public async removePullRequestReaction(input: {
+    repo: string;
+    prNumber: number;
+    content: "+1" | "eyes";
+    cwd?: string;
+  }): Promise<void> {
+    if (this.removeReactionFailuresRemaining > 0) {
+      this.removeReactionFailuresRemaining -= 1;
+      throw new Error("temporary remove reaction failure");
+    }
+    this.removedReactions.push({
+      repo: input.repo,
+      prNumber: input.prNumber,
+      content: input.content,
+    });
+  }
 }
 
 class FakeAgentExecutor {
@@ -279,7 +387,14 @@ function completedAgentResult(summary: string): AgentResult {
     artifacts: [],
     changedFiles: [],
     commits: [],
-    rawLogs: { stdout: `${summary}\n`, stderr: "" },
+    rawLogs: {
+      stdout: `${JSON.stringify({
+        verdict: "actionable",
+        body: summary,
+        comments: [{ body: summary }],
+      })}\n`,
+      stderr: "",
+    },
     parseStatus: "parsed",
     completionSignal: "done",
     heartbeatCount: 1,
@@ -293,13 +408,14 @@ function completedAgentResult(summary: string): AgentResult {
 
 function createCapturingLogger() {
   const entries: Array<{
-    level: "info" | "error";
+    level: "info" | "warn" | "error";
     message: string;
     context?: Record<string, unknown>;
   }> = [];
   const logger: Logger = {
     debug: () => {},
-    warn: () => {},
+    warn: (message, context) =>
+      entries.push({ level: "warn", message, context }),
     info: (message, context) =>
       entries.push({ level: "info", message, context }),
     error: (message, context) =>
@@ -392,6 +508,16 @@ describe("ReviewerLoopRunner", () => {
     const result = await runner.processClaimedItem(claimed);
     expect(result.status).toBe("success");
     expect(github.submitCalls).toHaveLength(1);
+    expect(github.addedReactions).toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "eyes",
+    });
+    expect(github.removedReactions).toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "eyes",
+    });
     expect(agent.starts).toHaveLength(1);
     expect(
       fixture.store.pullRequestSnapshots.getLatest("acme/looper", 42)?.headSha,
@@ -514,6 +640,11 @@ describe("ReviewerLoopRunner", () => {
     ]);
     expect(github.removedLabels).toEqual([]);
     expect(github.addedLabels).toEqual([]);
+    expect(github.removedReactions).toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "eyes",
+    });
 
     fixture.store.close();
   });
@@ -529,7 +660,17 @@ describe("ReviewerLoopRunner", () => {
     github.submitFailuresRemaining = 1;
     github.nextReviewDecisionAfterSubmit = "APPROVED";
     const agent = new FakeAgentExecutor([
-      completedAgentResult("Spec looks ready to implement"),
+      {
+        ...completedAgentResult("Spec looks ready to implement"),
+        rawLogs: {
+          stdout: `${JSON.stringify({
+            verdict: "clean",
+            body: "Spec looks ready to implement",
+            comments: [],
+          })}\n`,
+          stderr: "",
+        },
+      },
     ]);
     const runner = new ReviewerLoopRunner({
       store: fixture.store,
@@ -558,7 +699,7 @@ describe("ReviewerLoopRunner", () => {
       throw new Error("Expected failed reviewer run");
     }
     const failedCheckpoint = JSON.parse(failedRun.checkpointJson ?? "{}");
-    failedCheckpoint.pendingReview.event = "APPROVE";
+    expect(failedCheckpoint.pendingReview.event).toBe("APPROVE");
     fixture.store.runs.upsert({
       ...failedRun,
       checkpointJson: JSON.stringify(failedCheckpoint),
@@ -630,7 +771,9 @@ describe("ReviewerLoopRunner", () => {
     const firstRun = fixture.store.runs.listByLoop(firstResult.loopId)[0];
     const firstCheckpoint = JSON.parse(firstRun?.checkpointJson ?? "{}");
     expect(firstRun?.lastCompletedStep).toBe("review");
-    expect(firstCheckpoint.pendingReview.body).toContain("Please add tests");
+    expect(firstCheckpoint.pendingReview.comments[0].body).toContain(
+      "Please add tests",
+    );
     expect(fixture.store.queue.getById(firstClaim.id)?.status).toBe("queued");
     const failedLog = logs.entries.find(
       (entry) =>
@@ -844,6 +987,782 @@ describe("ReviewerLoopRunner", () => {
     ).toMatchObject({
       lastPublishedHeadSha: "new-head",
     });
+
+    fixture.store.close();
+  });
+
+  test("posts inline comments, top-level comments, and reactions from structured output", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      {
+        ...completedAgentResult("Detailed review"),
+        rawLogs: {
+          stdout: `${JSON.stringify({
+            verdict: "actionable",
+            body: "Overall review summary",
+            comments: [
+              {
+                body: "This branch misses a nil guard before dereferencing the config.",
+                path: "src/config.ts",
+                line: 27,
+                side: "RIGHT",
+              },
+              {
+                body: "Consider extracting the validation policy into a shared helper so future callers do not drift.",
+              },
+            ],
+          })}\n`,
+          stderr: "",
+        },
+      },
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("reviewer-worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed reviewer queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+
+    expect(result.status).toBe("success");
+    expect(github.submitCalls[0]).toMatchObject({
+      body: "Overall review summary",
+      commitId: "abc123",
+      comments: [
+        {
+          body: "This branch misses a nil guard before dereferencing the config.",
+          path: "src/config.ts",
+          line: 27,
+          side: "RIGHT",
+        },
+      ],
+    });
+    expect(github.prComments).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        body: "Consider extracting the validation policy into a shared helper so future callers do not drift.",
+      },
+    ]);
+    expect(github.removedReactions).toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "eyes",
+    });
+
+    fixture.store.close();
+  });
+
+  test("adds thumbs-up reaction for clean reviews and auto-approves when allowed", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      {
+        ...completedAgentResult("No actionable issues found"),
+        rawLogs: {
+          stdout: `${JSON.stringify({
+            verdict: "clean",
+            body: "No actionable issues found.",
+            comments: [],
+          })}\n`,
+          stderr: "",
+        },
+      },
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      allowAutoApprove: true,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("reviewer-worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed reviewer queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+
+    expect(result.status).toBe("success");
+    expect(github.submitCalls).toEqual([
+      expect.objectContaining({
+        repo: "acme/looper",
+        prNumber: 42,
+        event: "APPROVE",
+        body: "No actionable issues found.",
+      }),
+    ]);
+    expect(github.prComments).toEqual([]);
+    expect(github.addedReactions).toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "+1",
+    });
+    expect(github.removedReactions).toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "eyes",
+    });
+
+    fixture.store.close();
+  });
+
+  test("posts clean review body as comment when auto-approve is disabled", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      {
+        ...completedAgentResult("No actionable issues found"),
+        rawLogs: {
+          stdout: `${JSON.stringify({
+            verdict: "clean",
+            body: "No actionable issues found.",
+            comments: [],
+          })}\n`,
+          stderr: "",
+        },
+      },
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("reviewer-worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed reviewer queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+
+    expect(result.status).toBe("success");
+    expect(github.submitCalls).toEqual([
+      expect.objectContaining({
+        repo: "acme/looper",
+        prNumber: 42,
+        event: "COMMENT",
+        body: "No actionable issues found.",
+      }),
+    ]);
+    expect(github.addedReactions).toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "+1",
+    });
+
+    fixture.store.close();
+  });
+
+  test("posts clean review summary as comment when auto-approve is disabled and body is omitted", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      {
+        ...completedAgentResult("No actionable issues found"),
+        rawLogs: {
+          stdout: `${JSON.stringify({
+            verdict: "clean",
+            comments: [],
+          })}\n`,
+          stderr: "",
+        },
+      },
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("reviewer-worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed reviewer queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+
+    expect(result.status).toBe("success");
+    expect(github.submitCalls).toEqual([
+      expect.objectContaining({
+        repo: "acme/looper",
+        prNumber: 42,
+        event: "COMMENT",
+        body: "No actionable issues found",
+      }),
+    ]);
+    expect(github.addedReactions).toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "+1",
+    });
+
+    fixture.store.close();
+  });
+
+  test("treats clean verdict with comments as actionable feedback", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      {
+        ...completedAgentResult("Needs changes"),
+        rawLogs: {
+          stdout: `${JSON.stringify({
+            verdict: "clean",
+            body: "Needs changes",
+            comments: [{ body: "Please add a nil guard here." }],
+          })}\n`,
+          stderr: "",
+        },
+      },
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("reviewer-worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed reviewer queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+
+    expect(result.status).toBe("success");
+    expect(github.submitCalls[0]).toMatchObject({
+      event: "COMMENT",
+      body: "Needs changes",
+    });
+    expect(github.prComments).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        body: "Please add a nil guard here.",
+      },
+    ]);
+    expect(github.addedReactions).not.toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "+1",
+    });
+    expect(github.removedReactions).toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "+1",
+    });
+
+    fixture.store.close();
+  });
+
+  test("treats malformed clean inline comments as actionable feedback", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      {
+        ...completedAgentResult("Detailed review"),
+        rawLogs: {
+          stdout: `${JSON.stringify({
+            verdict: "clean",
+            body: "Overall review summary",
+            comments: [
+              {
+                body: "Fix null guard",
+                path: "src/config.ts",
+                line: 12,
+              },
+            ],
+          })}\n`,
+          stderr: "",
+        },
+      },
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("reviewer-worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed reviewer queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+
+    expect(result.status).toBe("success");
+    expect(github.submitCalls[0]).toMatchObject({
+      event: "COMMENT",
+      body: "Overall review summary",
+      comments: [],
+    });
+    expect(github.prComments).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        body: "Fix null guard",
+      },
+    ]);
+    expect(github.addedReactions).not.toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "+1",
+    });
+
+    fixture.store.close();
+  });
+
+  test("downgrades malformed multiline inline comment ranges to top-level comments", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    const agent = new FakeAgentExecutor([
+      {
+        ...completedAgentResult("Detailed review"),
+        rawLogs: {
+          stdout: `${JSON.stringify({
+            verdict: "actionable",
+            body: "Overall review summary",
+            comments: [
+              {
+                body: "Broken multiline range",
+                path: "src/config.ts",
+                line: 26,
+                side: "RIGHT",
+                startLine: 27,
+                startSide: "LEFT",
+              },
+              {
+                body: "Top-level follow-up",
+              },
+            ],
+          })}\n`,
+          stderr: "",
+        },
+      },
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("reviewer-worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed reviewer queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+
+    expect(result.status).toBe("success");
+    expect(github.submitCalls[0]).toMatchObject({
+      body: "Overall review summary",
+      comments: [],
+    });
+    expect(github.prComments).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        body: "Broken multiline range",
+      },
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        body: "Top-level follow-up",
+      },
+    ]);
+
+    fixture.store.close();
+  });
+
+  test("continues when reviewer reactions fail", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    github.addReactionFailuresRemaining = 2;
+    github.removeReactionFailuresRemaining = 1;
+    const logs = createCapturingLogger();
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Please add tests"),
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: logs.logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("reviewer-worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed reviewer queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+
+    expect(result.status).toBe("success");
+    expect(github.submitCalls).toHaveLength(1);
+    expect(logs.entries).toContainEqual(
+      expect.objectContaining({
+        level: "info",
+        message: "reviewer run completed",
+      }),
+    );
+    expect(logs.entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          level: "warn",
+          message: "reviewer reaction add failed",
+        }),
+        expect.objectContaining({
+          level: "warn",
+          message: "reviewer reaction removal failed",
+        }),
+      ]),
+    );
+    expect(github.addedReactions).toEqual([]);
+    expect(github.removedReactions).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        content: "eyes",
+      },
+    ]);
+
+    fixture.store.close();
+  });
+
+  test("removes eyes reaction when review step exits before publish", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: new FakeAgentExecutor([]),
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const claimed = fixture.queue.claimNext("reviewer-worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed reviewer queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+
+    expect(result.status).toBe("failed");
+    expect(github.addedReactions).toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "eyes",
+    });
+    expect(github.removedReactions).toContainEqual({
+      repo: "acme/looper",
+      prNumber: 42,
+      content: "eyes",
+    });
+    expect(github.submitCalls).toHaveLength(0);
+
+    fixture.store.close();
+  });
+
+  test("resumes publish safely after top-level comment posting partially succeeds", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    github.failPullRequestCommentCallNumbers.add(2);
+    const agent = new FakeAgentExecutor([
+      {
+        ...completedAgentResult("Detailed review"),
+        rawLogs: {
+          stdout: `${JSON.stringify({
+            verdict: "actionable",
+            body: "Overall review summary",
+            comments: [{ body: "First comment" }, { body: "Second comment" }],
+          })}\n`,
+          stderr: "",
+        },
+      },
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const firstClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!firstClaim) {
+      throw new Error("Expected first reviewer claim");
+    }
+
+    const firstResult = await runner.processClaimedItem(firstClaim);
+
+    expect(firstResult.status).toBe("failed");
+    expect(firstResult.failureKind).toBe("retryable_after_resume");
+    expect(github.submitCalls).toHaveLength(1);
+    expect(github.prComments).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        body: "First comment",
+      },
+    ]);
+
+    github.failPullRequestCommentCallNumbers.clear();
+    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
+    const retryClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!retryClaim) {
+      throw new Error("Expected retry reviewer claim");
+    }
+
+    const retryResult = await runner.processClaimedItem(retryClaim);
+
+    expect(retryResult.status).toBe("success");
+    expect(github.submitCalls).toHaveLength(1);
+    expect(github.prComments).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        body: "First comment",
+      },
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        body: "Second comment",
+      },
+    ]);
+
+    fixture.store.close();
+  });
+
+  test("falls back to top-level comments when GitHub rejects inline anchors", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    github.failInlineReviewAnchorCallNumbers.add(1);
+    github.failPullRequestCommentCallNumbers.add(2);
+    const agent = new FakeAgentExecutor([
+      {
+        ...completedAgentResult("Detailed review"),
+        rawLogs: {
+          stdout: `${JSON.stringify({
+            verdict: "actionable",
+            body: "Overall review summary",
+            comments: [
+              {
+                body: "Please handle the null case.",
+                path: "src/a.ts",
+                line: 12,
+                side: "RIGHT",
+              },
+              { body: "Add a regression test." },
+            ],
+          })}\n`,
+          stderr: "",
+        },
+      },
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const firstClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!firstClaim) {
+      throw new Error("Expected first reviewer claim");
+    }
+
+    const firstResult = await runner.processClaimedItem(firstClaim);
+
+    expect(firstResult.status).toBe("failed");
+    expect(firstResult.failureKind).toBe("retryable_after_resume");
+    expect(github.submitCalls).toHaveLength(2);
+    expect(github.submitCalls[0]).toMatchObject({
+      repo: "acme/looper",
+      prNumber: 42,
+      event: "COMMENT",
+      body: "Overall review summary",
+      commitId: "abc123",
+      comments: [
+        {
+          body: "Please handle the null case.",
+          path: "src/a.ts",
+          line: 12,
+          side: "RIGHT",
+        },
+      ],
+    });
+    expect(github.submitCalls[1]).toMatchObject({
+      repo: "acme/looper",
+      prNumber: 42,
+      event: "COMMENT",
+      body: "Overall review summary",
+    });
+    expect(github.prComments).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        body: "Inline comment fallback (src/a.ts:12):\n\nPlease handle the null case.",
+      },
+    ]);
+
+    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
+    github.failPullRequestCommentCallNumbers.clear();
+    const retryClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!retryClaim) {
+      throw new Error("Expected retry reviewer claim");
+    }
+
+    const retryResult = await runner.processClaimedItem(retryClaim);
+
+    expect(retryResult.status).toBe("success");
+    expect(github.submitCalls).toHaveLength(2);
+    expect(github.prComments).toEqual([
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        body: "Inline comment fallback (src/a.ts:12):\n\nPlease handle the null case.",
+      },
+      {
+        repo: "acme/looper",
+        prNumber: 42,
+        body: "Add a regression test.",
+      },
+    ]);
+
+    fixture.store.close();
+  });
+
+  test("defaults missing checkpoint review fields when resuming publish", async () => {
+    const fixture = await createFixture();
+    const github = new FakeGitHubGateway();
+    github.submitFailuresRemaining = 1;
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Please add tests"),
+    ]);
+    const runner = new ReviewerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+    });
+
+    await runner.discoverPullRequests({
+      projectId: "project_1",
+      repo: "acme/looper",
+    });
+    const firstClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!firstClaim) {
+      throw new Error("Expected first reviewer claim");
+    }
+
+    const firstResult = await runner.processClaimedItem(firstClaim);
+    expect(firstResult.status).toBe("failed");
+
+    const failedRun = fixture.store.runs.listByLoop(firstResult.loopId)[0];
+    if (!failedRun) {
+      throw new Error("Expected failed reviewer run");
+    }
+    const failedCheckpoint = JSON.parse(failedRun.checkpointJson ?? "{}");
+    failedCheckpoint.pendingReview = {
+      headSha: failedCheckpoint.pendingReview.headSha,
+      event: failedCheckpoint.pendingReview.event,
+      body: failedCheckpoint.pendingReview.body,
+      summary: failedCheckpoint.pendingReview.summary,
+    };
+    fixture.store.runs.upsert({
+      ...failedRun,
+      checkpointJson: JSON.stringify(failedCheckpoint),
+    });
+
+    fixture.now.setTime(new Date("2026-04-11T12:00:05.000Z").getTime());
+    const retryClaim = fixture.queue.claimNext("reviewer-worker-1");
+    if (!retryClaim) {
+      throw new Error("Expected retry reviewer claim");
+    }
+
+    const retryResult = await runner.processClaimedItem(retryClaim);
+
+    expect(retryResult.status).toBe("success");
+    expect(github.submitCalls).toHaveLength(2);
 
     fixture.store.close();
   });

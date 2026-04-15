@@ -7,6 +7,7 @@ import { CommandExecutionError } from "../infra/command";
 import type {
   GitHubPullRequestDetail,
   GitHubPullRequestSummary,
+  GitHubReviewComment,
   SubmitReviewInput,
 } from "../infra/github";
 import {
@@ -60,6 +61,24 @@ export interface ReviewerGitHubGateway {
     capturedAt?: string;
   }): Promise<PullRequestSnapshotRecord>;
   submitReview(input: SubmitReviewInput): Promise<void>;
+  addPullRequestComment(input: {
+    repo: string;
+    prNumber: number;
+    body: string;
+    cwd?: string;
+  }): Promise<void>;
+  addPullRequestReaction(input: {
+    repo: string;
+    prNumber: number;
+    content: "+1" | "eyes";
+    cwd?: string;
+  }): Promise<void>;
+  removePullRequestReaction(input: {
+    repo: string;
+    prNumber: number;
+    content: "+1" | "eyes";
+    cwd?: string;
+  }): Promise<void>;
   addPullRequestLabels(input: {
     repo: string;
     prNumber: number;
@@ -148,10 +167,44 @@ interface ReviewerCheckpoint {
   pendingReview?: {
     headSha: string;
     event: ReviewEvent;
-    body: string;
+    body?: string;
     summary?: string;
+    comments: ReviewFeedbackComment[];
+    clean: boolean;
+    publishState?: {
+      reviewSubmitted?: boolean;
+      topLevelCommentsPosted?: number;
+    };
   };
   skipReason?: string;
+}
+
+interface ReviewFeedbackComment {
+  body: string;
+  path?: string;
+  line?: number;
+  side?: "LEFT" | "RIGHT";
+  startLine?: number;
+  startSide?: "LEFT" | "RIGHT";
+}
+
+interface ParsedReviewFeedback {
+  body?: string;
+  comments: ReviewFeedbackComment[];
+  clean: boolean;
+}
+
+interface NormalizedPendingReviewCheckpoint {
+  headSha: string;
+  event: ReviewEvent;
+  body?: string;
+  summary?: string;
+  comments: ReviewFeedbackComment[];
+  clean: boolean;
+  publishState: {
+    reviewSubmitted: boolean;
+    topLevelCommentsPosted: number;
+  };
 }
 
 interface ResumedRunContext {
@@ -821,59 +874,83 @@ export class ReviewerLoopRunner {
     });
 
     const executionId = randomUUID();
-    const execution = await this.options.agentExecutor.start({
-      executionId,
+    await this.tryAddPullRequestReaction({
+      repo,
+      prNumber,
+      content: "eyes",
+      cwd: input.project.repoPath,
       projectId: input.project.id,
       loopId: input.loop.id,
       runId: input.run.id,
-      prompt,
-      workingDirectory: input.project.repoPath,
-      timeoutMs: this.agentTimeoutMs,
-      metadata: {
-        loopType: "reviewer",
-        repo: input.queueItem.repo,
-        prNumber: input.queueItem.prNumber,
-      },
-      idempotencyKey: `reviewer:${input.loop.id}:${snapshot.headSha}`,
     });
-    await this.options.onAgentExecutionStarted?.({
-      executionId,
-      projectId: input.project.id,
-      loopId: input.loop.id,
-      runId: input.run.id,
-      subtitle: `${repo}#${prNumber}`,
-      body: "Review started",
-      dedupeKey: `runtime.agent.started:reviewer:${input.run.id}`,
-    });
-    const result = await execution.wait();
+    try {
+      const execution = await this.options.agentExecutor.start({
+        executionId,
+        projectId: input.project.id,
+        loopId: input.loop.id,
+        runId: input.run.id,
+        prompt,
+        workingDirectory: input.project.repoPath,
+        timeoutMs: this.agentTimeoutMs,
+        metadata: {
+          loopType: "reviewer",
+          repo: input.queueItem.repo,
+          prNumber: input.queueItem.prNumber,
+        },
+        idempotencyKey: `reviewer:${input.loop.id}:${snapshot.headSha}`,
+      });
+      await this.options.onAgentExecutionStarted?.({
+        executionId,
+        projectId: input.project.id,
+        loopId: input.loop.id,
+        runId: input.run.id,
+        subtitle: `${repo}#${prNumber}`,
+        body: "Review started",
+        dedupeKey: `runtime.agent.started:reviewer:${input.run.id}`,
+      });
+      const result = await execution.wait();
 
-    if (result.status !== "completed") {
-      throw new ReviewerLoopError(
-        result.summary ?? `Reviewer agent ${result.status}`,
-        "retryable_transient",
-      );
+      if (result.status !== "completed") {
+        throw new ReviewerLoopError(
+          result.summary ?? `Reviewer agent ${result.status}`,
+          "retryable_transient",
+        );
+      }
+
+      const reviewFeedback = parseReviewFeedback(result);
+      if (!reviewFeedback.clean && reviewFeedback.comments.length === 0) {
+        throw new ReviewerLoopError(
+          "Reviewer agent produced no actionable review comments",
+          result.parseStatus === "invalid_json"
+            ? "non_retryable"
+            : "retryable_transient",
+        );
+      }
+
+      return {
+        ...input.checkpoint,
+        pendingReview: {
+          headSha: snapshot.headSha,
+          event: reviewFeedback.clean ? "APPROVE" : "COMMENT",
+          body: reviewFeedback.body,
+          summary: result.summary,
+          comments: reviewFeedback.comments,
+          clean: reviewFeedback.clean,
+        },
+        resumePolicy: "advance_from_checkpoint",
+      };
+    } catch (error) {
+      await this.tryRemovePullRequestReaction({
+        repo,
+        prNumber,
+        content: "eyes",
+        cwd: input.project.repoPath,
+        projectId: input.project.id,
+        loopId: input.loop.id,
+        runId: input.run.id,
+      });
+      throw error;
     }
-
-    const reviewBody = toReviewBody(result);
-    if (!reviewBody) {
-      throw new ReviewerLoopError(
-        "Reviewer agent produced an empty review body",
-        result.parseStatus === "invalid_json"
-          ? "non_retryable"
-          : "retryable_transient",
-      );
-    }
-
-    return {
-      ...input.checkpoint,
-      pendingReview: {
-        headSha: snapshot.headSha,
-        event: "COMMENT",
-        body: reviewBody,
-        summary: result.summary,
-      },
-      resumePolicy: "advance_from_checkpoint",
-    };
   }
 
   private async runPublishStep(input: {
@@ -895,20 +972,27 @@ export class ReviewerLoopRunner {
       );
     }
 
+    const normalizedPendingReview =
+      normalizePendingReviewCheckpoint(pendingReview);
     const loopMetadata = parseJsonObject(input.loop.metadataJson);
     const lastPublishedHeadSha = readString(loopMetadata.lastPublishedHeadSha);
-    if (lastPublishedHeadSha === pendingReview.headSha) {
+    if (lastPublishedHeadSha === normalizedPendingReview.headSha) {
       return {
         ...input.checkpoint,
-        skipReason: `Skipped already-published review for head ${pendingReview.headSha}`,
+        skipReason: `Skipped already-published review for head ${normalizedPendingReview.headSha}`,
       };
     }
 
     const reviewEvent =
-      pendingReview.event === "APPROVE" && !this.allowAutoApprove
+      normalizedPendingReview.event === "APPROVE" && !this.allowAutoApprove
         ? "COMMENT"
-        : pendingReview.event;
-
+        : normalizedPendingReview.event;
+    const reviewBody =
+      normalizedPendingReview.clean && reviewEvent === "COMMENT"
+        ? normalizedPendingReview.body?.trim() ||
+          normalizedPendingReview.summary?.trim() ||
+          undefined
+        : normalizedPendingReview.body;
     const repo = requireString(input.queueItem.repo, "queueItem.repo");
     const prNumber = requireNumber(
       input.queueItem.prNumber,
@@ -931,12 +1015,158 @@ export class ReviewerLoopRunner {
     }
 
     try {
-      await this.options.github.submitReview({
+      if (normalizedPendingReview.clean) {
+        if (
+          !normalizedPendingReview.publishState.reviewSubmitted &&
+          (reviewEvent === "APPROVE" || Boolean(reviewBody))
+        ) {
+          await this.options.github.submitReview({
+            repo,
+            prNumber,
+            event: reviewEvent,
+            body: reviewBody,
+            cwd: input.project.repoPath,
+          });
+          normalizedPendingReview.publishState.reviewSubmitted = true;
+          this.persistPendingReviewCheckpoint(
+            input.run,
+            input.checkpoint,
+            normalizedPendingReview,
+          );
+        }
+      } else {
+        if (
+          !normalizedPendingReview.publishState.reviewSubmitted &&
+          (normalizedPendingReview.comments.some(isInlineReviewComment) ||
+            normalizedPendingReview.body)
+        ) {
+          const inlineComments = normalizedPendingReview.comments.filter(
+            isInlineReviewComment,
+          );
+          try {
+            await this.options.github.submitReview({
+              repo,
+              prNumber,
+              event: reviewEvent,
+              body: normalizedPendingReview.body,
+              commitId: normalizedPendingReview.headSha,
+              comments: inlineComments.map(toGitHubReviewComment),
+              cwd: input.project.repoPath,
+            });
+          } catch (error) {
+            if (
+              inlineComments.length === 0 ||
+              !isInlineReviewAnchorFailure(error)
+            ) {
+              throw error;
+            }
+
+            this.options.logger.warn(
+              "reviewer inline anchors rejected; falling back to top-level comments",
+              {
+                projectId: input.project.id,
+                loopId: input.loop.id,
+                runId: input.run.id,
+                repo,
+                prNumber,
+                inlineCommentCount: inlineComments.length,
+              },
+            );
+
+            normalizedPendingReview.comments =
+              normalizedPendingReview.comments.map((comment) =>
+                isInlineReviewComment(comment)
+                  ? downgradeInlineCommentToTopLevel(comment)
+                  : comment,
+              );
+            this.persistPendingReviewCheckpoint(
+              input.run,
+              input.checkpoint,
+              normalizedPendingReview,
+            );
+
+            const fallbackBody =
+              normalizedPendingReview.body?.trim() ||
+              normalizedPendingReview.summary?.trim() ||
+              undefined;
+            if (fallbackBody) {
+              await this.options.github.submitReview({
+                repo,
+                prNumber,
+                event: reviewEvent,
+                body: fallbackBody,
+                cwd: input.project.repoPath,
+              });
+            }
+          }
+          normalizedPendingReview.publishState.reviewSubmitted = true;
+          this.persistPendingReviewCheckpoint(
+            input.run,
+            input.checkpoint,
+            normalizedPendingReview,
+          );
+        }
+        while (true) {
+          const topLevelComments = normalizedPendingReview.comments.filter(
+            (comment) => !isInlineReviewComment(comment),
+          );
+          if (
+            normalizedPendingReview.publishState.topLevelCommentsPosted >=
+            topLevelComments.length
+          ) {
+            break;
+          }
+          const comment =
+            topLevelComments[
+              normalizedPendingReview.publishState.topLevelCommentsPosted
+            ];
+          if (!comment) {
+            break;
+          }
+          await this.options.github.addPullRequestComment({
+            repo,
+            prNumber,
+            body: comment.body,
+            cwd: input.project.repoPath,
+          });
+          normalizedPendingReview.publishState.topLevelCommentsPosted += 1;
+          this.persistPendingReviewCheckpoint(
+            input.run,
+            input.checkpoint,
+            normalizedPendingReview,
+          );
+        }
+      }
+
+      if (normalizedPendingReview.clean) {
+        await this.tryAddPullRequestReaction({
+          repo,
+          prNumber,
+          content: "+1",
+          cwd: input.project.repoPath,
+          projectId: input.project.id,
+          loopId: input.loop.id,
+          runId: input.run.id,
+        });
+      } else {
+        await this.tryRemovePullRequestReaction({
+          repo,
+          prNumber,
+          content: "+1",
+          cwd: input.project.repoPath,
+          projectId: input.project.id,
+          loopId: input.loop.id,
+          runId: input.run.id,
+        });
+      }
+      await this.tryRemovePullRequestReaction({
         repo,
         prNumber,
-        event: reviewEvent,
-        body: pendingReview.body,
+        content: "eyes",
         cwd: input.project.repoPath,
+        projectId: input.project.id,
+        loopId: input.loop.id,
+        runId: input.run.id,
       });
 
       let postSubmitDetail = detail;
@@ -987,9 +1217,9 @@ export class ReviewerLoopRunner {
     this.updateLoop(input.loop, {
       metadataJson: JSON.stringify({
         ...loopMetadata,
-        lastPublishedHeadSha: pendingReview.headSha,
+        lastPublishedHeadSha: normalizedPendingReview.headSha,
         lastReviewEvent: reviewEvent,
-        lastReviewSummary: pendingReview.summary ?? null,
+        lastReviewSummary: normalizedPendingReview.summary ?? null,
         lastPublishedAt: this.nowIso(),
       }),
     });
@@ -1007,7 +1237,7 @@ export class ReviewerLoopRunner {
         repo: input.queueItem.repo,
         prNumber: input.queueItem.prNumber,
         event: reviewEvent,
-        headSha: pendingReview.headSha,
+        headSha: normalizedPendingReview.headSha,
       },
     });
 
@@ -1155,6 +1385,66 @@ export class ReviewerLoopRunner {
       parseCheckpoint(persistedRun?.checkpointJson ?? run.checkpointJson) ??
       fallback
     );
+  }
+
+  private persistPendingReviewCheckpoint(
+    run: RunRecord,
+    checkpoint: ReviewerCheckpoint,
+    pendingReview: NonNullable<ReviewerCheckpoint["pendingReview"]>,
+  ): void {
+    this.persistStepStarted(run, "publish", {
+      ...checkpoint,
+      pendingReview,
+      resumePolicy: "advance_from_checkpoint",
+    });
+  }
+
+  private async tryAddPullRequestReaction(input: {
+    repo: string;
+    prNumber: number;
+    content: "+1" | "eyes";
+    cwd: string;
+    projectId: string;
+    loopId: string;
+    runId: string;
+  }): Promise<void> {
+    try {
+      await this.options.github.addPullRequestReaction(input);
+    } catch (error) {
+      this.options.logger.warn("reviewer reaction add failed", {
+        projectId: input.projectId,
+        loopId: input.loopId,
+        runId: input.runId,
+        repo: input.repo,
+        prNumber: input.prNumber,
+        content: input.content,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async tryRemovePullRequestReaction(input: {
+    repo: string;
+    prNumber: number;
+    content: "+1" | "eyes";
+    cwd: string;
+    projectId: string;
+    loopId: string;
+    runId: string;
+  }): Promise<void> {
+    try {
+      await this.options.github.removePullRequestReaction(input);
+    } catch (error) {
+      this.options.logger.warn("reviewer reaction removal failed", {
+        projectId: input.projectId,
+        loopId: input.loopId,
+        runId: input.runId,
+        repo: input.repo,
+        prNumber: input.prNumber,
+        content: input.content,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private ensureLoopForPullRequest(input: {
@@ -1456,6 +1746,217 @@ function toReviewBody(result: AgentResult): string | null {
   return candidate.length > 0 ? candidate : null;
 }
 
+function parseReviewFeedback(result: AgentResult): ParsedReviewFeedback {
+  const rawOutput = extractReviewOutput(result.rawLogs.stdout);
+  const parsed = parseStructuredReviewOutput(rawOutput);
+  if (parsed) {
+    return parsed;
+  }
+
+  const fallbackBody = toReviewBody(result);
+  return {
+    body: fallbackBody ?? undefined,
+    comments: fallbackBody ? [{ body: fallbackBody }] : [],
+    clean: false,
+  };
+}
+
+function extractReviewOutput(stdout: string): string {
+  return stdout
+    .split(/\r?\n/)
+    .filter((line) => !line.startsWith("__LOOPER_RESULT__="))
+    .join("\n")
+    .trim();
+}
+
+function parseStructuredReviewOutput(
+  output: string,
+): ParsedReviewFeedback | null {
+  if (!output) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(output) as Record<string, unknown>;
+    const verdict = readString(parsed.verdict)?.toLowerCase();
+    const body = normalizeOptionalBody(parsed.body);
+    const comments = Array.isArray(parsed.comments)
+      ? parsed.comments
+          .map((comment) => normalizeReviewFeedbackComment(comment))
+          .filter((comment): comment is ReviewFeedbackComment =>
+            Boolean(comment),
+          )
+      : [];
+    const clean = verdict === "clean" && comments.length === 0;
+    if (!clean && comments.length === 0) {
+      return null;
+    }
+
+    return { body, comments, clean };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeReviewFeedbackComment(
+  value: unknown,
+): ReviewFeedbackComment | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const comment = value as Record<string, unknown>;
+  const body = readString(comment.body)?.trim();
+  if (!body) {
+    return null;
+  }
+
+  const path = readString(comment.path)?.trim();
+  const line = readPositiveInteger(comment.line);
+  const side = normalizeReviewSide(comment.side);
+  const startLine = readPositiveInteger(comment.startLine);
+  const startSide = normalizeReviewSide(comment.startSide);
+  const hasRangeStart = startLine !== undefined || startSide !== undefined;
+  if (
+    (path && (!line || !side)) ||
+    (!path && (line || side || startLine || startSide)) ||
+    (hasRangeStart && (!startLine || !startSide)) ||
+    (startLine &&
+      startSide &&
+      line &&
+      startLine === line &&
+      startSide === side) ||
+    (startLine && line && startLine > line)
+  ) {
+    return { body };
+  }
+
+  return {
+    body,
+    path,
+    line,
+    side,
+    startLine,
+    startSide,
+  };
+}
+
+function normalizeOptionalBody(value: unknown): string | undefined {
+  const body = readString(value)?.trim();
+  return body && body.length > 0 ? body : undefined;
+}
+
+function readPositiveInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value > 0
+    ? value
+    : undefined;
+}
+
+function normalizeReviewSide(value: unknown): "LEFT" | "RIGHT" | undefined {
+  const side = readString(value)?.trim().toUpperCase();
+  return side === "LEFT" || side === "RIGHT" ? side : undefined;
+}
+
+function isInlineReviewComment(
+  comment: ReviewFeedbackComment,
+): comment is ReviewFeedbackComment & {
+  path: string;
+  line: number;
+  side: "LEFT" | "RIGHT";
+} {
+  return Boolean(comment.path && comment.line && comment.side);
+}
+
+function toGitHubReviewComment(
+  comment: ReviewFeedbackComment & {
+    path: string;
+    line: number;
+    side: "LEFT" | "RIGHT";
+  },
+): GitHubReviewComment {
+  return {
+    body: comment.body,
+    path: comment.path,
+    line: comment.line,
+    side: comment.side,
+    startLine: comment.startLine,
+    startSide: comment.startSide,
+  };
+}
+
+function downgradeInlineCommentToTopLevel(
+  comment: ReviewFeedbackComment,
+): ReviewFeedbackComment {
+  const location = formatInlineCommentLocation(comment);
+  return {
+    body: location
+      ? `Inline comment fallback (${location}):\n\n${comment.body}`
+      : comment.body,
+  };
+}
+
+function formatInlineCommentLocation(
+  comment: ReviewFeedbackComment,
+): string | null {
+  if (!comment.path) {
+    return null;
+  }
+
+  if (
+    typeof comment.startLine === "number" &&
+    Number.isFinite(comment.startLine) &&
+    comment.startLine !== comment.line
+  ) {
+    return `${comment.path}:${comment.startLine}-${comment.line}`;
+  }
+
+  if (typeof comment.line === "number" && Number.isFinite(comment.line)) {
+    return `${comment.path}:${comment.line}`;
+  }
+
+  return comment.path;
+}
+
+function isInlineReviewAnchorFailure(error: unknown): boolean {
+  if (!(error instanceof CommandExecutionError)) {
+    return false;
+  }
+
+  const output = `${error.result.stdout}\n${error.result.stderr}`.toLowerCase();
+  return (
+    output.includes("validation failed") &&
+    output.includes("pull request review thread") &&
+    (output.includes("line") ||
+      output.includes("path") ||
+      output.includes("diff") ||
+      output.includes("side"))
+  );
+}
+
+function normalizePendingReviewCheckpoint(
+  pendingReview: ReviewerCheckpoint["pendingReview"],
+): NormalizedPendingReviewCheckpoint {
+  if (!pendingReview) {
+    throw new Error("pendingReview is required");
+  }
+
+  return {
+    ...pendingReview,
+    comments: Array.isArray(pendingReview.comments)
+      ? pendingReview.comments
+      : [],
+    clean: pendingReview.clean === true,
+    publishState: {
+      reviewSubmitted: pendingReview.publishState?.reviewSubmitted === true,
+      topLevelCommentsPosted:
+        typeof pendingReview.publishState?.topLevelCommentsPosted ===
+          "number" && pendingReview.publishState.topLevelCommentsPosted >= 0
+          ? pendingReview.publishState.topLevelCommentsPosted
+          : 0,
+    },
+  };
+}
+
 function summarizeLogs(stdout: string): string {
   return stdout
     .split("\n")
@@ -1494,7 +1995,16 @@ function buildReviewPrompt(input: {
         ? `Unresolved threads: ${input.snapshot.unresolvedThreadCount}`
         : null,
       diff ? `Diff:\n${diff}` : null,
-      "Return concise GitHub review feedback. Do not approve; provide comment-ready feedback text.",
+      [
+        "Return detailed GitHub review feedback as raw JSON with this exact shape:",
+        '{"verdict":"clean"|"actionable","body":"optional overall summary","comments":[{"body":"required comment text","path":"src/file.ts optional for inline comments","line":123,"side":"RIGHT","startLine":120,"startSide":"RIGHT"}]}',
+        "Use verdict=actionable whenever there is any actionable advice.",
+        "Prefer inline comments for specific code-level feedback when you can anchor them confidently to the diff using the changed file path and the file line numbers shown in the PR diff (not deprecated diff positions).",
+        "Use top-level comments without path/line only for architectural, cross-cutting, or otherwise unanchorable feedback.",
+        "For multiline inline comments, `startLine`/`startSide` must identify the first line of the range and `line`/`side` the last line; omit `startLine`/`startSide` for single-line comments.",
+        "Write substantially more detail than a brief summary; every comment should explain the problem, why it matters, and the concrete change to make.",
+        "Do not approve. If the review is clean, return verdict=clean with comments=[].",
+      ].join("\n"),
     ]
       .filter((value): value is string => Boolean(value))
       .join("\n\n"),
