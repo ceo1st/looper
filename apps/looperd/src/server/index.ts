@@ -889,9 +889,18 @@ function buildActiveRunsResponse(
 
 function buildActiveRunViews(context: LooperdApiContext): ActiveRunView[] {
   const activeRuns = context.store.runs.listByStatus("running");
+  const queuedLoopIds = new Set<string>(
+    context.store.queue
+      .list()
+      .flatMap((item) =>
+        (item.status === "queued" || item.status === "running") && item.loopId
+          ? [item.loopId]
+          : [],
+      ),
+  );
   const queuedLoops = context.store.loops
     .list()
-    .filter((loop) => loop.status === "queued");
+    .filter((loop) => loop.status === "queued" && queuedLoopIds.has(loop.id));
   const activeAgentByRunId = buildActiveAgentByRunId(
     context.store.agentExecutions.listActive(),
   );
