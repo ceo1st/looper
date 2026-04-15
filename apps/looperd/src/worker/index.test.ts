@@ -105,6 +105,7 @@ async function createFixture() {
 class FakeGitGateway implements WorkerGitGateway {
   public createWorktreeCalls = 0;
   public pushCalls = 0;
+  public pushedBranches: string[] = [];
   public lastCreateWorktreeInput?: {
     projectId: string;
     repoPath: string;
@@ -123,6 +124,7 @@ class FakeGitGateway implements WorkerGitGateway {
     worktreeRoot: string;
     branch: string;
     baseBranch: string;
+    prNumber?: number;
     protectedBranches?: string[];
   }): Promise<WorktreeRecord> {
     this.createWorktreeCalls += 1;
@@ -148,8 +150,14 @@ class FakeGitGateway implements WorkerGitGateway {
     };
   }
 
-  public async push(): Promise<void> {
+  public async push(input: {
+    worktreePath: string;
+    branch: string;
+    remote?: string;
+    protectedBranches?: string[];
+  }): Promise<void> {
     this.pushCalls += 1;
+    this.pushedBranches.push(input.branch);
   }
 
   public async prepareWorktree(): Promise<{
@@ -626,7 +634,7 @@ describe("WorkerLoopRunner", () => {
           isDraft: false,
           reviewDecision: undefined,
           labels: [],
-          headRefName: "looper/worker/loop-worker-1",
+          headRefName: "looper/05e7c1d53bba907c",
           baseRefName: "main",
           author: "octocat",
           reviewRequests: [],
@@ -671,6 +679,66 @@ describe("WorkerLoopRunner", () => {
     fixture.store.close();
   });
 
+  test("reuses open pull requests on legacy worker branch names", async () => {
+    const fixture = await createFixture();
+    const git = new FakeGitGateway(fixture.worktreeRoot);
+    const github = new FakeGitHubGateway();
+    github.listOpenPullRequests = async (input) => {
+      github.listOpenPullRequestCalls.push({
+        label: input.label,
+        limit: input.limit,
+      });
+      return [
+        {
+          number: 212,
+          title: "Legacy worker PR",
+          url: "https://example.test/acme/looper/pull/212",
+          state: "OPEN",
+          isDraft: false,
+          reviewDecision: undefined,
+          labels: [],
+          headRefName: "looper/worker/05e7c1d53bba907c",
+          baseRefName: "main",
+          author: "octocat",
+          reviewRequests: [],
+        },
+      ];
+    };
+    const agent = new FakeAgentExecutor([
+      completedAgentResult("Implemented slice and opened PR", ["abc123"]),
+    ]);
+    const runner = new WorkerLoopRunner({
+      store: fixture.store,
+      scheduler: fixture.queue,
+      git,
+      github,
+      agentExecutor: agent,
+      logger: createCapturingLogger().logger,
+      now: () => fixture.now,
+      validationRunner: async (): Promise<WorkerValidationResult> => ({
+        passed: true,
+        summary: "ok",
+        output: "ok",
+      }),
+      openPrStrategy: "all_done",
+    });
+
+    const claimed = fixture.queue.claimNext("worker-1");
+    if (!claimed) {
+      throw new Error("Expected claimed worker queue item");
+    }
+
+    const result = await runner.processClaimedItem(claimed);
+    expect(result.status).toBe("success");
+    expect(result.pullRequestNumber).toBe(212);
+    expect(git.pushCalls).toBe(1);
+    expect(git.pushedBranches).toEqual(["looper/worker/05e7c1d53bba907c"]);
+    expect(github.createPullRequestCalls).toHaveLength(0);
+    expect(fixture.store.loops.getById("loop_worker_1")?.prNumber).toBe(212);
+
+    fixture.store.close();
+  });
+
   test("does not reuse an existing PR when the base branch differs", async () => {
     const fixture = await createFixture();
     const git = new FakeGitGateway(fixture.worktreeRoot);
@@ -689,7 +757,7 @@ describe("WorkerLoopRunner", () => {
           isDraft: false,
           reviewDecision: undefined,
           labels: [],
-          headRefName: "looper/worker/loop-worker-1",
+          headRefName: "looper/05e7c1d53bba907c",
           baseRefName: "develop",
           author: "octocat",
           reviewRequests: [],
@@ -847,7 +915,7 @@ describe("WorkerLoopRunner", () => {
     expect(git.pushCalls).toBe(1);
     expect(github.createPullRequestCalls).toHaveLength(1);
     expect(github.createPullRequestCalls[0]?.headBranch).toBe(
-      "looper/worker/123-add-worker-issue-fallback-loop-worker-1",
+      "looper/123-add-worker-issue-fallback-05e7c1d53bba907c",
     );
     expect(github.createPullRequestCalls[0]?.title).toBe(
       "Add worker issue fallback",
@@ -965,9 +1033,9 @@ describe("WorkerLoopRunner", () => {
     expect(result.status).toBe("success");
     const headBranch = github.createPullRequestCalls[0]?.headBranch;
     expect(headBranch).toBeDefined();
-    expect(headBranch?.length ?? 0).toBeLessThanOrEqual(80);
-    expect(headBranch).toMatch(/^looper\/worker\/124-/);
-    expect(headBranch).toContain("-loop-worker-1");
+    expect(headBranch?.length ?? 0).toBeLessThanOrEqual(58);
+    expect(headBranch).toMatch(/^looper\/124-/);
+    expect(headBranch).toMatch(/-05e7c1d53bba907c$/);
 
     fixture.store.close();
   });

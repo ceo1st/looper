@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 
@@ -41,7 +41,9 @@ const WORKER_STEP_SEQUENCE = [
   "open-pr",
 ] as const;
 
-const WORKER_BRANCH_SLUG_MAX_LENGTH = 48;
+const WORKER_BRANCH_SLUG_MAX_LENGTH = 30;
+const WORKER_BRANCH_SLUG_MAX_WORDS = 5;
+const WORKER_BRANCH_HASH_LENGTH = 16;
 const WORKER_PR_DEDUPE_LOOKUP_LIMIT = 1000;
 
 export type WorkerStep = (typeof WORKER_STEP_SEQUENCE)[number];
@@ -872,16 +874,19 @@ export class WorkerLoopRunner {
     }
 
     try {
+      const branchAliases = buildWorkerBranchAliases(work, input.loop.id);
       const existingPullRequest = await this.findOpenPullRequestForBranch({
         repo: work.repo,
-        branch: worktree.branch,
+        branches: branchAliases,
         baseBranch: work.baseBranch,
         cwd: input.project.repoPath,
       });
       if (existingPullRequest) {
+        const existingPullRequestBranch =
+          existingPullRequest.headRefName ?? worktree.branch;
         await this.options.git.push({
           worktreePath: worktree.path,
-          branch: worktree.branch,
+          branch: existingPullRequestBranch,
           protectedBranches: [work.baseBranch],
         });
         await this.assignReviewersIfNeeded({
@@ -910,7 +915,7 @@ export class WorkerLoopRunner {
       });
       const discoveredPullRequest = await this.findOpenPullRequestForBranch({
         repo: work.repo,
-        branch: worktree.branch,
+        branches: branchAliases,
         baseBranch: work.baseBranch,
         cwd: input.project.repoPath,
       });
@@ -1001,7 +1006,7 @@ export class WorkerLoopRunner {
 
   private async findOpenPullRequestForBranch(input: {
     repo: string;
-    branch: string;
+    branches: string[];
     baseBranch: string;
     cwd: string;
   }): Promise<GitHubPullRequestSummary | null> {
@@ -1014,7 +1019,8 @@ export class WorkerLoopRunner {
       pullRequests.find(
         (pullRequest) =>
           normalizePrState(pullRequest.state) === "open" &&
-          pullRequest.headRefName === input.branch &&
+          typeof pullRequest.headRefName === "string" &&
+          input.branches.includes(pullRequest.headRefName) &&
           pullRequest.baseRefName === input.baseBranch,
       ) ?? null
     );
@@ -1642,19 +1648,41 @@ function buildIssuePrompt(repo: string, issue: GitHubIssueDetail): string {
 }
 
 function buildWorkerBranchName(work: WorkerInput, loopId: string): string {
+  const loopHash = buildWorkerLoopHash(loopId);
   if (work.issueNumber) {
-    return `looper/worker/${work.issueNumber}-${buildWorkerSlug(work.title)}-${slugify(loopId)}`;
+    return `looper/${work.issueNumber}-${buildWorkerSlug(work.title)}-${loopHash}`;
   }
 
-  return `looper/worker/${slugify(loopId)}`;
+  return `looper/${loopHash}`;
+}
+
+function buildWorkerBranchAliases(work: WorkerInput, loopId: string): string[] {
+  const branchName = buildWorkerBranchName(work, loopId);
+  const legacyBranchName = branchName.replace(/^looper\//, "looper/worker/");
+
+  return legacyBranchName === branchName
+    ? [branchName]
+    : [branchName, legacyBranchName];
 }
 
 function buildWorkerSlug(title: string): string {
-  const words = slugify(title).split("-").filter(Boolean).slice(0, 8).join("-");
+  const words = slugify(title)
+    .split("-")
+    .filter(Boolean)
+    .slice(0, WORKER_BRANCH_SLUG_MAX_WORDS)
+    .join("-");
   return (
     words.slice(0, WORKER_BRANCH_SLUG_MAX_LENGTH).replace(/-+$/g, "") ||
     "update"
   );
+}
+
+function buildWorkerLoopHash(loopId: string): string {
+  const hash = createHash("sha1")
+    .update(loopId)
+    .digest("hex")
+    .slice(0, WORKER_BRANCH_HASH_LENGTH);
+  return hash || "worker";
 }
 
 function buildDefaultIssueWorkerTitle(
