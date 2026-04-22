@@ -595,9 +595,12 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		},
 	})
 	workerRunner = worker.New(worker.Options{
-		DB:               coordinator.DB(),
-		Repos:            repos,
-		GitHub:           workerGitHubAdapter{gateway: githubGateway},
+		DB:     coordinator.DB(),
+		Repos:  repos,
+		GitHub: workerGitHubAdapter{gateway: githubGateway},
+		GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
+			return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
+		},
 		Git:              workerGitAdapter{gateway: gitGateway},
 		AgentExecutor:    workerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:           logger,
@@ -629,6 +632,33 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			Worker:            workerRunner,
 		})
 	}
+}
+
+func githubCLIAutoPROpeningAvailable(ctx context.Context, cfg config.Config, githubGateway *githubinfra.Gateway, logger bootstrap.Logger, repo, cwd string) bool {
+	if githubGateway == nil {
+		return false
+	}
+	authenticated, err := githubGateway.IsAuthenticated(ctx, cwd, githubAuthHostname(repo))
+	if err != nil {
+		if logger != nil {
+			logger.Warn("github cli auth check failed; disabling automatic PR opening", map[string]any{"error": err.Error(), "repo": repo, "hostname": githubAuthHostname(repo)})
+		}
+		return false
+	}
+	return authenticated
+}
+
+func githubAuthHostname(repo string) string {
+	const defaultHost = "github.com"
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return defaultHost
+	}
+	parts := strings.Split(repo, "/")
+	if len(parts) == 3 && strings.TrimSpace(parts[0]) != "" {
+		return strings.TrimSpace(parts[0])
+	}
+	return defaultHost
 }
 
 func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInput) error {

@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -224,6 +225,60 @@ fi
 	err := gateway.ResolveReviewThread(context.Background(), ResolveReviewThreadInput{Repo: "acme/looper", ThreadID: "thread-missing"})
 	if _, ok := err.(*ReviewThreadNotFoundError); !ok {
 		t.Fatalf("ResolveReviewThread() error = %v, want *ReviewThreadNotFoundError", err)
+	}
+}
+
+func TestGatewayIsAuthenticatedTracksGHAuthStatus(t *testing.T) {
+	t.Parallel()
+	rootDir := t.TempDir()
+	scriptPath := filepath.Join(rootDir, "gh")
+	writeExecutable(t, scriptPath, `#!/bin/sh
+case "$*" in
+  "auth status")
+    exit 1
+    ;;
+  *)
+    printf '{}'
+    ;;
+esac
+`)
+	gateway := New(Options{GHPath: scriptPath, CWD: rootDir})
+	authenticated, err := gateway.IsAuthenticated(context.Background(), "", "")
+	if err != nil {
+		t.Fatalf("IsAuthenticated() error = %v", err)
+	}
+	if authenticated {
+		t.Fatal("IsAuthenticated() = true, want false for unauthenticated gh cli")
+	}
+}
+
+func TestGatewayIsAuthenticatedScopesStatusToHostname(t *testing.T) {
+	t.Parallel()
+	rootDir := t.TempDir()
+	logPath := filepath.Join(rootDir, "gh.log")
+	scriptPath := filepath.Join(rootDir, "gh")
+	writeExecutable(t, scriptPath, fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >> %q
+case "$*" in
+  "auth status --hostname github.example.com")
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+`, logPath))
+	gateway := New(Options{GHPath: scriptPath, CWD: rootDir})
+	authenticated, err := gateway.IsAuthenticated(context.Background(), "", "github.example.com")
+	if err != nil {
+		t.Fatalf("IsAuthenticated() error = %v", err)
+	}
+	if !authenticated {
+		t.Fatal("IsAuthenticated() = false, want true for hostname-scoped auth")
+	}
+	log := readFile(t, logPath)
+	if !strings.Contains(log, "auth status --hostname github.example.com") {
+		t.Fatalf("gh log = %q, want hostname-scoped auth status", log)
 	}
 }
 

@@ -256,24 +256,26 @@ type RunCompletedInput struct {
 type RunCompletedFunc func(context.Context, RunCompletedInput) error
 
 type Options struct {
-	DB                      *sql.DB
-	Repos                   *storage.Repositories
-	GitHub                  GitHubGateway
-	Git                     GitGateway
-	AgentExecutor           AgentExecutor
-	Logger                  bootstrap.Logger
-	Now                     func() time.Time
-	AgentTimeout            time.Duration
-	ClaimTTL                time.Duration
-	ValidationCommands      []string
-	ValidationRunner        ValidationRunner
-	AllowAutoCommit         bool
-	AllowAutoPush           bool
-	OpenPRStrategy          config.OpenPRStrategy
-	RetryBaseDelay          time.Duration
-	RetryMaxAttempts        int64
-	OnAgentExecutionStarted AgentExecutionStartedFunc
-	OnRunCompleted          RunCompletedFunc
+	DB                              *sql.DB
+	Repos                           *storage.Repositories
+	GitHub                          GitHubGateway
+	GitHubCLIAvailable              *bool
+	GitHubCLIAutoPROpeningAvailable func(context.Context, string, string) bool
+	Git                             GitGateway
+	AgentExecutor                   AgentExecutor
+	Logger                          bootstrap.Logger
+	Now                             func() time.Time
+	AgentTimeout                    time.Duration
+	ClaimTTL                        time.Duration
+	ValidationCommands              []string
+	ValidationRunner                ValidationRunner
+	AllowAutoCommit                 bool
+	AllowAutoPush                   bool
+	OpenPRStrategy                  config.OpenPRStrategy
+	RetryBaseDelay                  time.Duration
+	RetryMaxAttempts                int64
+	OnAgentExecutionStarted         AgentExecutionStartedFunc
+	OnRunCompleted                  RunCompletedFunc
 }
 
 type Runner struct {
@@ -290,6 +292,8 @@ type Runner struct {
 	validationRunner        ValidationRunner
 	allowAutoCommit         bool
 	allowAutoPush           bool
+	githubCLIAvailable      bool
+	githubCLICheck          func(context.Context, string, string) bool
 	openPRStrategy          config.OpenPRStrategy
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
@@ -405,6 +409,10 @@ func New(options Options) *Runner {
 	if retryMaxAttempts <= 0 {
 		retryMaxAttempts = defaultRetryMax
 	}
+	githubCLIAvailable := options.GitHub != nil
+	if options.GitHubCLIAvailable != nil {
+		githubCLIAvailable = *options.GitHubCLIAvailable
+	}
 	strategy := options.OpenPRStrategy
 	if strategy == "" {
 		strategy = config.OpenPRStrategyManual
@@ -423,6 +431,8 @@ func New(options Options) *Runner {
 		validationRunner:        options.ValidationRunner,
 		allowAutoCommit:         options.AllowAutoCommit,
 		allowAutoPush:           options.AllowAutoPush,
+		githubCLIAvailable:      githubCLIAvailable,
+		githubCLICheck:          options.GitHubCLIAutoPROpeningAvailable,
 		openPRStrategy:          strategy,
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMaxAttempts,
@@ -790,7 +800,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	if err != nil {
 		return checkpoint, err
 	}
-	prompt, err := buildWorkerPrompt(worktree.Path, work, checkpoint.Plan, r.canAgentCreatePR(work))
+	prompt, err := buildWorkerPrompt(worktree.Path, work, checkpoint.Plan, r.canAgentCreatePR(ctx, work, input.Project.RepoPath))
 	if err != nil {
 		return checkpoint, err
 	}
@@ -867,6 +877,11 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	}
 	if r.openPRStrategy == config.OpenPRStrategyManual {
 		checkpoint.SkipReason = fmt.Sprintf("Worker completed; PR opening is manual for %s", input.Loop.ID)
+		checkpoint.ResumePolicy = "manual_intervention"
+		return checkpoint, nil
+	}
+	if !r.githubCLIAutoPROpeningAvailable(ctx, work.Repo, input.Project.RepoPath) {
+		checkpoint.SkipReason = fmt.Sprintf("GitHub CLI unavailable; PR opening is manual for worker %s", input.Loop.ID)
 		checkpoint.ResumePolicy = "manual_intervention"
 		return checkpoint, nil
 	}
@@ -1297,8 +1312,20 @@ func pullRequestURL(pr *checkpointPullPR) string {
 	return strings.TrimSpace(pr.URL)
 }
 
-func (r *Runner) canAgentCreatePR(work workerInput) bool {
-	return work.ExecutionMode == "create-pr" && r.openPRStrategy != config.OpenPRStrategyManual && r.allowAutoPush && len(r.validationCommands) == 0 && r.validationRunner == nil
+func (r *Runner) canAgentCreatePR(ctx context.Context, work workerInput, cwd string) bool {
+	return work.ExecutionMode == "create-pr" &&
+		r.openPRStrategy != config.OpenPRStrategyManual &&
+		r.allowAutoPush &&
+		r.githubCLIAutoPROpeningAvailable(ctx, work.Repo, cwd) &&
+		len(r.validationCommands) == 0 &&
+		r.validationRunner == nil
+}
+
+func (r *Runner) githubCLIAutoPROpeningAvailable(ctx context.Context, repo, cwd string) bool {
+	if r.githubCLICheck != nil {
+		return r.githubCLICheck(ctx, repo, cwd)
+	}
+	return r.githubCLIAvailable
 }
 
 func (r *Runner) classifyFailure(err error) *loopError {

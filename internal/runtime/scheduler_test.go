@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -10,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/powerformer/looper/internal/config"
 	"github.com/powerformer/looper/internal/fixer"
+	githubinfra "github.com/powerformer/looper/internal/infra/github"
 	"github.com/powerformer/looper/internal/planner"
 	"github.com/powerformer/looper/internal/reviewer"
 	"github.com/powerformer/looper/internal/storage"
@@ -288,6 +292,80 @@ func TestRunDefaultSchedulerTickContinuesAfterDiscoveryError(t *testing.T) {
 	}
 }
 
+func TestGithubCLIAutoPROpeningAvailableRechecksAuthenticatedCLIWithoutConfiguredPath(t *testing.T) {
+	t.Parallel()
+
+	rootDir := t.TempDir()
+	authenticatedPath := filepath.Join(rootDir, "gh-authenticated")
+	writeExecutable(t, authenticatedPath, `#!/bin/sh
+case "$*" in
+  "auth status --hostname github.com")
+    exit 0
+    ;;
+  *)
+    printf '{}'
+    ;;
+esac
+`)
+	unauthenticatedPath := filepath.Join(rootDir, "gh-unauthenticated")
+	writeExecutable(t, unauthenticatedPath, `#!/bin/sh
+case "$*" in
+  "auth status --hostname github.com")
+    exit 1
+    ;;
+  *)
+    printf '{}'
+    ;;
+esac
+`)
+
+	logger := &testLogger{}
+	authenticatedGateway := githubinfra.New(githubinfra.Options{GHPath: authenticatedPath, CWD: rootDir})
+	unauthenticatedGateway := githubinfra.New(githubinfra.Options{GHPath: unauthenticatedPath, CWD: rootDir})
+
+	if !githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Tools: config.ToolPathsConfig{GHPath: &authenticatedPath}}, authenticatedGateway, logger, "powerformer/looper", rootDir) {
+		t.Fatal("githubCLIAutoPROpeningAvailable() = false, want true for authenticated gh cli")
+	}
+	if githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Tools: config.ToolPathsConfig{GHPath: &unauthenticatedPath}}, unauthenticatedGateway, logger, "powerformer/looper", rootDir) {
+		t.Fatal("githubCLIAutoPROpeningAvailable() = true, want false for unauthenticated gh cli")
+	}
+	if !githubCLIAutoPROpeningAvailable(context.Background(), config.Config{}, authenticatedGateway, logger, "powerformer/looper", rootDir) {
+		t.Fatal("githubCLIAutoPROpeningAvailable() = false, want true when gateway can recheck authenticated gh cli without configured path")
+	}
+}
+
+func TestGithubCLIAutoPROpeningAvailableUsesRepoHostname(t *testing.T) {
+	t.Parallel()
+
+	rootDir := t.TempDir()
+	logPath := filepath.Join(rootDir, "gh.log")
+	scriptPath := filepath.Join(rootDir, "gh")
+	writeExecutable(t, scriptPath, fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >> %q
+case "$*" in
+  "auth status --hostname github.example.com")
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+`, logPath))
+
+	logger := &testLogger{}
+	gateway := githubinfra.New(githubinfra.Options{GHPath: scriptPath, CWD: rootDir})
+	if !githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Tools: config.ToolPathsConfig{GHPath: &scriptPath}}, gateway, logger, "github.example.com/powerformer/looper", rootDir) {
+		t.Fatal("githubCLIAutoPROpeningAvailable() = false, want true for repo host auth")
+	}
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if log := string(logBytes); !strings.Contains(log, "auth status --hostname github.example.com") {
+		t.Fatalf("gh log = %q, want repo hostname auth status", log)
+	}
+}
+
 type stubPlannerScheduler struct {
 	mu             sync.Mutex
 	discoverCalls  []planner.DiscoveryInput
@@ -500,5 +578,12 @@ func waitForSchedulerCondition(t *testing.T, condition func() bool) {
 	}
 	if !condition() {
 		t.Fatal("condition not satisfied before timeout")
+	}
+}
+
+func writeExecutable(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(contents), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", path, err)
 	}
 }
