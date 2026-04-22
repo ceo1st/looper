@@ -2890,9 +2890,45 @@ func (h *Handler) maybeFindPlannerLoopForIssue(ctx context.Context, input findPl
 		if prNumber == nil {
 			prNumber = int64MetadataPtr(metadata, "prNumber")
 		}
-		return &workerPlannerMatch{PRNumber: prNumber, SpecPath: stringMetadataPtr(metadata, "specPath")}, nil
+		match := &workerPlannerMatch{PRNumber: prNumber, SpecPath: stringMetadataPtr(metadata, "specPath")}
+		if prNumber == nil {
+			return &workerPlannerMatch{PRNumber: nil, SpecPath: match.SpecPath}, nil
+		}
+		isOpen, known, err := h.getPlannerPullRequestOpenState(ctx, input.ProjectID, input.Repo, *prNumber)
+		if err != nil {
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		if known && !isOpen {
+			return &workerPlannerMatch{PRNumber: nil, SpecPath: match.SpecPath}, nil
+		}
+		return match, nil
 	}
 	return nil, nil
+}
+
+func (h *Handler) isPlannerPullRequestOpen(ctx context.Context, projectID, repo string, prNumber int64) bool {
+	isOpen, known, err := h.getPlannerPullRequestOpenState(ctx, projectID, repo, prNumber)
+	return err == nil && known && isOpen
+}
+
+func (h *Handler) getPlannerPullRequestOpenState(ctx context.Context, projectID, repo string, prNumber int64) (bool, bool, error) {
+	if prNumber <= 0 {
+		return false, true, nil
+	}
+	snapshot, err := h.context.Runtime.Services().Repositories.PullRequestSnapshots.GetLatestByProject(ctx, projectID, repo, prNumber)
+	if err != nil {
+		return false, false, err
+	}
+	if snapshot == nil {
+		return false, false, nil
+	}
+	payload := parseJSONObject(snapshot.PayloadJSON)
+	detail, _ := payload["detail"].(map[string]any)
+	state := firstNonEmptyString(readStringAny(detail["state"]), readStringAny(detail["State"]))
+	if state == nil {
+		return false, false, nil
+	}
+	return strings.EqualFold(*state, "open"), true, nil
 }
 
 func deriveWorkerTitle(prompt, specPath, repo *string, prNumber, issueNumber *int64) string {
@@ -3717,6 +3753,14 @@ func stringMetadataPtr(metadata map[string]any, key string) *string {
 
 	result := text
 	return &result
+}
+
+func stringFromAnyDefault(value any) string {
+	text, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return text
 }
 
 func normalizeOptionalString(value *string) *string {
