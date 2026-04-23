@@ -204,6 +204,7 @@ type AgentResult struct {
 	Status       string
 	Summary      string
 	Stdout       string
+	ParseStatus  string
 	ChangedFiles []string
 	Commits      []string
 }
@@ -356,6 +357,7 @@ type checkpointPlan struct {
 type checkpointExecution struct {
 	Status       string   `json:"status,omitempty"`
 	Summary      string   `json:"summary,omitempty"`
+	ParseStatus  string   `json:"parseStatus,omitempty"`
 	ChangedFiles []string `json:"changedFiles,omitempty"`
 	Commits      []string `json:"commits,omitempty"`
 	Stdout       string   `json:"stdout,omitempty"`
@@ -384,6 +386,19 @@ type stepInput struct {
 type loopError struct {
 	message string
 	kind    QueueFailureKind
+}
+
+func validateCompletedExecutionCheckpoint(execution *checkpointExecution) error {
+	if execution == nil || execution.Status != "completed" {
+		return nil
+	}
+	if execution.ParseStatus == "parsed" {
+		return nil
+	}
+	return &loopError{
+		message: firstNonEmpty(execution.Summary, fmt.Sprintf("Worker agent completed without valid structured result (parse status: %s)", firstNonEmpty(execution.ParseStatus, "missing"))),
+		kind:    FailureRetryableTransient,
+	}
 }
 
 func (e *loopError) Error() string { return e.message }
@@ -560,6 +575,42 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		updated.NextRunAt = nil
 	}); err != nil {
 		return ProcessResult{}, err
+	}
+	if err := validateWorkerResumeCheckpoint(resumedRun.StartStep, checkpoint); err != nil {
+		failure := r.classifyFailure(err)
+		latest := r.getLatestCheckpoint(ctx, run, checkpoint)
+		if latest.ResumePolicy == "" {
+			latest.ResumePolicy = "replay_step"
+		}
+		if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
+			return ProcessResult{}, err
+		}
+		failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+		if err != nil {
+			return ProcessResult{}, err
+		}
+		if shouldNotifyCompletedRun(failure.kind, failedQueue) {
+			r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, latest, "failed", failure.kind, failure.message))
+		}
+		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+			updated.LastRunAt = stringPtr(r.nowISO())
+			if updated.Status == "paused" {
+				updated.NextRunAt = nil
+			} else if failedQueue != nil && failedQueue.Status == "queued" {
+				updated.Status = "queued"
+				updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
+			} else {
+				if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+					updated.Status = "paused"
+				} else {
+					updated.Status = "failed"
+				}
+				updated.NextRunAt = nil
+			}
+		}); err != nil {
+			return ProcessResult{}, err
+		}
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 	}
 
 	for _, step := range stepsFrom(resumedRun.StartStep) {
@@ -785,6 +836,9 @@ func (r *Runner) runPlanStep(input stepInput) (workerCheckpoint, error) {
 func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
 	checkpoint := input.Checkpoint
 	if checkpoint.Execution != nil && checkpoint.Execution.Status == "completed" {
+		if err := validateCompletedExecutionCheckpoint(checkpoint.Execution); err != nil {
+			return checkpoint, err
+		}
 		return checkpoint, nil
 	}
 	if !r.allowAutoCommit {
@@ -819,7 +873,10 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	if result.Status != "completed" {
 		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, fmt.Sprintf("Worker agent %s", result.Status)), kind: FailureRetryableTransient}
 	}
-	checkpoint.Execution = &checkpointExecution{Status: result.Status, Summary: result.Summary, ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Stdout: result.Stdout}
+	if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
+		return checkpoint, err
+	}
+	checkpoint.Execution = &checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus, ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Stdout: result.Stdout}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -1007,6 +1064,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	checkpoint := workerCheckpoint{}
 	var lastCompletedStep WorkerStep
+	var failedStep WorkerStep
 	if latestRun != nil {
 		checkpoint, err = parseCheckpoint(latestRun.CheckpointJSON)
 		if err != nil {
@@ -1016,20 +1074,32 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		if derefString(latestRun.LastCompletedStep) != "" && lastCompletedStep == "" {
 			return resumedRunContext{}, fmt.Errorf("unknown worker last completed step %q", derefString(latestRun.LastCompletedStep))
 		}
+		failedStep = asWorkerStep(derefString(latestRun.CurrentStep))
 	}
 	startStep := stepPrepareWork
+	resumedCheckpoint := checkpoint
 	if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && lastCompletedStep != "" {
-		if next := nextWorkerStep(lastCompletedStep); next != "" {
+		if shouldReplayExecuteOnResume(latestRun.Status, failedStep, checkpoint) {
+			startStep = stepExecute
+			resumedCheckpoint = rewindCheckpointForExecuteRetry(checkpoint)
+		} else if next := nextWorkerStep(lastCompletedStep); next != "" {
 			startStep = next
 		}
 	}
 	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepPrepareWork
 	nowISO := r.nowISO()
-	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: checkpoint.Work, ClaimedLockKey: checkpoint.ClaimedLockKey, Worktree: checkpoint.Worktree, Plan: checkpoint.Plan, Execution: checkpoint.Execution, Validation: checkpoint.Validation, PullRequest: checkpoint.PullRequest, SkipReason: checkpoint.SkipReason})
+	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
-	if resumed && lastCompletedStep != "" {
-		value := string(lastCompletedStep)
-		run.LastCompletedStep = &value
+	if resumed {
+		if shouldReplayExecuteOnResume(latestRun.Status, failedStep, checkpoint) {
+			if prev := previousWorkerStep(startStep); prev != "" {
+				value := string(prev)
+				run.LastCompletedStep = &value
+			}
+		} else if lastCompletedStep != "" {
+			value := string(lastCompletedStep)
+			run.LastCompletedStep = &value
+		}
 	}
 	if err := r.repos.Runs.Upsert(ctx, run); err != nil {
 		return resumedRunContext{}, err
@@ -1361,6 +1431,24 @@ func nextWorkerStep(step WorkerStep) WorkerStep {
 	return ""
 }
 
+func previousWorkerStep(step WorkerStep) WorkerStep {
+	for i, candidate := range workerStepSequence {
+		if candidate == step && i > 0 {
+			return workerStepSequence[i-1]
+		}
+	}
+	return ""
+}
+
+func validateWorkerResumeCheckpoint(startStep WorkerStep, checkpoint workerCheckpoint) error {
+	switch startStep {
+	case stepValidate, stepOpenPR:
+		return validateCompletedExecutionCheckpoint(checkpoint.Execution)
+	default:
+		return nil
+	}
+}
+
 func asWorkerStep(value string) WorkerStep {
 	for _, candidate := range workerStepSequence {
 		if string(candidate) == value {
@@ -1386,6 +1474,26 @@ func requireWork(checkpoint workerCheckpoint) (workerInput, error) {
 		return workerInput{}, &loopError{message: "missing worker input checkpoint", kind: FailureRetryableTransient}
 	}
 	return *checkpoint.Work, nil
+}
+
+func shouldReplayExecuteOnResume(status string, failedStep WorkerStep, checkpoint workerCheckpoint) bool {
+	if status != "failed" && status != "interrupted" {
+		return false
+	}
+	switch failedStep {
+	case stepValidate, stepOpenPR:
+	default:
+		return false
+	}
+	return validateCompletedExecutionCheckpoint(checkpoint.Execution) != nil
+}
+
+func rewindCheckpointForExecuteRetry(checkpoint workerCheckpoint) workerCheckpoint {
+	checkpoint.Execution = nil
+	checkpoint.Validation = nil
+	checkpoint.PullRequest = nil
+	checkpoint.SkipReason = ""
+	return checkpoint
 }
 
 func requireWorktree(checkpoint workerCheckpoint) (checkpointWorktree, error) {
