@@ -8,26 +8,31 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/version"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
 
 type Deps struct {
-	Stdout        io.Writer
-	Stderr        io.Writer
-	HTTPClient    *http.Client
-	HomeDir       string
-	Platform      string
-	Arch          string
-	RunCommand    runCommandFunc
-	SpawnDetached spawnDetachedFunc
-	KillProcess   killProcessFunc
-	ReadFile      readFileFunc
-	WriteFile     writeFileFunc
-	RemoveFile    removeFileFunc
-	MkdirAll      mkdirAllFunc
-	Sleep         sleepFunc
-	Getwd         getwdFunc
+	Stdin          io.Reader
+	Stdout         io.Writer
+	Stderr         io.Writer
+	HTTPClient     *http.Client
+	HomeDir        string
+	Platform       string
+	Arch           string
+	LookPath       config.LookPathFunc
+	RunCommand     runCommandFunc
+	SpawnDetached  spawnDetachedFunc
+	KillProcess    killProcessFunc
+	ReadFile       readFileFunc
+	WriteFile      writeFileFunc
+	RemoveFile     removeFileFunc
+	MkdirAll       mkdirAllFunc
+	Sleep          sleepFunc
+	Getwd          getwdFunc
+	ExecutablePath string
 }
 
 type App struct {
@@ -89,10 +94,28 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	root := newCommand(commandSpec{
 		use:             "looper",
 		short:           "Looper command-line interface",
-		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
+		helpSubcommands: []helpSubcommand{{name: "status", description: "Show service status"}, {name: "bootstrap", description: "Run first-time setup"}, {name: "version", description: "Show Looper version"}, {name: "project", description: "Project commands"}, {name: "config", description: "Config commands"}, {name: "daemon", description: "Daemon commands"}, {name: "upgrade", description: "Check or upgrade Looper installations"}, {name: "loop", description: "Loop commands"}, {name: "work", description: "Create a worker run"}, {name: "plan", description: "Create a planner run"}, {name: "pr", description: "Pull request commands"}, {name: "review", description: "Create a reviewer task for a pull request"}, {name: "feedback", description: "Submit feedback as a GitHub issue"}, {name: "ps", description: "Show running loops"}, {name: "jump", description: "Print shell command for a loop worktree"}, {name: "logs", description: "Show logs for a loop"}, {name: "stop", description: "Stop an active loop"}, {name: "run", description: "Run commands"}},
 		helpWhenNoArgs:  true,
 		subcommands: []*cobra.Command{
 			newCommand(commandSpec{use: "status", short: "Show service status", runE: runtime.status}),
+			newCommand(commandSpec{
+				use:   "bootstrap",
+				short: "Run first-time setup",
+				runE:  runtime.bootstrap,
+				localFlags: []flagSpec{
+					boolFlag("yes", "Run non-interactively with defaults"),
+					boolFlag("force", "Reinstall the managed daemon binary even if it already exists"),
+					stringFlag("agent-vendor", "vendor", "Agent vendor for generated config"),
+					stringFlag("project-path", "path", "Add a default project from a local repository path"),
+					boolFlag("enable-local-token", "Enable server.authMode=local-token for generated config"),
+					boolFlag("disable-osascript", "Disable osascript notifications for generated config"),
+				},
+				exampleLines: []string{
+					"$ looper bootstrap",
+					"$ looper bootstrap --yes --project-path /path/to/repo --agent-vendor opencode",
+				},
+			}),
+			newCommand(commandSpec{use: "version", short: "Show Looper version", runE: runtime.version}),
 			newCommand(commandSpec{
 				use:             "project",
 				short:           "Project commands",
@@ -128,7 +151,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 			newCommand(commandSpec{
 				use:             "daemon",
 				short:           "Daemon commands",
-				helpSubcommands: []helpSubcommand{{name: "install", description: "Install the managed daemon binary"}, {name: "status", description: "Show daemon status"}, {name: "start", description: "Start the daemon"}, {name: "restart", description: "Restart the daemon"}, {name: "logs", description: "Show daemon logs"}},
+				helpSubcommands: []helpSubcommand{{name: "install", description: "Install the managed daemon binary"}, {name: "status", description: "Show daemon status"}, {name: "start", description: "Start the daemon"}, {name: "stop", description: "Stop the daemon"}, {name: "restart", description: "Restart the daemon"}, {name: "logs", description: "Show daemon logs"}},
 				helpWhenNoArgs:  true,
 				persistentFlags: []flagSpec{
 					stringFlag("lines", "count", "Line count"),
@@ -137,6 +160,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				exampleLines: []string{
 					"$ looper daemon install",
 					"$ looper daemon start",
+					"$ looper daemon stop",
 					"$ looper daemon restart",
 					"$ looper daemon status",
 					"$ looper daemon logs --lines 50",
@@ -145,6 +169,7 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 					newCommand(commandSpec{use: "install", short: "Install the managed daemon binary", runE: runtime.daemonInstall}),
 					newCommand(commandSpec{use: "status", short: "Show daemon status", runE: runtime.daemonStatus}),
 					newCommand(commandSpec{use: "start", short: "Start the daemon", runE: runtime.daemonStart}),
+					newCommand(commandSpec{use: "stop", short: "Stop the daemon", runE: runtime.daemonStop}),
 					newCommand(commandSpec{use: "restart", short: "Restart the daemon", runE: runtime.daemonRestart}),
 					newCommand(commandSpec{use: "logs", short: "Show daemon logs", runE: runtime.daemonLogs}),
 				},
@@ -155,10 +180,12 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				runE:  runtime.upgrade,
 				localFlags: []flagSpec{
 					boolFlag("check", "Check available CLI and daemon updates"),
+					boolFlag("cli", "Upgrade the looper CLI binary when self-upgrade is allowed"),
 					boolFlag("daemon", "Install or upgrade the managed daemon binary"),
 				},
 				exampleLines: []string{
 					"$ looper upgrade --check",
+					"$ looper upgrade --cli",
 					"$ looper upgrade --daemon",
 				},
 			}),
@@ -240,6 +267,19 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 				},
 			}),
 			newCommand(commandSpec{
+				use:   "feedback [message...]",
+				short: "Submit feedback as a GitHub issue",
+				args:  cobra.ArbitraryArgs,
+				runE:  runtime.feedback,
+				localFlags: []flagSpec{
+					stringFlag("title", "title", "Issue title hint"),
+				},
+				exampleLines: []string{
+					"$ looper feedback The CLI should include feedback support",
+					"$ looper feedback --title \"CLI UX\" add an interactive mode",
+				},
+			}),
+			newCommand(commandSpec{
 				use:   "ps",
 				short: "Show running loops",
 				runE:  runtime.activeRuns,
@@ -305,6 +345,9 @@ func (a *App) newRootCommand(argv []string) *cobra.Command {
 	addFlags(root.PersistentFlags(), globalFlags())
 	root.SetOut(a.stdout())
 	root.SetErr(a.stderr())
+	if a.deps.Stdin != nil {
+		root.SetIn(a.deps.Stdin)
+	}
 	root.SilenceErrors = true
 	root.SilenceUsage = true
 	root.CompletionOptions.DisableDefaultCmd = true
@@ -370,6 +413,9 @@ func renderHelp(w io.Writer, cmd *cobra.Command, listedSubcommands []helpSubcomm
 	var output strings.Builder
 
 	_, _ = fmt.Fprintf(&output, "Usage:\n  %s\n", cmd.UseLine())
+	if cmd.Parent() == nil {
+		_, _ = fmt.Fprintf(&output, "\nVersion:\n  %s\n", version.Current().Version)
+	}
 
 	subcommands := listedSubcommands
 	if len(subcommands) == 0 {

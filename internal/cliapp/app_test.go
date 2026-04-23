@@ -20,6 +20,7 @@ import (
 	"github.com/powerformer/looper/internal/config"
 	gitinfra "github.com/powerformer/looper/internal/infra/git"
 	looperdruntime "github.com/powerformer/looper/internal/runtime"
+	"github.com/powerformer/looper/internal/version"
 	"github.com/powerformer/looper/internal/worker"
 	pkgapi "github.com/powerformer/looper/pkg/api"
 )
@@ -49,7 +50,7 @@ func TestCommandGroupHelpListsExpectedSubcommands(t *testing.T) {
 	}{
 		{args: []string{"project", "--help"}, subcommands: []string{"list  List projects", "add   Add a project"}},
 		{args: []string{"config", "--help"}, subcommands: []string{"show  Show active config"}},
-		{args: []string{"daemon", "--help"}, subcommands: []string{"install  Install the managed daemon binary", "status   Show daemon status", "start    Start the daemon", "restart  Restart the daemon", "logs     Show daemon logs"}},
+		{args: []string{"daemon", "--help"}, subcommands: []string{"install  Install the managed daemon binary", "status   Show daemon status", "start    Start the daemon", "stop     Stop the daemon", "restart  Restart the daemon", "logs     Show daemon logs"}},
 		{args: []string{"loop", "--help"}, subcommands: []string{"list   List loops", "start  Start a loop", "pause  Pause a loop"}},
 		{args: []string{"pr", "--help"}, subcommands: []string{"list    List pull requests", "show    Show a pull request", "status  Show pull request status"}},
 		{args: []string{"run", "--help"}, subcommands: []string{"list  List runs"}},
@@ -90,6 +91,9 @@ func TestRootHelpIncludesGlobalFlagsWithFrozenSyntax(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("Run([--help]) stderr = %q, want empty string", stderr)
 	}
+	if !strings.Contains(stdout, "Version:\n  "+version.Current().Version) {
+		t.Fatalf("Run([--help]) stdout = %q, want version section", stdout)
+	}
 
 	for _, syntax := range []string{
 		"--json",
@@ -107,6 +111,116 @@ func TestRootHelpIncludesGlobalFlagsWithFrozenSyntax(t *testing.T) {
 			t.Fatalf("Run([--help]) stdout = %q, want to contain %q", stdout, syntax)
 		}
 	}
+}
+
+func TestRootHelpIncludesFeedbackSubcommand(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "--help")
+	if exitCode != 0 {
+		t.Fatalf("Run([--help]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([--help]) stderr = %q, want empty string", stderr)
+	}
+	if !strings.Contains(stdout, "feedback") || !strings.Contains(stdout, "Submit feedback as a GitHub issue") {
+		t.Fatalf("Run([--help]) stdout = %q, want feedback subcommand", stdout)
+	}
+}
+
+func TestFeedbackCommandRunsAgentAndPrintsIssueURL(t *testing.T) {
+	t.Parallel()
+
+	scriptPath := filepath.Join(t.TempDir(), "fake-agent.sh")
+	script := strings.Join([]string{
+		"#!/bin/sh",
+		"printf 'agent started\\n'",
+		"printf 'https://github.com/powerformer/looper/issues/42\\n'",
+		"printf 'https://github.com/powerformer/looper/issues/321\\n'",
+		"printf '%s{\"summary\":\"created issue\"}\\n' \"$LOOPER_COMPLETION_MARKER\"",
+	}, "\n")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake agent script: %v", err)
+	}
+
+	configPath := writeCLIConfigWithAgent(t, "http://127.0.0.1:1", string(config.AgentVendorOpenCode), map[string]any{"command": scriptPath})
+
+	exitCode, stdout, stderr := runApp(t, "feedback", "Great", "tool", "--title", "CLI Feedback", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([feedback ...]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([feedback ...]) stderr = %q, want empty string", stderr)
+	}
+	if got, want := stdout, "https://github.com/powerformer/looper/issues/321\n"; got != want {
+		t.Fatalf("Run([feedback ...]) stdout = %q, want %q", got, want)
+	}
+
+	exitCode, stdout, stderr = runApp(t, "feedback", "Great", "tool", "--title", "CLI Feedback", "--json", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([feedback ... --json]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([feedback ... --json]) stderr = %q, want empty string", stderr)
+	}
+	assertJSONContains(t, stdout, "repo", "powerformer/looper")
+	assertJSONContains(t, stdout, "titleHint", "CLI Feedback")
+	assertJSONContains(t, stdout, "message", "Great tool")
+	assertJSONContains(t, stdout, "issueUrl", "https://github.com/powerformer/looper/issues/321")
+	assertJSONContains(t, stdout, "summary", "created issue")
+}
+
+func TestFeedbackCommandRequiresMessage(t *testing.T) {
+	t.Parallel()
+
+	configPath := writeCLIConfigWithAgent(t, "http://127.0.0.1:1", string(config.AgentVendorOpenCode), map[string]any{"command": "/bin/true"})
+	exitCode, stdout, stderr := runApp(t, "feedback", "--title", "Only title", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([feedback --title ...]) exit code = %d, want non-zero", exitCode)
+	}
+	if stdout != "" {
+		t.Fatalf("Run([feedback --title ...]) stdout = %q, want empty string", stdout)
+	}
+	if !strings.Contains(stderr, "feedback message is required") {
+		t.Fatalf("Run([feedback --title ...]) stderr = %q, want missing message error", stderr)
+	}
+}
+
+func TestVersionCommandPrintsCurrentVersion(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "version")
+	if exitCode != 0 {
+		t.Fatalf("Run([version]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([version]) stderr = %q, want empty string", stderr)
+	}
+	if got, want := stdout, version.Current().Version+"\n"; got != want {
+		t.Fatalf("Run([version]) stdout = %q, want %q", got, want)
+	}
+}
+
+func TestVersionCommandJSONPrintsBuildMetadata(t *testing.T) {
+	t.Parallel()
+
+	exitCode, stdout, stderr := runApp(t, "version", "--json")
+	if exitCode != 0 {
+		t.Fatalf("Run([version --json]) exit code = %d, want 0", exitCode)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([version --json]) stderr = %q, want empty string", stderr)
+	}
+	assertJSONContains(t, stdout, "version", version.Current().Version)
+	assertJSONContains(t, stdout, "metadata", map[string]any{
+		"versionSource":   version.Current().Metadata.VersionSource,
+		"channel":         version.Current().Metadata.Channel,
+		"apiVersion":      version.Current().Metadata.APIVersion,
+		"minCliForDaemon": nil,
+		"minDaemonForCli": nil,
+		"gitCommitSha":    nil,
+		"buildTimestamp":  nil,
+	})
 }
 
 func TestNestedCommandParsingReachesLeafCommands(t *testing.T) {
@@ -1277,6 +1391,32 @@ func writeCLIConfig(t *testing.T, baseURL string, localToken string) string {
 	}
 
 	raw, err := json.Marshal(config)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(configPath, raw, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	return configPath
+}
+
+func writeCLIConfigWithAgent(t *testing.T, baseURL string, vendor string, params map[string]any) string {
+	t.Helper()
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	configPayload := map[string]any{
+		"server": map[string]any{
+			"baseUrl":  baseURL,
+			"authMode": "none",
+		},
+		"agent": map[string]any{
+			"vendor": vendor,
+			"params": params,
+		},
+	}
+
+	raw, err := json.Marshal(configPayload)
 	if err != nil {
 		t.Fatalf("marshal config: %v", err)
 	}
