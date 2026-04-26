@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/infra/shell"
 	"github.com/powerformer/looper/internal/storage"
 )
 
@@ -166,6 +167,109 @@ func TestServiceAddProjectReturnsDiscoveryWarnings(t *testing.T) {
 	}
 	if result.Warnings[1] != "Could not discover pull requests: gh pr list failed" {
 		t.Fatalf("Warnings[1] = %q, want pull request warning", result.Warnings[1])
+	}
+}
+
+func TestServiceAddProjectWarnsWhenPullRequestSnapshotFails(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	service := &Service{
+		DB:    coordinator.DB(),
+		Repos: repos,
+		Now:   func() time.Time { return now },
+		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+			return []PullRequestSummary{{Number: 73, State: "OPEN", IsDraft: false}}, nil
+		},
+		CapturePullRequestSnapshot: func(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+			return storage.PullRequestSnapshotRecord{}, errors.New("could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)")
+		},
+	}
+	repo := "powerformer/looper"
+
+	result, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if result.DiscoveredPullRequests != 0 {
+		t.Fatalf("AddProject().DiscoveredPullRequests = %d, want 0", result.DiscoveredPullRequests)
+	}
+	if len(result.Warnings) != 1 {
+		t.Fatalf("len(AddProject().Warnings) = %d, want 1", len(result.Warnings))
+	}
+	wantWarning := "Could not snapshot pull request #73: could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)"
+	if result.Warnings[0] != wantWarning {
+		t.Fatalf("Warnings[0] = %q, want %q", result.Warnings[0], wantWarning)
+	}
+	stored, getErr := repos.Projects.GetByID(ctx, "looper")
+	if getErr != nil {
+		t.Fatalf("Projects.GetByID() error = %v", getErr)
+	}
+	if stored == nil {
+		t.Fatal("Projects.GetByID() = nil, want stored project")
+	}
+	snapshot, getErr := repos.PullRequestSnapshots.GetLatest(ctx, repo, 73)
+	if getErr != nil {
+		t.Fatalf("PullRequestSnapshots.GetLatest() error = %v", getErr)
+	}
+	if snapshot != nil {
+		t.Fatalf("PullRequestSnapshots.GetLatest() = %#v, want nil", snapshot)
+	}
+}
+
+func TestServiceAddProjectPropagatesPullRequestSnapshotCancellation(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	service := &Service{
+		DB:    coordinator.DB(),
+		Repos: repos,
+		Now:   func() time.Time { return now },
+		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+			return []PullRequestSummary{{Number: 73, State: "OPEN", IsDraft: false}}, nil
+		},
+		CapturePullRequestSnapshot: func(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+			return storage.PullRequestSnapshotRecord{}, context.Canceled
+		},
+	}
+	repo := "powerformer/looper"
+
+	_, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("AddProject() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestServiceAddProjectPropagatesSnapshotCommandErrorCancellation(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	service := &Service{
+		DB:    coordinator.DB(),
+		Repos: repos,
+		Now:   func() time.Time { return now },
+		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+			return []PullRequestSummary{{Number: 73, State: "OPEN", IsDraft: false}}, nil
+		},
+		CapturePullRequestSnapshot: func(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+			cancel()
+			return storage.PullRequestSnapshotRecord{}, &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{ExitCode: 1}}
+		},
+	}
+	repo := "powerformer/looper"
+
+	_, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("AddProject() error = %v, want context.Canceled", err)
 	}
 }
 
