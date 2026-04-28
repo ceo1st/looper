@@ -113,6 +113,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 
 	cmd := exec.Command(command, args...)
 	cmd.Dir = input.WorkingDirectory
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = os.Environ()
 	for key, value := range e.config.Env {
 		cmd.Env = append(cmd.Env, key+"="+value)
@@ -209,6 +210,36 @@ func (x *execution) Kill(reason string) error {
 	return nil
 }
 
+func (x *execution) signalProcessGroup(signal syscall.Signal) error {
+	if x.process.Process == nil {
+		return os.ErrProcessDone
+	}
+	pid := x.process.Process.Pid
+	if pid <= 0 {
+		return x.process.Process.Signal(signal)
+	}
+	if err := syscall.Kill(-pid, signal); err != nil {
+		if err == syscall.ESRCH {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	return nil
+}
+
+func (x *execution) killProcessGroup() error {
+	if x.process.Process == nil {
+		return os.ErrProcessDone
+	}
+	pid := x.process.Process.Pid
+	if pid > 0 {
+		if err := syscall.Kill(-pid, syscall.SIGKILL); err == nil || err == syscall.ESRCH {
+			return nil
+		}
+	}
+	return x.process.Process.Kill()
+}
+
 func (x *execution) run(ctx context.Context) {
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- x.process.Wait() }()
@@ -221,16 +252,20 @@ func (x *execution) run(ctx context.Context) {
 		graceKillTimer  <-chan time.Time
 		timeoutTimer    <-chan time.Time
 		inactivityTimer *time.Ticker
+		termDelivered   bool
 		terminateOnce   sync.Once
 		terminateSignal = func() {
 			terminateOnce.Do(func() {
 				if x.process.Process == nil {
 					return
 				}
-				if err := x.process.Process.Signal(syscall.SIGTERM); err != nil && err != os.ErrProcessDone {
-					_ = x.process.Process.Kill()
+				if err := x.signalProcessGroup(syscall.SIGTERM); err != nil {
+					if err != os.ErrProcessDone {
+						_ = x.killProcessGroup()
+					}
 					return
 				}
+				termDelivered = true
 				grace := x.gracefulShutdown
 				if grace <= 0 {
 					grace = 5 * time.Second
@@ -266,8 +301,14 @@ func (x *execution) run(ctx context.Context) {
 			x.setStatus("timeout")
 			terminateSignal()
 		case <-tickerChan(inactivityTimer):
-			if timedOut || killed || x.process.ProcessState != nil {
+			if timedOut || killed {
 				continue
+			}
+			select {
+			case waitErr = <-waitCh:
+				waiting = false
+				continue
+			default:
 			}
 			if x.timeSinceLastOutput() < x.heartbeatTimeout {
 				continue
@@ -292,10 +333,11 @@ func (x *execution) run(ctx context.Context) {
 			terminateSignal()
 		case <-graceKillTimer:
 			graceKillTimer = nil
-			if x.process.Process != nil {
-				_ = x.process.Process.Kill()
-			}
+			_ = x.killProcessGroup()
 		}
+	}
+	if termDelivered && (killed || timedOut) {
+		_ = x.killProcessGroup()
 	}
 
 	stdout := x.stdoutString()
