@@ -285,6 +285,30 @@ func TestHandlerPullRequestStatusReturnsInternalErrorWhenLoopLookupFails(t *test
 	assertEqual(t, errMap["message"], "list loops: database is locked")
 }
 
+func TestReadAgentOutputLogReadsTailToPreserveCompletionMarker(t *testing.T) {
+	t.Parallel()
+
+	logDir := t.TempDir()
+	logPath := filepath.Join(logDir, "stdout.log")
+	completionLine := "__LOOPER_RESULT__={\"summary\":\"done from tail\"}\n"
+	headSize := maxPersistedAgentLogReadBytes - len(completionLine) + 1023
+	fullLog := strings.Repeat("x", headSize) + "\n" + completionLine
+	if err := os.WriteFile(logPath, []byte(fullLog), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	persisted, ok := readAgentOutputLog(logDir, logPath)
+	if !ok {
+		t.Fatal("readAgentOutputLog() = ok false, want true")
+	}
+	if len(persisted) != maxPersistedAgentLogReadBytes {
+		t.Fatalf("len(persisted) = %d, want %d", len(persisted), maxPersistedAgentLogReadBytes)
+	}
+	if !strings.HasSuffix(persisted, completionLine) {
+		t.Fatal("persisted log missing completion tail suffix")
+	}
+}
+
 func TestHandlerPullRequestStatusReturnsInternalErrorWhenRunLookupFails(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedEventAndPullRequestRouteData(t, fixture.runtime)
@@ -3020,6 +3044,57 @@ func TestHandlerLoopLogsFollowStreamsSnapshotAndChunk(t *testing.T) {
 	if !strings.Contains(text, "event: end") {
 		t.Fatalf("stream body = %q, want end event", text)
 	}
+}
+
+func TestHandlerLoopLogsReturnsPersistedHistoricalAgentOutput(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedRunRouteData(t, fixture.runtime)
+
+	stdoutPath := filepath.Join(fixture.config.Daemon.LogDir, "loops", "loop_1", "run_1", "agent_exec_persisted.stdout.log")
+	stderrPath := filepath.Join(fixture.config.Daemon.LogDir, "loops", "loop_1", "run_1", "agent_exec_persisted.stderr.log")
+	fullStdout := strings.Repeat("stdout-line\n", 4)
+	fullStderr := strings.Repeat("stderr-line\n", 4)
+	if err := os.MkdirAll(filepath.Dir(stdoutPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(log dir) error = %v", err)
+	}
+	if err := os.WriteFile(stdoutPath, []byte(fullStdout), 0o644); err != nil {
+		t.Fatalf("WriteFile(stdoutPath) error = %v", err)
+	}
+	if err := os.WriteFile(stderrPath, []byte(fullStderr), 0o644); err != nil {
+		t.Fatalf("WriteFile(stderrPath) error = %v", err)
+	}
+
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:              "agent_exec_persisted",
+		ProjectID:       stringPtr("project_1"),
+		LoopID:          stringPtr("loop_1"),
+		RunID:           stringPtr("run_1"),
+		Vendor:          "openai",
+		Status:          "completed",
+		PID:             int64Ptr(1234),
+		HeartbeatCount:  1,
+		LastHeartbeatAt: stringPtr(nowISO),
+		StartedAt:       nowISO,
+		OutputJSON:      stringPtr(`{"stdout":"tail-out","stderr":"tail-err","stdoutLogPath":"` + stdoutPath + `","stderrLogPath":"` + stderrPath + `"}`),
+		CreatedAt:       nowISO,
+		UpdatedAt:       nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert(agent_exec_persisted) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/loops/loop_1/logs", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	agent := data["agent"].(map[string]any)
+	assertEqual(t, agent["stdout"], fullStdout)
+	assertEqual(t, agent["stderr"], fullStderr)
 }
 
 func TestHandlerLoopLogsFollowDefaultsToCodexStderrWhenStdoutEmpty(t *testing.T) {
