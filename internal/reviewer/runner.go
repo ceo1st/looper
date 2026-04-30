@@ -13,9 +13,11 @@ import (
 	"github.com/powerformer/looper/internal/agent"
 	"github.com/powerformer/looper/internal/bootstrap"
 	"github.com/powerformer/looper/internal/config"
+	"github.com/powerformer/looper/internal/disclosure"
 	"github.com/powerformer/looper/internal/eventlog"
 	"github.com/powerformer/looper/internal/infra/specpr"
 	"github.com/powerformer/looper/internal/storage"
+	"github.com/powerformer/looper/internal/version"
 )
 
 const (
@@ -43,8 +45,9 @@ type ReviewerStep string
 type ReviewEvent string
 
 const (
-	ReviewEventApprove ReviewEvent = "APPROVE"
-	ReviewEventComment ReviewEvent = "COMMENT"
+	ReviewEventApprove     ReviewEvent = "APPROVE"
+	ReviewEventComment     ReviewEvent = "COMMENT"
+	reviewEventAgentNative ReviewEvent = "AGENT_NATIVE"
 )
 
 type QueueFailureKind string
@@ -140,15 +143,6 @@ func (e TransientCommandError) Error() string   { return e.Err.Error() }
 func (e TransientCommandError) Unwrap() error   { return e.Err }
 func (e TransientCommandError) Temporary() bool { return true }
 
-type ReviewComment struct {
-	Body      string `json:"body"`
-	Path      string `json:"path,omitempty"`
-	Line      int64  `json:"line,omitempty"`
-	Side      string `json:"side,omitempty"`
-	StartLine int64  `json:"startLine,omitempty"`
-	StartSide string `json:"startSide,omitempty"`
-}
-
 type ListOpenPullRequestsInput struct {
 	Repo  string
 	CWD   string
@@ -170,27 +164,26 @@ type CapturePullRequestSnapshotInput struct {
 	CapturedAt string
 }
 
-type SubmitReviewInput struct {
-	Repo     string
-	PRNumber int64
-	Event    ReviewEvent
-	Body     string
-	CommitID string
-	Comments []ReviewComment
-	CWD      string
+type VerifyReviewMarkerInput struct {
+	Repo                string
+	PRNumber            int64
+	Marker              string
+	AllowedReviewEvents []ReviewEvent
+	AuthorLogin         string
+	CWD                 string
+}
+
+type ReviewMarkerResult struct {
+	Found       bool
+	Outcome     string
+	Event       ReviewEvent
+	AuthorLogin string
 }
 
 type PullRequestReactionInput struct {
 	Repo     string
 	PRNumber int64
 	Content  string
-	CWD      string
-}
-
-type PullRequestCommentInput struct {
-	Repo     string
-	PRNumber int64
-	Body     string
 	CWD      string
 }
 
@@ -206,8 +199,7 @@ type GitHubGateway interface {
 	GetCurrentUserLogin(context.Context, string) (string, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	CapturePullRequestSnapshot(context.Context, CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error)
-	SubmitReview(context.Context, SubmitReviewInput) error
-	AddPullRequestComment(context.Context, PullRequestCommentInput) error
+	FindReviewMarker(context.Context, VerifyReviewMarkerInput) (ReviewMarkerResult, error)
 	AddPullRequestReaction(context.Context, PullRequestReactionInput) error
 	RemovePullRequestReaction(context.Context, PullRequestReactionInput) error
 	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
@@ -271,6 +263,9 @@ type Options struct {
 	AgentTimeout            time.Duration
 	ClaimTTL                time.Duration
 	AllowAutoApprove        bool
+	Disclosure              *config.DisclosureConfig
+	AgentRuntime            string
+	AgentModel              *string
 	RetryBaseDelay          time.Duration
 	RetryMaxAttempts        int64
 	OnAgentExecutionStarted AgentExecutionStartedFunc
@@ -287,6 +282,9 @@ type Runner struct {
 	agentTimeout            time.Duration
 	claimTTL                time.Duration
 	allowAutoApprove        bool
+	disclosure              config.DisclosureConfig
+	agentRuntime            string
+	agentModel              string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
@@ -358,34 +356,11 @@ type checkpointSnapshot struct {
 	PayloadJSON           string `json:"payloadJson,omitempty"`
 }
 
-type reviewFeedbackComment struct {
-	Body      string `json:"body"`
-	Path      string `json:"path,omitempty"`
-	Line      int64  `json:"line,omitempty"`
-	Side      string `json:"side,omitempty"`
-	StartLine int64  `json:"startLine,omitempty"`
-	StartSide string `json:"startSide,omitempty"`
-}
-
-type publishState struct {
-	ReviewSubmitted        bool `json:"reviewSubmitted,omitempty"`
-	TopLevelCommentsPosted int  `json:"topLevelCommentsPosted,omitempty"`
-}
-
 type pendingReviewCheckpoint struct {
-	HeadSHA      string                  `json:"headSha,omitempty"`
-	Event        ReviewEvent             `json:"event,omitempty"`
-	Body         string                  `json:"body,omitempty"`
-	Summary      string                  `json:"summary,omitempty"`
-	Comments     []reviewFeedbackComment `json:"comments,omitempty"`
-	Clean        bool                    `json:"clean,omitempty"`
-	PublishState *publishState           `json:"publishState,omitempty"`
-}
-
-type parsedReviewFeedback struct {
-	Body     string
-	Comments []reviewFeedbackComment
-	Clean    bool
+	HeadSHA                  string      `json:"headSha,omitempty"`
+	Event                    ReviewEvent `json:"event,omitempty"`
+	Summary                  string      `json:"summary,omitempty"`
+	MarkerVerificationMisses int         `json:"markerVerificationMisses,omitempty"`
 }
 
 type resumedRunContext struct {
@@ -423,6 +398,10 @@ func New(options Options) *Runner {
 	if retryMax <= 0 {
 		retryMax = defaultRetryMax
 	}
+	disclosureCfg := config.DefaultDisclosureConfig()
+	if options.Disclosure != nil {
+		disclosureCfg = *options.Disclosure
+	}
 	return &Runner{
 		db:                      options.DB,
 		repos:                   options.Repos,
@@ -434,6 +413,9 @@ func New(options Options) *Runner {
 		agentTimeout:            agentTimeout,
 		claimTTL:                claimTTL,
 		allowAutoApprove:        options.AllowAutoApprove,
+		disclosure:              disclosureCfg,
+		agentRuntime:            strings.TrimSpace(options.AgentRuntime),
+		agentModel:              derefString(options.AgentModel),
 		retryBaseDelay:          retryBaseDelay,
 		retryMaxAttempts:        retryMax,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
@@ -691,10 +673,18 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if err != nil {
 			failure := r.classifyFailure(err)
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
+			if checkpoint.ResumePolicy == "rerun_review" || hasPendingReviewMarkerMiss(checkpoint) {
+				latest = checkpoint
+			}
+			if checkpoint.ResumePolicy == "restart_from_discover" {
+				latest.ResumePolicy = checkpoint.ResumePolicy
+			}
 			resumePolicy := latest.ResumePolicy
 			switch failure.kind {
 			case FailureRetryableAfterResume:
-				resumePolicy = "advance_from_checkpoint"
+				if resumePolicy != "restart_from_discover" && resumePolicy != "rerun_review" {
+					resumePolicy = "advance_from_checkpoint"
+				}
 			case FailureManualIntervention:
 				resumePolicy = "manual_intervention"
 			default:
@@ -971,7 +961,8 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, err
 	}
 	executionID := eventlog.NewEventID("agent")
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildReviewPrompt(input.Repo, input.PRNumber, checkpoint), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: fmt.Sprintf("reviewer:%s:%s", input.Loop.ID, checkpoint.Snapshot.HeadSHA)})
+	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: buildReviewPrompt(input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.allowAutoApprove, isManualReviewerLoop(input.Loop), r.disclosure, r.agentRuntime, r.agentModel), WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, Metadata: map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -980,14 +971,26 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			r.logger.Warn("reviewer agent start notification failed", map[string]any{"loopId": input.Loop.ID, "runId": input.Run.ID, "error": err.Error()})
 		}
 	}
-	_ = r.tryAddReaction(ctx, input, "eyes")
 	result, err := execution.Wait(ctx)
 	if err != nil {
-		_ = r.tryRemoveReaction(ctx, input, "eyes")
 		return checkpoint, err
 	}
 	if result.Status != "completed" {
-		_ = r.tryRemoveReaction(ctx, input, "eyes")
+		if reason, ok := r.detectHeadChangeRequired(ctx, input, checkpoint); ok {
+			checkpoint.ResumePolicy = "restart_from_discover"
+			return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume}
+		}
+		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA); err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		} else if found.Found {
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, Event: reviewEventAgentNative, Summary: result.Summary}
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			return checkpoint, nil
+		}
+		if reason, ok := r.detectRediscoveryRequired(ctx, input, checkpoint); ok {
+			checkpoint.ResumePolicy = "restart_from_discover"
+			return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume}
+		}
 		message := firstNonEmpty(result.Summary, result.Stderr, fmt.Sprintf("Reviewer agent %s", result.Status))
 		kind := FailureRetryableTransient
 		if agent.IsAgentSetupFailureMessage(message) {
@@ -995,16 +998,17 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		return checkpoint, &loopError{message: message, kind: kind}
 	}
-	feedback := parseReviewFeedback(result)
-	if !feedback.Clean && len(feedback.Comments) == 0 && strings.TrimSpace(feedback.Body) == "" {
-		_ = r.tryRemoveReaction(ctx, input, "eyes")
-		kind := FailureRetryableTransient
-		if result.ParseStatus == "invalid_json" {
-			kind = FailureNonRetryable
+	if result.ParseStatus != "parsed" {
+		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA); err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		} else if found.Found {
+			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, Event: reviewEventAgentNative, Summary: result.Summary}
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			return checkpoint, nil
 		}
-		return checkpoint, &loopError{message: "Reviewer agent produced no actionable review feedback", kind: kind}
+		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureNonRetryable}
 	}
-	checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, Event: ternaryReviewEvent(feedback.Clean), Body: feedback.Body, Summary: result.Summary, Comments: feedback.Comments, Clean: feedback.Clean}
+	checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, Event: reviewEventAgentNative, Summary: result.Summary}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -1017,19 +1021,11 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if checkpoint.PendingReview == nil {
 		return checkpoint, &loopError{message: "Missing pending review checkpoint for publish step", kind: FailureRetryableAfterResume}
 	}
-	pending := normalizePendingReviewCheckpoint(*checkpoint.PendingReview)
+	pending := *checkpoint.PendingReview
 	meta := parseJSONObject(input.Loop.MetadataJSON)
 	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pending.HeadSHA {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped already-published review for head %s", pending.HeadSHA)
 		return checkpoint, nil
-	}
-	reviewEvent := pending.Event
-	if reviewEvent == ReviewEventApprove && !r.allowAutoApprove {
-		reviewEvent = ReviewEventComment
-	}
-	reviewBody := pending.Body
-	if pending.Clean && reviewEvent == ReviewEventComment {
-		reviewBody = firstNonEmpty(strings.TrimSpace(reviewBody), strings.TrimSpace(pending.Summary))
 	}
 	repo := input.Repo
 	prNumber := input.PRNumber
@@ -1037,129 +1033,122 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
-	phase := resolvePullRequestPhase(detail.Labels)
-	checkpointPhase := resolvePullRequestPhase(detailLabels(input.Checkpoint.Detail))
+	if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
+		return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA), kind: FailureRetryableAfterResume}
+	}
+	markerResult := ReviewMarkerResult{}
+	if pending.Event == reviewEventAgentNative {
+		found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA)
+		if err != nil {
+			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
+		markerResult = found
+	} else {
+		checkpoint.PendingReview = nil
+		checkpoint.ResumePolicy = "rerun_review"
+		return checkpoint, &loopError{message: "Legacy pending review checkpoint cannot be verified; rerunning review before marking publish success", kind: FailureRetryableAfterResume}
+	}
 	if !isManualReviewerLoop(input.Loop) {
 		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
-		if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) {
-			if pending.PublishState.ReviewSubmitted {
-				if err := r.transitionSpecReviewLabels(ctx, input, detail, phase, checkpointPhase, reviewEvent); err != nil {
-					return checkpoint, err
-				}
-				if err := r.recordPublishedReviewProgress(ctx, input, pending, reviewEvent); err != nil {
-					return checkpoint, err
-				}
-			}
+		if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) && !markerResult.Found {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", repo, prNumber)
 			return checkpoint, nil
 		}
 	}
-	if detail.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
-		return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA), kind: FailureRetryableAfterResume}
-	}
-	if pending.Clean {
-		if !pending.PublishState.ReviewSubmitted && (reviewEvent == ReviewEventApprove || reviewBody != "") {
-			if err := r.github.SubmitReview(ctx, SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: reviewEvent, Body: reviewBody, CWD: input.Project.RepoPath}); err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-			}
-			pending.PublishState.ReviewSubmitted = true
+	if !markerResult.Found {
+		if pending.MarkerVerificationMisses == 0 {
+			pending.MarkerVerificationMisses = 1
 			checkpoint.PendingReview = pending.clone()
-			if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
-				return checkpoint, err
-			}
+			checkpoint.ResumePolicy = "advance_from_checkpoint"
+			return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found; retrying marker verification before rerunning review", kind: FailureRetryableAfterResume}
 		}
-	} else {
-		if !pending.PublishState.ReviewSubmitted && (hasInlineComments(pending.Comments) || strings.TrimSpace(pending.Body) != "") {
-			inline := inlineComments(pending.Comments)
-			err := r.github.SubmitReview(ctx, SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: reviewEvent, Body: pending.Body, CommitID: pending.HeadSHA, Comments: toGitHubReviewComments(inline), CWD: input.Project.RepoPath})
-			if err != nil {
-				if len(inline) == 0 || !isInlineReviewAnchorFailure(err) {
-					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-				}
-				r.logWarn("reviewer inline anchors rejected; falling back to top-level comments", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": repo, "prNumber": prNumber, "inlineCommentCount": len(inline)})
-				for i := range pending.Comments {
-					if pending.Comments[i].Path != "" && pending.Comments[i].Line > 0 && pending.Comments[i].Side != "" {
-						pending.Comments[i] = downgradeInlineCommentToTopLevel(pending.Comments[i])
-					}
-				}
-				checkpoint.PendingReview = pending.clone()
-				if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
-					return checkpoint, err
-				}
-				fallbackBody := firstNonEmpty(strings.TrimSpace(pending.Body), strings.TrimSpace(pending.Summary))
-				if fallbackBody != "" {
-					if err := r.github.SubmitReview(ctx, SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: reviewEvent, Body: fallbackBody, CWD: input.Project.RepoPath}); err != nil {
-						return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-					}
-				}
-			}
-			pending.PublishState.ReviewSubmitted = true
-			checkpoint.PendingReview = pending.clone()
-			if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
-				return checkpoint, err
-			}
-		}
-		topLevel := topLevelComments(pending.Comments)
-		for pending.PublishState.TopLevelCommentsPosted < len(topLevel) {
-			comment := topLevel[pending.PublishState.TopLevelCommentsPosted]
-			if isDuplicateTopLevelReviewComment(comment, pending.Body) {
-				pending.PublishState.TopLevelCommentsPosted++
-				checkpoint.PendingReview = pending.clone()
-				if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
-					return checkpoint, err
-				}
-				continue
-			}
-			if err := r.github.AddPullRequestComment(ctx, PullRequestCommentInput{Repo: repo, PRNumber: prNumber, Body: comment.Body, CWD: input.Project.RepoPath}); err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-			}
-			pending.PublishState.TopLevelCommentsPosted++
-			checkpoint.PendingReview = pending.clone()
-			if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
-				return checkpoint, err
-			}
-		}
+		checkpoint.PendingReview = nil
+		checkpoint.ResumePolicy = "rerun_review"
+		return checkpoint, &loopError{message: "Reviewer agent completed but no matching GitHub review marker was found", kind: FailureRetryableAfterResume}
 	}
-	if pending.Clean {
-		_ = r.tryAddReaction(ctx, input, "+1")
-	} else {
-		_ = r.tryRemoveReaction(ctx, input, "+1")
-	}
-	_ = r.tryRemoveReaction(ctx, input, "eyes")
-	if err := r.transitionSpecReviewLabels(ctx, input, detail, phase, checkpointPhase, reviewEvent); err != nil {
+	checkpoint.PendingReview = pending.clone()
+	if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, markerResult); err != nil {
 		return checkpoint, err
 	}
-	if err := r.recordPublishedReviewProgress(ctx, input, pending, reviewEvent); err != nil {
+	if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
 		return checkpoint, err
 	}
 	return checkpoint, nil
 }
 
-func (r *Runner) transitionSpecReviewLabels(ctx context.Context, input stepInput, detail PullRequestDetail, phase string, checkpointPhase string, reviewEvent ReviewEvent) error {
-	if reviewEvent != ReviewEventApprove || (phase != "spec" && checkpointPhase != "spec") {
-		return nil
-	}
-	postSubmitDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepInput, headSHA string) (ReviewMarkerResult, error) {
+	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 	if err != nil {
-		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return ReviewMarkerResult{}, err
 	}
-	if !isSpecReviewClean(postSubmitDetail) {
-		return nil
+	marker := agentNativeReviewMarker(input.Loop.ID, headSHA)
+	return r.github.FindReviewMarker(ctx, VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: marker, AllowedReviewEvents: r.allowedAgentNativeReviewEvents(), AuthorLogin: currentLogin, CWD: input.Project.RepoPath})
+}
+
+func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail, marker ReviewMarkerResult) error {
+	if !marker.Found {
+		return &loopError{message: "Cannot apply review side effects without a verified review marker", kind: FailureRetryableAfterResume}
 	}
-	if specpr.HasLabel(postSubmitDetail.Labels, specpr.ReviewingLabel) {
-		if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
-			return err
+	outcome := strings.ToLower(strings.TrimSpace(marker.Outcome))
+	reaction := PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}
+	switch outcome {
+	case "clean":
+		if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
+			return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 		}
-	}
-	if !specpr.HasLabel(postSubmitDetail.Labels, specpr.ReadyLabel) {
-		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
-			return err
+		checkpointHadSpecReviewing := specpr.HasLabel(detailLabels(checkpoint.Detail), specpr.ReviewingLabel)
+		if r.allowAutoApprove && marker.Event == ReviewEventApprove && (checkpointHadSpecReviewing || specpr.HasLabel(detail.Labels, specpr.ReviewingLabel)) {
+			freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+			if err != nil {
+				return &loopError{message: fmt.Sprintf("Failed to refresh pull request review state before spec-ready transition: %v", err), kind: FailureRetryableAfterResume}
+			}
+			if detail.HeadSHA != "" && freshDetail.HeadSHA != "" && detail.HeadSHA != freshDetail.HeadSHA {
+				return &loopError{message: fmt.Sprintf("PR head changed before spec-ready transition: expected %s, got %s", detail.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume}
+			}
+			detail = freshDetail
+			if !specpr.IsReviewClean(detail.ReviewDecision, detail.Comments) {
+				return nil
+			}
+			if specpr.HasLabel(detail.Labels, specpr.ReviewingLabel) {
+				if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
+					return &loopError{message: fmt.Sprintf("Failed to remove spec-reviewing label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+				}
+			}
+			if !specpr.HasLabel(detail.Labels, specpr.ReadyLabel) {
+				if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
+					return &loopError{message: fmt.Sprintf("Failed to add spec-ready label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+				}
+			}
 		}
+	case "actionable":
+		if err := r.github.RemovePullRequestReaction(ctx, reaction); err != nil {
+			return &loopError{message: fmt.Sprintf("Failed to remove stale clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+		}
+	default:
+		return &loopError{message: "Verified review marker is missing outcome=clean|actionable; cannot validate review side effects", kind: FailureRetryableAfterResume}
 	}
 	return nil
+}
+
+func pendingReviewEvent(pending pendingReviewCheckpoint) ReviewEvent {
+	if pending.Event != "" {
+		return pending.Event
+	}
+	return reviewEventAgentNative
+}
+
+func hasPendingReviewMarkerMiss(checkpoint reviewerCheckpoint) bool {
+	return checkpoint.PendingReview != nil && checkpoint.PendingReview.MarkerVerificationMisses > 0
+}
+
+func (r *Runner) allowedAgentNativeReviewEvents() []ReviewEvent {
+	if r.allowAutoApprove {
+		return []ReviewEvent{ReviewEventComment, ReviewEventApprove}
+	}
+	return []ReviewEvent{ReviewEventComment}
 }
 
 func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent) error {
@@ -1205,14 +1194,20 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		failedStep = asReviewerStep(derefString(latestRun.CurrentStep))
 	}
 	restartFromDiscover := false
+	rerunReview := false
 	if latestRun != nil {
 		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
-		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, failureSummary)
+		restartFromDiscover = checkpoint.ResumePolicy == "restart_from_discover" || shouldRestartFromDiscover(latestRun.Status, failedStep, failureSummary)
+		rerunReview = checkpoint.ResumePolicy == "rerun_review"
 	}
 	startStep := stepDiscover
 	if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") {
 		if restartFromDiscover {
 			startStep = stepDiscover
+		} else if rerunReview && !isManualReviewerLoop(loop) {
+			startStep = stepDiscover
+		} else if rerunReview {
+			startStep = stepReview
 		} else if lastCompleted != "" {
 			if next := nextReviewerStep(lastCompleted); next != "" {
 				startStep = next
@@ -1493,22 +1488,6 @@ func (r *Runner) classifyFailure(err error) *loopError {
 	return &loopError{message: err.Error(), kind: FailureNonRetryable}
 }
 
-func (r *Runner) tryAddReaction(ctx context.Context, input stepInput, content string) error {
-	if err := r.github.AddPullRequestReaction(ctx, PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: content, CWD: input.Project.RepoPath}); err != nil {
-		r.logWarn("reviewer reaction add failed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "content": content, "error": err.Error()})
-		return err
-	}
-	return nil
-}
-
-func (r *Runner) tryRemoveReaction(ctx context.Context, input stepInput, content string) error {
-	if err := r.github.RemovePullRequestReaction(ctx, PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: content, CWD: input.Project.RepoPath}); err != nil {
-		r.logWarn("reviewer reaction removal failed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "content": content, "error": err.Error()})
-		return err
-	}
-	return nil
-}
-
 func (r *Runner) nowISO() string {
 	return eventlog.FormatJavaScriptISOString(r.now())
 }
@@ -1535,7 +1514,48 @@ func shouldRestartFromDiscover(status string, failedStep ReviewerStep, failureSu
 	if status != "failed" && status != "interrupted" {
 		return false
 	}
-	return failedStep == stepPublish && strings.Contains(failureSummary, "PR head changed before publish")
+	if failedStep != stepPublish && failedStep != stepReview {
+		return false
+	}
+	return strings.Contains(failureSummary, "PR head changed before publish") || strings.Contains(failureSummary, "review request removed before publish")
+}
+
+func (r *Runner) detectRediscoveryRequired(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (string, bool) {
+	if checkpoint.Snapshot == nil {
+		return "", false
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return "", false
+	}
+	if detail.HeadSHA != "" && checkpoint.Snapshot.HeadSHA != "" && detail.HeadSHA != checkpoint.Snapshot.HeadSHA {
+		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", checkpoint.Snapshot.HeadSHA, detail.HeadSHA), true
+	}
+	if isManualReviewerLoop(input.Loop) {
+		return "", false
+	}
+	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return "", false
+	}
+	if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) {
+		return "review request removed before publish", true
+	}
+	return "", false
+}
+
+func (r *Runner) detectHeadChangeRequired(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (string, bool) {
+	if checkpoint.Snapshot == nil {
+		return "", false
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return "", false
+	}
+	if detail.HeadSHA != "" && checkpoint.Snapshot.HeadSHA != "" && detail.HeadSHA != checkpoint.Snapshot.HeadSHA {
+		return fmt.Sprintf("PR head changed before publish: expected %s, got %s", checkpoint.Snapshot.HeadSHA, detail.HeadSHA), true
+	}
+	return "", false
 }
 
 func stepsFrom(start ReviewerStep) []ReviewerStep {
@@ -1636,13 +1656,16 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 	return fmt.Sprintf("pr:%s:%d", *item.Repo, *item.PRNumber)
 }
 
-func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint) string {
+func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, allowApprove bool, manual bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
 	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
 	phaseInstruction := "This is an implementation review. Focus on code correctness, safety, tests, and maintainability."
 	if phase == "spec" {
 		phaseInstruction = "This is a spec review. Focus on scope, correctness, feasibility, risks, and validation. Do not review implementation details beyond whether the spec is actionable."
 	}
-	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), "Phase: " + phase, phaseInstruction}
+	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), "Phase: " + phase, phaseInstruction, "You must publish the GitHub review yourself by calling the `gh` CLI from the shell. Do not return review JSON for looper to parse; looper will not parse review content or post GitHub comments for you.", fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|actionable -->", idempotencyKey, snapshotHeadSHA(checkpoint)), "Use outcome=clean for clean LGTM reviews and outcome=actionable for reviews requesting changes or giving actionable feedback.", "Run ID for logging only, not for idempotency: " + runID}
+	if checkpoint.Detail != nil && len(checkpoint.Detail.Labels) > 0 {
+		parts = append(parts, "Current labels: "+strings.Join(checkpoint.Detail.Labels, ", "))
+	}
 	if checkpoint.Snapshot != nil {
 		if checkpoint.Snapshot.Title != "" {
 			parts = append(parts, "Title: "+checkpoint.Snapshot.Title)
@@ -1665,128 +1688,83 @@ func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoin
 			parts = append(parts, "Diff:\n"+diff)
 		}
 	}
+	approveInstruction := "Do not approve; submit clean reviews as COMMENT."
+	specLabelInstruction := "Do not transition spec-review labels when clean reviews are submitted as COMMENT."
+	if allowApprove {
+		approveInstruction = "If the review is clean, submit an APPROVE review."
+		specLabelInstruction = "If this is a clean spec review and the PR currently has label `looper:spec-reviewing`, use `gh` to remove `looper:spec-reviewing` and add `looper:spec-ready` after the APPROVE review is posted. Do not change labels for COMMENT or actionable reviews."
+	}
+	existingMarkerEventInstruction := "Only treat an existing marker as satisfying idempotency when that marker is on a COMMENTED PR review. Ignore matching markers on APPROVED reviews and post a new COMMENT review instead."
+	if allowApprove {
+		existingMarkerEventInstruction = "Only treat an existing marker as satisfying idempotency when that marker is on a COMMENTED or APPROVED PR review."
+	}
+	reviewRequestInstruction := "Before posting, confirm the current GitHub user is still requested for review. If not requested, do not post a review; exit non-zero with the exact message `review request removed before publish`."
+	if manual {
+		reviewRequestInstruction = "This is a manual reviewer run, so a current-user review request is not required before posting."
+	}
 	parts = append(parts,
-		"Return detailed GitHub review feedback as raw JSON with this exact shape:\n{\"verdict\":\"clean\"|\"actionable\",\"body\":\"optional overall summary\",\"comments\":[{\"body\":\"required comment text\",\"path\":\"src/file.ts optional for inline comments\",\"line\":123,\"side\":\"RIGHT\",\"startLine\":120,\"startSide\":\"RIGHT\"}]}",
-		"Use verdict=actionable whenever there is any actionable advice.",
+		"Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. If any existing review body already contains `looper:review id=` with the idempotency id and `head=` with the expected head SHA, do not post another review. Instead, inspect the marker's `outcome` and review state: outcome=clean means ensure +1 reaction and spec-ready label transition only when the matching review is APPROVED; outcome=actionable means remove any stale +1 reaction from the current user. Then exit successfully after printing the normal completion marker.",
+		existingMarkerEventInstruction,
+		fmt.Sprintf("GitHub operation contract: use `gh` to submit exactly one PR review for this run. Prefer `gh api repos/%s/pulls/%d/reviews --method POST --input -`, with `commit_id` set to the expected head SHA and `event` set to COMMENT or APPROVE as appropriate.", repo, prNumber),
+		"Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`.",
+		reviewRequestInstruction,
+		"Review body style contract: the visible body must be human-authored review prose only. Never post terminal/tool output, ANSI escape sequences, file-read traces, command logs, JSON parsing artifacts, or your internal scratch work as the GitHub review body. If you do not have concrete prose yet, write a concise clean LGTM body or exit non-zero instead of posting logs.",
+		"Every review body you post must include exactly one stable idempotency marker with id, head, and outcome fields: `<!-- looper:review id=... head=... outcome=clean|actionable -->`.",
+		reviewDisclosureInstruction(disclosureCfg, agentRuntime, agentModel),
+		"If your inline review API call is rejected because of an invalid anchor, retry once with corrected inline anchors. If code-anchored actionable findings still cannot be submitted as resolvable inline review comments, exit non-zero instead of moving them into the review body or creating separate duplicate PR comments.",
+		fmt.Sprintf("For clean reviews, also add a +1 reaction to the PR main conversation with `gh api repos/%s/issues/%d/reactions --method POST -H 'Accept: application/vnd.github+json' -f content=+1`.", repo, prNumber),
+		"For actionable reviews, use `gh` to remove any existing +1 reaction from the current GitHub user on the PR main conversation so stale clean signals do not remain after a new head needs changes.",
+		specLabelInstruction,
+		approveInstruction,
+		"Prefer 3 deeply specific comments over 10 shallow comments. If there is no concrete actionable feedback, post a clean review. Do not invent feedback.",
+		"Every comment MUST include: (1) a location via inline anchor or exact file/section/symbol reference, (2) the concrete problem, (3) why it matters, (4) evidence from the changed lines or spec section, and (5) a specific suggested change.",
 		"Prefer inline comments for specific code-level feedback when you can anchor them confidently to the diff using the changed file path and file line numbers shown in the PR diff.",
-		"Use top-level comments without path/line only for architectural, cross-cutting, or otherwise unanchorable feedback.",
+		"Use top-level comments without path/line only for architectural, cross-cutting, or otherwise unanchorable feedback; top-level comment bodies must still name the exact file, section, symbol, or behavior they refer to.",
 		"Do not repeat the overall body/summary as a comment; comments must add distinct actionable feedback.",
-		"For multiline inline comments, startLine/startSide must identify the first line and line/side the last line; omit startLine/startSide for single-line comments.",
+		"Resolvable inline review comments are required for code-anchored actionable feedback: when a finding refers to specific changed lines and you can identify the changed file path plus RIGHT/LEFT line numbers from the diff, submit it as an inline review comment in the PR review `comments` array, not in the review body and not as a separate issue/PR conversation comment.",
+		"Inline review comments posted through the PR review `comments` array create resolvable GitHub review threads. Top-level review bodies and issue comments are not resolvable; use them only for clean summaries or genuinely cross-cutting/unanchorable feedback.",
+		fmt.Sprintf("When submitting the review with `gh api repos/%s/pulls/%d/reviews --method POST --input -`, include `comments` entries using GitHub's review comment fields: `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, and `body` for the actionable feedback.", repo, prNumber),
+		"For actionable reviews with any anchorable findings, the review body should be a short overview plus markers/disclosure; the detailed findings must live in inline `comments` so maintainers can resolve them individually.",
+		"For multiline inline comments, `start_line`/`start_side` must identify the first line and `line`/`side` the last line; omit `start_line`/`start_side` for single-line comments.",
 		"Write substantially more detail than a brief summary; every comment should explain the problem, why it matters, and the concrete change to make.",
-		"Do not approve. If the review is clean, return verdict=clean with comments=[].",
+		"A comment is invalid if it only names a category (for example, 'gaps around X', 'issues with Y', or 'concerns about Z'), says only 'add tests' without naming the behavior and where the test belongs, lacks a concrete location or section reference, asks a question without proposing a resolution path, or compresses multiple unrelated concerns into one vague summary.",
+		"Bad comment example: 'Spec review found actionable gaps around role-specific trigger schema, auto-discovery gating boundaries, and exact env/config-source behavior.' This is bad because it has no file, line, section, concrete missing requirement, evidence, or suggested wording.",
+		"Good spec/docs comment example: {\"severity\":\"major\",\"category\":\"spec\",\"body\":\"Define the role trigger schema before implementation starts\",\"problem\":\"The spec introduces role-specific triggers but does not define the schema fields or validation rules.\",\"why\":\"Implementers cannot know which fields are required, how defaults behave, or how invalid trigger definitions should fail.\",\"evidence\":\"The Role triggers section describes behavior but does not list fields, defaults, or invalid examples.\",\"suggestedChange\":\"Add a schema table defining role, event, enabled, conditions, defaults, and validation errors, plus one valid and one invalid example.\",\"path\":\"docs/reviewer.md\",\"line\":42,\"side\":\"RIGHT\"}",
+		"Implementation review rubric: check correctness, error handling, tests, concurrency, config compatibility, security, resource lifecycle, observability, migrations, and backward compatibility. Only report issues that are concrete and actionable.",
+		"Spec/docs review rubric: check whether every requirement is testable, schemas are typed/defaulted/validated, config precedence is explicit, failure modes are defined, rollout/backward compatibility is covered, acceptance criteria are present, and ambiguous terms are resolved. For missing spec details, suggest exact wording, section, table, or example content.",
+		"If the review is clean, write a warm, specific LGTM review body that briefly praises what is good about this PR. Keep it concise, genuine, and varied; do not use a generic template if you can reference the actual PR content.",
 	)
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n"))
 }
 
-func parseReviewFeedback(result AgentResult) parsedReviewFeedback {
-	output := extractReviewOutput(result.Stdout)
-	if structured, ok := parseStructuredReviewOutput(output); ok {
-		return structured
+func reviewDisclosureInstruction(disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {
+	if !disclosureCfg.Enabled {
+		return "Looper disclosure stamping is disabled by configuration; do not add looper Markdown disclosure footers or hidden looper stamp markers to GitHub review bodies or inline review comments."
 	}
-	fallback := strings.TrimSpace(firstNonEmpty(result.Summary, summarizeLogs(result.Stdout)))
-	if fallback == "" {
-		return parsedReviewFeedback{}
+	if !disclosureCfg.Channels.ReviewComment {
+		return "Looper review disclosure stamping is disabled by configuration; do not add looper Markdown disclosure footers or hidden looper stamp markers to GitHub review bodies or inline review comments."
 	}
-	return parsedReviewFeedback{Body: fallback, Comments: []reviewFeedbackComment{}, Clean: false}
+	stamper := disclosure.Stamper{Config: disclosureCfg, Version: version.Current().Version, Agent: agentRuntime, Model: agentModel}
+	reviewBodyInstruction := "Every GitHub review body you post must use looper's configured disclosure style: include the hidden stamp marker `" + disclosure.Marker + "` immediately followed by the visible Markdown footer `" + strings.TrimPrefix(stamper.MarkdownStamp("reviewer"), disclosure.Marker+"\n") + "`. Do not write the footer as plain paragraph text."
+	if disclosureCfg.Channels.InlineCommentVisible {
+		return reviewBodyInstruction + " Every inline review comment must include the hidden stamp marker immediately followed by the same visible Markdown footer."
+	}
+	return reviewBodyInstruction + " Inline review comments must use only the hidden `" + disclosure.Marker + "` marker, without a visible disclosure footer."
 }
 
-func extractReviewOutput(stdout string) string {
-	lines := make([]string, 0)
-	for _, line := range strings.Split(stdout, "\n") {
-		if strings.HasPrefix(line, agent.CompletionMarkerPrefix) {
-			continue
-		}
-		lines = append(lines, line)
+func snapshotHeadSHA(checkpoint reviewerCheckpoint) string {
+	if checkpoint.Snapshot != nil {
+		return checkpoint.Snapshot.HeadSHA
 	}
-	return strings.TrimSpace(strings.Join(lines, "\n"))
+	return ""
 }
 
-func parseStructuredReviewOutput(output string) (parsedReviewFeedback, bool) {
-	if strings.TrimSpace(output) == "" {
-		return parsedReviewFeedback{}, false
-	}
-	var payload struct {
-		Verdict  string                  `json:"verdict"`
-		Body     string                  `json:"body"`
-		Comments []reviewFeedbackComment `json:"comments"`
-	}
-	if err := json.Unmarshal([]byte(output), &payload); err != nil {
-		return parsedReviewFeedback{}, false
-	}
-	body := strings.TrimSpace(payload.Body)
-	comments := make([]reviewFeedbackComment, 0, len(payload.Comments))
-	for _, comment := range payload.Comments {
-		normalized := normalizeReviewFeedbackComment(comment)
-		if normalized.Body != "" {
-			comments = append(comments, normalized)
-		}
-	}
-	clean := strings.EqualFold(payload.Verdict, "clean") && len(comments) == 0
-	comments = dedupeReviewFeedbackComments(comments, body)
-	if !clean && len(comments) == 0 && body == "" {
-		return parsedReviewFeedback{}, false
-	}
-	return parsedReviewFeedback{Body: body, Comments: comments, Clean: clean}, true
+func agentNativeReviewID(loopID string, headSHA string) string {
+	return fmt.Sprintf("reviewer:%s:%s", loopID, headSHA)
 }
 
-func normalizeReviewFeedbackComment(comment reviewFeedbackComment) reviewFeedbackComment {
-	comment.Body = strings.TrimSpace(comment.Body)
-	comment.Path = strings.TrimSpace(comment.Path)
-	comment.Side = strings.ToUpper(strings.TrimSpace(comment.Side))
-	comment.StartSide = strings.ToUpper(strings.TrimSpace(comment.StartSide))
-	if comment.Body == "" {
-		return reviewFeedbackComment{}
-	}
-	if (comment.Path != "" && (comment.Line <= 0 || (comment.Side != "LEFT" && comment.Side != "RIGHT"))) || (comment.Path == "" && (comment.Line > 0 || comment.Side != "" || comment.StartLine > 0 || comment.StartSide != "")) {
-		return reviewFeedbackComment{Body: comment.Body}
-	}
-	if (comment.StartLine > 0 || comment.StartSide != "") && (comment.StartLine <= 0 || (comment.StartSide != "LEFT" && comment.StartSide != "RIGHT")) {
-		return reviewFeedbackComment{Body: comment.Body}
-	}
-	if comment.StartLine > 0 && comment.Line > 0 && comment.StartLine >= comment.Line {
-		return reviewFeedbackComment{Body: comment.Body}
-	}
-	return comment
-}
-
-func normalizePendingReviewCheckpoint(pending pendingReviewCheckpoint) pendingReviewCheckpoint {
-	if pending.PublishState == nil {
-		pending.PublishState = &publishState{}
-	}
-	if pending.Comments == nil {
-		pending.Comments = []reviewFeedbackComment{}
-	}
-	if pending.PublishState.TopLevelCommentsPosted == 0 {
-		pending.Comments = dedupeReviewFeedbackComments(pending.Comments, pending.Body)
-	}
-	return pending
-}
-
-func dedupeReviewFeedbackComments(comments []reviewFeedbackComment, body string) []reviewFeedbackComment {
-	if len(comments) == 0 {
-		return []reviewFeedbackComment{}
-	}
-	result := make([]reviewFeedbackComment, 0, len(comments))
-	seenTopLevel := map[string]struct{}{}
-	for _, comment := range comments {
-		if comment.Body == "" {
-			continue
-		}
-		if isInlineReviewFeedbackComment(comment) {
-			result = append(result, comment)
-			continue
-		}
-		key := normalizedReviewFeedbackText(comment.Body)
-		if key == "" || key == normalizedReviewFeedbackText(body) {
-			continue
-		}
-		if _, ok := seenTopLevel[key]; ok {
-			continue
-		}
-		seenTopLevel[key] = struct{}{}
-		result = append(result, comment)
-	}
-	return result
+func agentNativeReviewMarker(loopID string, headSHA string) string {
+	return fmt.Sprintf("looper:review id=%s head=%s", agentNativeReviewID(loopID, headSHA), headSHA)
 }
 
 func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project storage.ProjectRecord, checkpoint *reviewerCheckpoint) {
@@ -1845,95 +1823,7 @@ func pullRequestHeadRef(prNumber int64) string {
 
 func (p pendingReviewCheckpoint) clone() *pendingReviewCheckpoint {
 	copyValue := p
-	copyValue.Comments = append([]reviewFeedbackComment(nil), p.Comments...)
-	if p.PublishState != nil {
-		stateCopy := *p.PublishState
-		copyValue.PublishState = &stateCopy
-	}
 	return &copyValue
-}
-
-func summarizeLogs(stdout string) string {
-	lines := make([]string, 0)
-	for _, line := range strings.Split(stdout, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, agent.CompletionMarkerPrefix) {
-			continue
-		}
-		lines = append(lines, trimmed)
-	}
-	return strings.Join(lines, "\n")
-}
-
-func hasInlineComments(comments []reviewFeedbackComment) bool {
-	for _, comment := range comments {
-		if isInlineReviewFeedbackComment(comment) {
-			return true
-		}
-	}
-	return false
-}
-
-func inlineComments(comments []reviewFeedbackComment) []reviewFeedbackComment {
-	result := make([]reviewFeedbackComment, 0)
-	for _, comment := range comments {
-		if isInlineReviewFeedbackComment(comment) {
-			result = append(result, comment)
-		}
-	}
-	return result
-}
-
-func topLevelComments(comments []reviewFeedbackComment) []reviewFeedbackComment {
-	result := make([]reviewFeedbackComment, 0)
-	for _, comment := range comments {
-		if comment.Path == "" || comment.Line <= 0 || comment.Side == "" {
-			result = append(result, comment)
-		}
-	}
-	return result
-}
-
-func isInlineReviewFeedbackComment(comment reviewFeedbackComment) bool {
-	return comment.Path != "" && comment.Line > 0 && comment.Side != ""
-}
-
-func isDuplicateTopLevelReviewComment(comment reviewFeedbackComment, body string) bool {
-	if isInlineReviewFeedbackComment(comment) {
-		return false
-	}
-	key := normalizedReviewFeedbackText(comment.Body)
-	return key != "" && key == normalizedReviewFeedbackText(body)
-}
-
-func normalizedReviewFeedbackText(value string) string {
-	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
-}
-
-func toGitHubReviewComments(comments []reviewFeedbackComment) []ReviewComment {
-	result := make([]ReviewComment, 0, len(comments))
-	for _, comment := range comments {
-		result = append(result, ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
-	}
-	return result
-}
-
-func downgradeInlineCommentToTopLevel(comment reviewFeedbackComment) reviewFeedbackComment {
-	location := comment.Path
-	if comment.StartLine > 0 && comment.Line > 0 && comment.StartLine != comment.Line {
-		location = fmt.Sprintf("%s:%d-%d", comment.Path, comment.StartLine, comment.Line)
-	} else if comment.Line > 0 {
-		location = fmt.Sprintf("%s:%d", comment.Path, comment.Line)
-	}
-	if location == "" {
-		return reviewFeedbackComment{Body: comment.Body}
-	}
-	return reviewFeedbackComment{Body: fmt.Sprintf("Inline comment fallback (%s):\n\n%s", location, comment.Body)}
-}
-
-func isInlineReviewAnchorFailure(err error) bool {
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "validation failed") && strings.Contains(message, "pull request review thread") && (strings.Contains(message, "line") || strings.Contains(message, "path") || strings.Contains(message, "diff") || strings.Contains(message, "side"))
 }
 
 func backoffDelay(base time.Duration, attempts int64) time.Duration {
@@ -1946,13 +1836,6 @@ func backoffDelay(base time.Duration, attempts int64) time.Duration {
 
 func isRetryableFailure(kind QueueFailureKind) bool {
 	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume
-}
-
-func ternaryReviewEvent(clean bool) ReviewEvent {
-	if clean {
-		return ReviewEventApprove
-	}
-	return ReviewEventComment
 }
 
 func cloneStrings(values []string) []string {
@@ -2015,10 +1898,6 @@ func resolvePullRequestPhase(labels []string) string {
 		return "spec"
 	}
 	return "implementation"
-}
-
-func isSpecReviewClean(detail PullRequestDetail) bool {
-	return specpr.IsReviewClean(detail.ReviewDecision, detail.Comments)
 }
 
 func detailLabels(detail *checkpointDetail) []string {

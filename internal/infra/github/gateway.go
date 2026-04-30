@@ -131,6 +131,22 @@ type ReviewComment struct {
 	StartSide string
 }
 
+type VerifyReviewMarkerInput struct {
+	Repo                string
+	PRNumber            int64
+	Marker              string
+	AllowedReviewEvents []string
+	AuthorLogin         string
+	CWD                 string
+}
+
+type ReviewMarkerResult struct {
+	Found       bool
+	Outcome     string
+	Event       string
+	AuthorLogin string
+}
+
 type PullRequestReactionInput struct {
 	Repo     string
 	PRNumber int64
@@ -542,6 +558,123 @@ func (g *Gateway) AddPullRequestComment(ctx context.Context, input PullRequestCo
 	return err
 }
 
+func (g *Gateway) HasReviewMarker(ctx context.Context, input VerifyReviewMarkerInput) (bool, error) {
+	marker, err := g.FindReviewMarker(ctx, input)
+	if err != nil {
+		return false, err
+	}
+	return marker.Found, nil
+}
+
+func (g *Gateway) FindReviewMarker(ctx context.Context, input VerifyReviewMarkerInput) (ReviewMarkerResult, error) {
+	if strings.TrimSpace(input.Marker) == "" {
+		return ReviewMarkerResult{}, nil
+	}
+	reviewsResult, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/reviews", input.Repo, input.PRNumber))
+	if err != nil {
+		return ReviewMarkerResult{}, err
+	}
+	return findAllowedReviewMarker(reviewsResult.Stdout, input.Marker, input.AllowedReviewEvents, input.AuthorLogin), nil
+}
+
+func jsonBodiesContainAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string) bool {
+	return findAllowedReviewMarker(raw, marker, allowedReviewEvents, "").Found
+}
+
+func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string, authorLogin string) ReviewMarkerResult {
+	expectedAuthorLogin := normalizeReviewMarkerLogin(authorLogin)
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(raw), &rows); err != nil {
+		var pages [][]map[string]any
+		if err := json.Unmarshal([]byte(raw), &pages); err != nil {
+			if expectedAuthorLogin == "" && len(allowedReviewEvents) == 0 && strings.Contains(raw, marker) {
+				return ReviewMarkerResult{Found: true, Outcome: reviewMarkerOutcome(raw, marker)}
+			}
+			return ReviewMarkerResult{}
+		}
+		for _, page := range pages {
+			rows = append(rows, page...)
+		}
+	}
+	var newest ReviewMarkerResult
+	for _, row := range rows {
+		body, ok := row["body"].(string)
+		if !ok || !strings.Contains(body, marker) {
+			continue
+		}
+		author := reviewAuthorLogin(row)
+		if expectedAuthorLogin != "" && normalizeReviewMarkerLogin(author) != expectedAuthorLogin {
+			continue
+		}
+		event := reviewEventFromStateString(row["state"])
+		if len(allowedReviewEvents) == 0 || reviewEventAllowed(event, allowedReviewEvents) {
+			newest = ReviewMarkerResult{Found: true, Outcome: reviewMarkerOutcome(body, marker), Event: event, AuthorLogin: author}
+		}
+	}
+	return newest
+}
+
+func reviewAuthorLogin(row map[string]any) string {
+	user, _ := row["user"].(map[string]any)
+	login, _ := user["login"].(string)
+	return login
+}
+
+func normalizeReviewMarkerLogin(login string) string {
+	return strings.ToLower(strings.TrimSpace(login))
+}
+
+func reviewMarkerOutcome(body string, marker string) string {
+	idx := strings.Index(body, marker)
+	if idx < 0 {
+		return ""
+	}
+	segment := body[idx:]
+	if end := strings.Index(segment, "-->"); end >= 0 {
+		segment = segment[:end]
+	}
+	matches := regexp.MustCompile(`\boutcome=(clean|actionable)\b`).FindStringSubmatch(segment)
+	if len(matches) == 2 {
+		return matches[1]
+	}
+	return ""
+}
+
+func reviewStateAllowed(raw any, allowedReviewEvents []string) bool {
+	event := reviewEventFromStateString(raw)
+	return reviewEventAllowed(event, allowedReviewEvents)
+}
+
+func reviewEventFromStateString(raw any) string {
+	state, _ := raw.(string)
+	return reviewEventFromState(state)
+}
+
+func reviewEventAllowed(event string, allowedReviewEvents []string) bool {
+	if event == "" {
+		return false
+	}
+	for _, allowed := range allowedReviewEvents {
+		if strings.EqualFold(event, allowed) {
+			return true
+		}
+	}
+	return false
+}
+
+func reviewEventFromState(state string) string {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "APPROVED":
+		return "APPROVE"
+	case "COMMENTED":
+		return "COMMENT"
+	case "CHANGES_REQUESTED":
+		return "REQUEST_CHANGES"
+	default:
+		return ""
+	}
+}
+
 func (g *Gateway) AddPullRequestReaction(ctx context.Context, input PullRequestReactionInput) error {
 	_, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/reactions", input.Repo, input.PRNumber), "--method", "POST", "-H", "Accept: application/vnd.github+json", "-f", "content="+input.Content)
 	return err
@@ -555,11 +688,11 @@ func (g *Gateway) RemovePullRequestReaction(ctx context.Context, input PullReque
 	if currentLogin == "" {
 		return nil
 	}
-	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d/reactions", input.Repo, input.PRNumber), "-H", "Accept: application/vnd.github+json")
+	result, err := g.runGh(ctx, input.CWD, "", "api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/reactions", input.Repo, input.PRNumber), "-H", "Accept: application/vnd.github+json")
 	if err != nil {
 		return err
 	}
-	rows, err := decodeJSONArray(result.Stdout)
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
 	if err != nil {
 		return err
 	}
@@ -1092,6 +1225,24 @@ func decodeJSONArray(value string) ([]map[string]any, error) {
 		return []map[string]any{}, nil
 	}
 	return out, nil
+}
+
+func decodeJSONArrayOrPages(value string) ([]map[string]any, error) {
+	rows, err := decodeJSONArray(value)
+	if err == nil {
+		return rows, nil
+	}
+	var pages [][]map[string]any
+	if pageErr := json.Unmarshal([]byte(value), &pages); pageErr != nil {
+		return nil, err
+	}
+	for _, page := range pages {
+		rows = append(rows, page...)
+	}
+	if rows == nil {
+		return []map[string]any{}, nil
+	}
+	return rows, nil
 }
 
 func invalidJSONError(stdout string, err error) error {

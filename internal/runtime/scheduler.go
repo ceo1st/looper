@@ -261,19 +261,16 @@ func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, i
 	return a.gateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
 }
 
-func (a reviewerGitHubAdapter) SubmitReview(ctx context.Context, input reviewer.SubmitReviewInput) error {
-	comments := make([]githubinfra.ReviewComment, 0, len(input.Comments))
-	for _, comment := range input.Comments {
-		body := a.stamper.ReviewComment(comment.Body, "reviewer")
-		comments = append(comments, githubinfra.ReviewComment{Body: body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
+func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input reviewer.VerifyReviewMarkerInput) (reviewer.ReviewMarkerResult, error) {
+	allowedReviewEvents := make([]string, 0, len(input.AllowedReviewEvents))
+	for _, event := range input.AllowedReviewEvents {
+		allowedReviewEvents = append(allowedReviewEvents, string(event))
 	}
-	body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelReviewComment)
-	return a.gateway.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, Event: string(input.Event), Body: body, CommitID: input.CommitID, Comments: comments, CWD: input.CWD})
-}
-
-func (a reviewerGitHubAdapter) AddPullRequestComment(ctx context.Context, input reviewer.PullRequestCommentInput) error {
-	body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelIssueComment)
-	return a.gateway.AddPullRequestComment(ctx, githubinfra.PullRequestCommentInput{Repo: input.Repo, PRNumber: input.PRNumber, Body: body, CWD: input.CWD})
+	marker, err := a.gateway.FindReviewMarker(ctx, githubinfra.VerifyReviewMarkerInput{Repo: input.Repo, PRNumber: input.PRNumber, Marker: input.Marker, AllowedReviewEvents: allowedReviewEvents, AuthorLogin: input.AuthorLogin, CWD: input.CWD})
+	if err != nil {
+		return reviewer.ReviewMarkerResult{}, err
+	}
+	return reviewer.ReviewMarkerResult{Found: marker.Found, Outcome: marker.Outcome, Event: reviewer.ReviewEvent(marker.Event), AuthorLogin: marker.AuthorLogin}, nil
 }
 
 func (a reviewerGitHubAdapter) AddPullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
@@ -721,6 +718,14 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		Logger:           logger,
 		Now:              now,
 		AllowAutoApprove: cfg.Defaults.AllowAutoApprove,
+		Disclosure:       &cfg.Disclosure,
+		AgentRuntime: func() string {
+			if cfg.Agent.Vendor == nil {
+				return ""
+			}
+			return string(*cfg.Agent.Vendor)
+		}(),
+		AgentModel:       cfg.Agent.Model,
 		RetryBaseDelay:   retryBaseDelay,
 		RetryMaxAttempts: int64(cfg.Scheduler.RetryMaxAttempts),
 		OnAgentExecutionStarted: func(ctx context.Context, input reviewer.AgentExecutionStartedInput) error {

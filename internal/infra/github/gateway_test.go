@@ -55,7 +55,7 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 			return shell.Result{Stdout: "{}"}, nil
 		case args == "api repos/acme/looper/issues/42/reactions --method POST -H Accept: application/vnd.github+json -f content=eyes":
 			return shell.Result{Stdout: "{}"}, nil
-		case args == "api repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json":
+		case args == "api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json":
 			return shell.Result{Stdout: `[{"id":7,"content":"eyes","user":{"login":"reviewer"}}]`}, nil
 		case args == "api repos/acme/looper/issues/42/reactions/7 --method DELETE -H Accept: application/vnd.github+json":
 			return shell.Result{Stdout: "{}"}, nil
@@ -185,6 +185,7 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 		"api repos/acme/looper/pulls/42/reviews --method POST --input -",
 		"pr comment 42 --repo acme/looper --body High-level follow-up",
 		"api repos/acme/looper/issues/42/reactions --method POST -H Accept: application/vnd.github+json -f content=eyes",
+		"api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json",
 		"api repos/acme/looper/issues/42/reactions/7 --method DELETE -H Accept: application/vnd.github+json",
 		"pr list --repo acme/looper --state open --limit 30 --label phase-1",
 		"issue list --repo acme/looper --state open --limit 30 --assignee reviewer --label phase-1",
@@ -223,6 +224,196 @@ func TestGatewayResolveReviewThreadReturnsNotFound(t *testing.T) {
 	err := gateway.ResolveReviewThread(context.Background(), ResolveReviewThreadInput{Repo: "acme/looper", ThreadID: "thread-missing"})
 	if _, ok := err.(*ReviewThreadNotFoundError); !ok {
 		t.Fatalf("ResolveReviewThread() error = %v, want *ReviewThreadNotFoundError", err)
+	}
+}
+
+func TestGatewayHasReviewMarkerIgnoresIssueComments(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch args {
+		case "api --paginate --slurp repos/acme/looper/pulls/42/reviews":
+			return shell.Result{Stdout: `[{"body":"review without marker"}]`}, nil
+		case "api --paginate --slurp repos/acme/looper/issues/42/comments":
+			t.Fatalf("HasReviewMarker must not accept markers from issue comments")
+		}
+		t.Fatalf("unexpected gh args: %q", args)
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	found, err := gateway.HasReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc"})
+	if err != nil {
+		t.Fatalf("HasReviewMarker() error = %v", err)
+	}
+	if found {
+		t.Fatal("HasReviewMarker() = true, want false without marker in PR reviews")
+	}
+}
+
+func TestGatewayHasReviewMarkerRequiresAllowedReviewEvent(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[{"state":"APPROVED","body":"<!-- looper:stamp v=1 -->\nlooper:review id=abc"}]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	found, err := gateway.HasReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc", AllowedReviewEvents: []string{"COMMENT"}})
+	if err != nil {
+		t.Fatalf("HasReviewMarker() error = %v", err)
+	}
+	if found {
+		t.Fatal("HasReviewMarker() = true, want false for disallowed approval marker")
+	}
+	found, err = gateway.HasReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc", AllowedReviewEvents: []string{"COMMENT", "APPROVE"}})
+	if err != nil {
+		t.Fatalf("HasReviewMarker() error = %v", err)
+	}
+	if !found {
+		t.Fatal("HasReviewMarker() = false, want true when approval is allowed")
+	}
+}
+
+func TestGatewayHasReviewMarkerAllowsChangesRequestedReviewEvent(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[{"state":"CHANGES_REQUESTED","body":"<!-- looper:stamp v=1 -->\nlooper:review id=abc"}]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	found, err := gateway.HasReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc", AllowedReviewEvents: []string{"REQUEST_CHANGES"}})
+	if err != nil {
+		t.Fatalf("HasReviewMarker() error = %v", err)
+	}
+	if !found {
+		t.Fatal("HasReviewMarker() = false, want true when request-changes review is allowed")
+	}
+}
+
+func TestGatewayHasReviewMarkerReadsSlurpedPaginatedReviews(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[[{"state":"COMMENTED","body":"review without marker"}],[{"state":"APPROVED","body":"<!-- looper:stamp v=1 -->\nlooper:review id=abc"}]]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	found, err := gateway.HasReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc", AllowedReviewEvents: []string{"APPROVE"}})
+	if err != nil {
+		t.Fatalf("HasReviewMarker() error = %v", err)
+	}
+	if !found {
+		t.Fatal("HasReviewMarker() = false, want true for marker in slurped paginated reviews")
+	}
+}
+
+func TestGatewayFindReviewMarkerExtractsOutcomeFromMatchedMarker(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[{"state":"COMMENTED","body":"This prose mentions outcome=clean but is not the marker.\n<!-- looper:review id=abc head=def outcome=actionable -->"}]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	marker, err := gateway.FindReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc head=def", AllowedReviewEvents: []string{"COMMENT"}})
+	if err != nil {
+		t.Fatalf("FindReviewMarker() error = %v", err)
+	}
+	if !marker.Found || marker.Outcome != "actionable" || marker.Event != "COMMENT" {
+		t.Fatalf("FindReviewMarker() = %#v, want actionable COMMENT marker from matched marker", marker)
+	}
+}
+
+func TestGatewayFindReviewMarkerReturnsNewestMatchingMarker(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[
+				{"state":"COMMENTED","body":"<!-- looper:review id=abc head=def outcome=actionable -->"},
+				{"state":"APPROVED","body":"<!-- looper:review id=abc head=def outcome=clean -->"},
+				{"state":"COMMENTED","body":"<!-- looper:review id=abc head=def outcome=clean -->"}
+			]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	marker, err := gateway.FindReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc head=def", AllowedReviewEvents: []string{"COMMENT"}})
+	if err != nil {
+		t.Fatalf("FindReviewMarker() error = %v", err)
+	}
+	if !marker.Found || marker.Outcome != "clean" || marker.Event != "COMMENT" {
+		t.Fatalf("FindReviewMarker() = %#v, want newest matching COMMENT marker", marker)
+	}
+}
+
+func TestGatewayFindReviewMarkerRequiresAuthorLogin(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if strings.Join(options.Args, " ") == "api --paginate --slurp repos/acme/looper/pulls/42/reviews" {
+			return shell.Result{Stdout: `[
+				{"state":"COMMENTED","user":{"login":"other-bot"},"body":"<!-- looper:review id=abc head=def outcome=clean -->"},
+				{"state":"COMMENTED","user":{"login":"reviewer-bot"},"body":"<!-- looper:review id=abc head=def outcome=actionable -->"}
+			]`}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	marker, err := gateway.FindReviewMarker(context.Background(), VerifyReviewMarkerInput{Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc head=def", AllowedReviewEvents: []string{"COMMENT"}, AuthorLogin: "Reviewer-Bot"})
+	if err != nil {
+		t.Fatalf("FindReviewMarker() error = %v", err)
+	}
+	if !marker.Found || marker.Outcome != "actionable" || marker.AuthorLogin != "reviewer-bot" {
+		t.Fatalf("FindReviewMarker() = %#v, want marker authored by reviewer-bot", marker)
+	}
+}
+
+func TestGatewayRemovePullRequestReactionReadsSlurpedPaginatedReactions(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		switch strings.Join(options.Args, " ") {
+		case "api user --jq .login":
+			return shell.Result{Stdout: "reviewer\n"}, nil
+		case "api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json":
+			return shell.Result{Stdout: `[[{"id":6,"content":"+1","user":{"login":"someoneelse"}}],[{"id":7,"content":"+1","user":{"login":"reviewer"}}]]`}, nil
+		case "api repos/acme/looper/issues/42/reactions/7 --method DELETE -H Accept: application/vnd.github+json":
+			return shell.Result{Stdout: "{}"}, nil
+		}
+		t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+		return shell.Result{}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.RemovePullRequestReaction(context.Background(), PullRequestReactionInput{Repo: "acme/looper", PRNumber: 42, Content: "+1"}); err != nil {
+		t.Fatalf("RemovePullRequestReaction() error = %v", err)
+	}
+	if !strings.Contains(strings.Join(runner.calls, "\n"), "reactions/7 --method DELETE") {
+		t.Fatalf("gh calls = %#v, want deletion of paginated current-user reaction", runner.calls)
 	}
 }
 
