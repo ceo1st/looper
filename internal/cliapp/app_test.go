@@ -878,6 +878,89 @@ func TestConfigGetReadsConfigFileLayer(t *testing.T) {
 	}
 }
 
+func TestConfigGetSupportsInstructionKeys(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"instructions": map[string]any{
+			"enabled":  false,
+			"maxBytes": 4096,
+		},
+		"roles": map[string]any{
+			"planner":  map[string]any{"instructions": "plan carefully"},
+			"reviewer": map[string]any{"instructions": "review carefully"},
+			"fixer":    map[string]any{"instructions": "fix carefully"},
+			"worker":   map[string]any{"instructions": "work carefully"},
+		},
+	})
+
+	tests := map[string]string{
+		"instructions.enabled":        "false",
+		"instructions.maxBytes":       "4096",
+		"roles.planner.instructions":  "plan carefully",
+		"roles.reviewer.instructions": "review carefully",
+		"roles.fixer.instructions":    "fix carefully",
+		"roles.worker.instructions":   "work carefully",
+	}
+	for key, want := range tests {
+		key, want := key, want
+		t.Run(key, func(t *testing.T) {
+			exitCode, stdout, stderr := runApp(t, "config", "get", key, "--config", configPath)
+			if exitCode != 0 {
+				t.Fatalf("Run([config get %s]) exit code = %d, want 0; stderr=%q", key, exitCode, stderr)
+			}
+			if strings.TrimSpace(stdout) != want {
+				t.Fatalf("stdout = %q, want %q", stdout, want)
+			}
+		})
+	}
+}
+
+func TestConfigSetUnsetInstructionKeys(t *testing.T) {
+	configPath := writeEditableCLIConfig(t)
+
+	exitCode, stdout, stderr := runApp(t, "config", "set", "roles.reviewer.instructions", "review carefully", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set reviewer instructions]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Set roles.reviewer.instructions") {
+		t.Fatalf("stdout = %q, want set confirmation", stdout)
+	}
+
+	exitCode, stdout, stderr = runApp(t, "config", "get", "roles.reviewer.instructions", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config get reviewer instructions]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if strings.TrimSpace(stdout) != "review carefully" {
+		t.Fatalf("stdout = %q, want reviewer instructions", stdout)
+	}
+
+	exitCode, stdout, stderr = runApp(t, "config", "set", "instructions.maxBytes", "4096", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set instructions.maxBytes]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Set instructions.maxBytes") {
+		t.Fatalf("stdout = %q, want set confirmation", stdout)
+	}
+
+	exitCode, stdout, stderr = runApp(t, "config", "unset", "roles.reviewer.instructions", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config unset reviewer instructions]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Unset roles.reviewer.instructions") {
+		t.Fatalf("stdout = %q, want unset confirmation", stdout)
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(raw), "review carefully") {
+		t.Fatalf("config = %s, want reviewer instructions removed", raw)
+	}
+}
+
 func TestConfigSetRejectsInvalidKeyAndValue(t *testing.T) {
 	configPath := writeEditableCLIConfig(t)
 
@@ -946,6 +1029,29 @@ func TestConfigValidateAndShowSource(t *testing.T) {
 	}
 	if got, want := allowRisky["value"], false; got != want {
 		t.Fatalf("value = %#v, want %#v", got, want)
+	}
+
+	exitCode, stdout, stderr = runApp(t, "config", "show", "--source", "--no-custom-instructions=false", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source --no-custom-instructions=false]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	decoded = map[string]any{}
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("unmarshal source output with CLI instructions override: %v", err)
+	}
+	fields, ok = decoded["fields"].(map[string]any)
+	if !ok {
+		t.Fatalf("fields = %#v, want object", decoded["fields"])
+	}
+	instructionsEnabled, ok := fields["instructions.enabled"].(map[string]any)
+	if !ok {
+		t.Fatalf("instructions.enabled = %#v, want object", fields["instructions.enabled"])
+	}
+	if got, want := instructionsEnabled["source"], "cli"; got != want {
+		t.Fatalf("instructions.enabled source = %#v, want %#v", got, want)
+	}
+	if got, want := instructionsEnabled["value"], true; got != want {
+		t.Fatalf("instructions.enabled value = %#v, want %#v", got, want)
 	}
 }
 
@@ -1084,6 +1190,14 @@ func TestConfigSetWarnsWhenFlagOverridesWrittenValue(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "warning: --fix-all-pull-requests is set") {
 		t.Fatalf("stderr = %q, want override warning", stderr)
+	}
+
+	exitCode, _, stderr = runApp(t, "config", "set", "instructions.enabled", "true", "--no-custom-instructions", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config set instructions.enabled with override]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "warning: --no-custom-instructions is set") {
+		t.Fatalf("stderr = %q, want instructions override warning", stderr)
 	}
 }
 
