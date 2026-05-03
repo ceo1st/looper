@@ -86,6 +86,8 @@ type PullRequestSummary struct {
 	ReviewDecision string
 	Labels         []string
 	HeadSHA        string
+	BaseSHA        string
+	HasConflicts   bool
 	Author         string
 	ReviewRequests []string
 }
@@ -400,14 +402,16 @@ type ProcessResult struct {
 }
 
 type reviewerCheckpoint struct {
-	ResumePolicy     string                      `json:"resumePolicy,omitempty"`
-	Detail           *checkpointDetail           `json:"detail,omitempty"`
-	ClaimedLockKey   string                      `json:"claimedLockKey,omitempty"`
-	Snapshot         *checkpointSnapshot         `json:"snapshot,omitempty"`
-	Worktree         *checkpointWorktree         `json:"worktree,omitempty"`
-	ThreadResolution *threadResolutionCheckpoint `json:"threadResolution,omitempty"`
-	PendingReview    *pendingReviewCheckpoint    `json:"pendingReview,omitempty"`
-	SkipReason       string                      `json:"skipReason,omitempty"`
+	ResumePolicy      string                      `json:"resumePolicy,omitempty"`
+	Detail            *checkpointDetail           `json:"detail,omitempty"`
+	ClaimedLockKey    string                      `json:"claimedLockKey,omitempty"`
+	Snapshot          *checkpointSnapshot         `json:"snapshot,omitempty"`
+	Worktree          *checkpointWorktree         `json:"worktree,omitempty"`
+	ThreadResolution  *threadResolutionCheckpoint `json:"threadResolution,omitempty"`
+	PendingReview     *pendingReviewCheckpoint    `json:"pendingReview,omitempty"`
+	SkipReason        string                      `json:"skipReason,omitempty"`
+	SkipKind          string                      `json:"skipKind,omitempty"`
+	SkipReviewerLogin string                      `json:"skipReviewerLogin,omitempty"`
 }
 
 type checkpointDetail struct {
@@ -607,6 +611,21 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		meta := parseJSONObject(loopResult.record.MetadataJSON)
 		_, hasPublishedHead := stringFromAny(meta["lastPublishedHeadSha"])
 		if !r.loopEnabled(meta) && (!loopResult.created || hasPublishedHead) {
+			result.Skipped++
+			return nil
+		}
+		if reviewerDiscoverySuppressedByLastSkip(meta, pr, currentLogin) {
+			result.Skipped++
+			return nil
+		}
+		if reviewerLastSkipNeedsCurrentLogin(meta, pr) && currentLogin == "" {
+			lookupLogin, lookupErr := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+			if lookupErr != nil {
+				lookupLogin = ""
+			}
+			currentLogin = normalizeLogin(lookupLogin)
+		}
+		if reviewerDiscoverySuppressedByLastSkip(meta, pr, currentLogin) {
 			result.Skipped++
 			return nil
 		}
@@ -1118,10 +1137,12 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	if !r.discoveryPolicy.IncludeDrafts && checkpoint.Detail.IsDraft {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped draft pull request %s#%d", input.Repo, input.PRNumber)
+		checkpoint.SkipKind = "draft"
 		return checkpoint, nil
 	}
 	if normalizePRState(checkpoint.Detail.State) != "open" {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped non-open pull request %s#%d", input.Repo, input.PRNumber)
+		checkpoint.SkipKind = "non_open"
 		if err := r.terminateLoop(ctx, input.Loop, "pr_closed_or_merged"); err != nil {
 			return checkpoint, err
 		}
@@ -1129,6 +1150,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnApproved && strings.EqualFold(strings.TrimSpace(checkpoint.Detail.ReviewDecision), "APPROVED") {
 		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for approved pull request %s#%d", input.Repo, input.PRNumber)
+		checkpoint.SkipKind = "approved"
 		if err := r.terminateLoop(ctx, input.Loop, "approved"); err != nil {
 			return checkpoint, err
 		}
@@ -1136,6 +1158,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnReadyLabel && specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
 		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for ready pull request %s#%d", input.Repo, input.PRNumber)
+		checkpoint.SkipKind = "ready_label"
 		if err := r.terminateLoop(ctx, input.Loop, "ready_label"); err != nil {
 			return checkpoint, err
 		}
@@ -1143,6 +1166,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	if checkpoint.Detail.HasConflicts {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped conflicted pull request %s#%d", input.Repo, input.PRNumber)
+		checkpoint.SkipKind = "conflicted"
 		return checkpoint, nil
 	}
 	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 {
@@ -1152,17 +1176,21 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		if hasReviewByAuthorForHead(checkpoint.Detail.Reviews, currentLogin, checkpoint.Detail.HeadSHA) {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user already reviewed head %s", input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA)
+			checkpoint.SkipKind = "already_reviewed_by_current_user"
+			checkpoint.SkipReviewerLogin = normalizeLogin(currentLogin)
 			return checkpoint, nil
 		}
 	}
 	meta := parseJSONObject(input.Loop.MetadataJSON)
 	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && checkpoint.Detail.HeadSHA != "" && last == checkpoint.Detail.HeadSHA {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped already-reviewed head %s for %s#%d", checkpoint.Detail.HeadSHA, input.Repo, input.PRNumber)
+		checkpoint.SkipKind = "already_published_head"
 		return checkpoint, nil
 	}
 	if r.loopEnabled(meta) {
 		if reason := r.loopBudgetTerminationReason(input.Loop, checkpoint.Detail.HeadSHA); reason != "" {
 			checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for %s#%d: %s", input.Repo, input.PRNumber, reason)
+			checkpoint.SkipKind = reason
 			if err := r.terminateLoop(ctx, input.Loop, reason); err != nil {
 				return checkpoint, err
 			}
@@ -1176,6 +1204,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		if !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, normalizeLogin(currentLogin)) {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
+			checkpoint.SkipKind = "not_requested"
 			return checkpoint, nil
 		}
 	}
@@ -2580,6 +2609,68 @@ func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, err
 	return string(encoded), nil
 }
 
+func reviewerDiscoverySuppressedByLastSkip(meta map[string]any, pr PullRequestSummary, currentLogin string) bool {
+	raw, _ := meta["lastFilterSkip"].(map[string]any)
+	if raw == nil {
+		return false
+	}
+	kind, _ := stringFromAny(raw["kind"])
+	if !isDiscoverySuppressingSkipKind(kind) {
+		return false
+	}
+	headSHA, _ := stringFromAny(raw["headSha"])
+	if headSHA == "" || pr.HeadSHA == "" || headSHA != pr.HeadSHA {
+		return false
+	}
+	if kind == "already_reviewed_by_current_user" {
+		reviewerLogin, _ := stringFromAny(raw["reviewerLogin"])
+		if normalizeLogin(reviewerLogin) == "" || normalizeLogin(currentLogin) == "" || normalizeLogin(reviewerLogin) != normalizeLogin(currentLogin) {
+			return false
+		}
+	}
+	switch kind {
+	case "conflicted":
+		if !pr.HasConflicts {
+			return false
+		}
+	case "ready_label":
+		if label, ok := stringFromAny(raw["requiredLabel"]); ok && label != "" && !specpr.HasLabel(pr.Labels, label) {
+			return false
+		}
+	case "approved":
+		if decision, ok := stringFromAny(raw["reviewDecision"]); ok && decision != "" && !strings.EqualFold(strings.TrimSpace(pr.ReviewDecision), decision) {
+			return false
+		}
+	case "draft":
+		if draft, ok := raw["isDraft"].(bool); ok && draft != pr.IsDraft {
+			return false
+		}
+	}
+	return true
+}
+
+func reviewerLastSkipNeedsCurrentLogin(meta map[string]any, pr PullRequestSummary) bool {
+	raw, _ := meta["lastFilterSkip"].(map[string]any)
+	if raw == nil {
+		return false
+	}
+	kind, _ := stringFromAny(raw["kind"])
+	if kind != "already_reviewed_by_current_user" {
+		return false
+	}
+	headSHA, _ := stringFromAny(raw["headSha"])
+	return headSHA != "" && pr.HeadSHA != "" && headSHA == pr.HeadSHA
+}
+
+func isDiscoverySuppressingSkipKind(kind string) bool {
+	switch kind {
+	case "conflicted", "already_reviewed_by_current_user", "already_published_head", "draft", "approved", "ready_label":
+		return true
+	default:
+		return false
+	}
+}
+
 func (r *Runner) loopEnabled(meta map[string]any) bool {
 	if enabled, ok := meta["followUpdates"].(bool); ok {
 		return enabled
@@ -2819,9 +2910,47 @@ func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerC
 	if loopMeta["terminationReason"] == nil {
 		loopMeta["status"] = "waiting"
 	}
+	if checkpoint.SkipReason != "" {
+		delete(meta, "lastFilterSkip")
+		if skip := filterSkipMetadata(checkpoint, r.nowISO()); skip != nil {
+			meta["lastFilterSkip"] = skip
+		}
+	} else {
+		delete(meta, "lastFilterSkip")
+	}
 	meta["loop"] = loopMeta
 	encoded, err := json.Marshal(meta)
 	return string(encoded), err
+}
+
+func filterSkipMetadata(checkpoint reviewerCheckpoint, recordedAt string) map[string]any {
+	if checkpoint.Detail == nil || !isDiscoverySuppressingSkipKind(checkpoint.SkipKind) {
+		return nil
+	}
+	metadata := map[string]any{
+		"kind":       checkpoint.SkipKind,
+		"reason":     checkpoint.SkipReason,
+		"recordedAt": recordedAt,
+	}
+	if checkpoint.Detail.HeadSHA != "" {
+		metadata["headSha"] = checkpoint.Detail.HeadSHA
+	}
+	if checkpoint.SkipKind == "draft" && checkpoint.Detail.IsDraft {
+		metadata["isDraft"] = true
+	}
+	if checkpoint.SkipKind == "approved" && checkpoint.Detail.ReviewDecision != "" {
+		metadata["reviewDecision"] = strings.TrimSpace(checkpoint.Detail.ReviewDecision)
+	}
+	if checkpoint.SkipKind == "conflicted" && checkpoint.Detail.HasConflicts {
+		metadata["hasConflicts"] = true
+	}
+	if checkpoint.SkipKind == "ready_label" {
+		metadata["requiredLabel"] = specpr.ReadyLabel
+	}
+	if checkpoint.SkipKind == "already_reviewed_by_current_user" && checkpoint.SkipReviewerLogin != "" {
+		metadata["reviewerLogin"] = normalizeLogin(checkpoint.SkipReviewerLogin)
+	}
+	return metadata
 }
 
 func loopSuccessOutputFingerprint(checkpoint reviewerCheckpoint, summary string) string {
@@ -2944,7 +3073,7 @@ func containsAnyString(values []any, target string) bool {
 }
 
 func summaryFromDetail(detail PullRequestDetail) PullRequestSummary {
-	return PullRequestSummary{Number: detail.Number, Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests)}
+	return PullRequestSummary{Number: detail.Number, Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HasConflicts: detail.HasConflicts, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests)}
 }
 
 func normalizePRState(value string) string {
