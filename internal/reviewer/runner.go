@@ -1815,8 +1815,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	if result.Status != "completed" {
 		if reason, ok := r.detectHeadChangeRequired(ctx, input, checkpoint); ok {
-			checkpoint.ResumePolicy = "restart_from_discover"
-			return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume}
+			return markReviewerRunStale(checkpoint, reason), nil
 		}
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -1826,8 +1825,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, nil
 		}
 		if reason, ok := r.detectRediscoveryRequired(ctx, input, checkpoint); ok {
-			checkpoint.ResumePolicy = "restart_from_discover"
-			return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume}
+			return markReviewerRunStale(checkpoint, reason), nil
 		}
 		message := firstNonEmpty(result.Summary, result.Stderr, fmt.Sprintf("Reviewer agent %s", result.Status))
 		kind := FailureRetryableTransient
@@ -1845,12 +1843,10 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, nil
 		}
 		if reason, ok := rediscoverySignalFromAgentResult(result, !isManualReviewerLoop(input.Loop) && policy.RequireReviewRequest); ok {
-			checkpoint.ResumePolicy = "restart_from_discover"
-			return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume}
+			return markReviewerRunStale(checkpoint, reason), nil
 		}
 		if reason, ok := r.detectRediscoveryRequired(ctx, input, checkpoint); ok {
-			checkpoint.ResumePolicy = "restart_from_discover"
-			return checkpoint, &loopError{message: reason, kind: FailureRetryableAfterResume}
+			return markReviewerRunStale(checkpoint, reason), nil
 		}
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureNonRetryable}
 	}
@@ -1898,7 +1894,10 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
-			return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA), kind: FailureRetryableAfterResume}
+			return markReviewerRunStale(checkpoint, fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA)), nil
+		}
+		if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
+			return markReviewerRunStale(checkpoint, reason), nil
 		}
 		policy := r.discoveryPolicyForProject(input.Project.ID)
 		if !isManualReviewerLoop(input.Loop) && policy.RequireReviewRequest {
@@ -1951,7 +1950,10 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
-		return checkpoint, &loopError{message: fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA), kind: FailureRetryableAfterResume}
+		return markReviewerRunStale(checkpoint, fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA)), nil
+	}
+	if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
+		return markReviewerRunStale(checkpoint, reason), nil
 	}
 	markerResult := ReviewMarkerResult{}
 	if pending.Event == reviewEventAgentNative {
@@ -2031,6 +2033,40 @@ func cleanReviewMarkerSatisfiesCleanPolicy(marker ReviewMarkerResult, prAuthorLo
 		return true
 	}
 	return marker.Found && marker.Event == ReviewEventComment && strings.EqualFold(strings.TrimSpace(marker.Outcome), "clean") && len(marker.InlineCommentBodies) == 0 && sameReviewAuthorLogin(marker.AuthorLogin, prAuthorLogin)
+}
+
+func markReviewerRunStale(checkpoint reviewerCheckpoint, reason string) reviewerCheckpoint {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "PR drift detected before publish"
+	}
+	checkpoint.SkipReason = reason
+	checkpoint.SkipKind = "stale"
+	checkpoint.PendingReview = nil
+	checkpoint.ResumePolicy = ""
+	return checkpoint
+}
+
+func reviewerPublishDriftReason(input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail) string {
+	if state := normalizePRState(detail.State); state != "" && state != "open" {
+		observed := strings.ToUpper(strings.TrimSpace(detail.State))
+		if observed == "" {
+			observed = strings.ToUpper(state)
+		}
+		return fmt.Sprintf("PR drift detected before publish: expected PR state OPEN, observed %s for %s#%d", observed, input.Repo, input.PRNumber)
+	}
+	if checkpoint.Detail != nil {
+		if checkpoint.Detail.IsDraft != detail.IsDraft {
+			return fmt.Sprintf("PR drift detected before publish: draft status changed from %t to %t for %s#%d", checkpoint.Detail.IsDraft, detail.IsDraft, input.Repo, input.PRNumber)
+		}
+		if checkpoint.Detail.BaseRefName != "" && detail.BaseRefName != "" && checkpoint.Detail.BaseRefName != detail.BaseRefName {
+			return fmt.Sprintf("PR base branch changed before publish: expected %s, got %s", checkpoint.Detail.BaseRefName, detail.BaseRefName)
+		}
+		if checkpoint.Detail.HeadRefName != "" && detail.HeadRefName != "" && checkpoint.Detail.HeadRefName != detail.HeadRefName {
+			return fmt.Sprintf("PR head branch changed before publish: expected %s, got %s", checkpoint.Detail.HeadRefName, detail.HeadRefName)
+		}
+	}
+	return ""
 }
 
 func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail, marker ReviewMarkerResult) error {
