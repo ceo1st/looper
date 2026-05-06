@@ -437,16 +437,17 @@ type ProcessResult struct {
 }
 
 type reviewerCheckpoint struct {
-	ResumePolicy      string                      `json:"resumePolicy,omitempty"`
-	Detail            *checkpointDetail           `json:"detail,omitempty"`
-	ClaimedLockKey    string                      `json:"claimedLockKey,omitempty"`
-	Snapshot          *checkpointSnapshot         `json:"snapshot,omitempty"`
-	Worktree          *checkpointWorktree         `json:"worktree,omitempty"`
-	ThreadResolution  *threadResolutionCheckpoint `json:"threadResolution,omitempty"`
-	PendingReview     *pendingReviewCheckpoint    `json:"pendingReview,omitempty"`
-	SkipReason        string                      `json:"skipReason,omitempty"`
-	SkipKind          string                      `json:"skipKind,omitempty"`
-	SkipReviewerLogin string                      `json:"skipReviewerLogin,omitempty"`
+	ResumePolicy                 string                      `json:"resumePolicy,omitempty"`
+	Detail                       *checkpointDetail           `json:"detail,omitempty"`
+	ClaimedLockKey               string                      `json:"claimedLockKey,omitempty"`
+	Snapshot                     *checkpointSnapshot         `json:"snapshot,omitempty"`
+	Worktree                     *checkpointWorktree         `json:"worktree,omitempty"`
+	ThreadResolution             *threadResolutionCheckpoint `json:"threadResolution,omitempty"`
+	ThreadResolutionFollowUpOnly bool                        `json:"threadResolutionFollowUpOnly,omitempty"`
+	PendingReview                *pendingReviewCheckpoint    `json:"pendingReview,omitempty"`
+	SkipReason                   string                      `json:"skipReason,omitempty"`
+	SkipKind                     string                      `json:"skipKind,omitempty"`
+	SkipReviewerLogin            string                      `json:"skipReviewerLogin,omitempty"`
 }
 
 type checkpointDetail struct {
@@ -767,7 +768,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		if !isManualReviewerLoop(loop) && policy.RequireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) {
+		if !isManualReviewerLoop(loop) && policy.RequireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) && !r.hasThreadResolutionFollowUpCandidate(ctx, project.RepoPath, input.Repo, *loop.PRNumber, detail.HeadSHA, currentLogin) {
 			result.Skipped++
 			continue
 		}
@@ -1241,9 +1242,13 @@ func (r *Runner) runDiscoverStep(ctx context.Context, input stepInput) (reviewer
 		return input.Checkpoint, err
 	}
 	checkpoint := input.Checkpoint
-	checkpoint.Detail = &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests), HasConflicts: detail.HasConflicts, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Reviews: cloneObjectSlice(detail.Reviews)}
+	checkpoint.Detail = checkpointDetailFromDetail(detail)
 	checkpoint.ResumePolicy = "replay_step"
 	return checkpoint, nil
+}
+
+func checkpointDetailFromDetail(detail PullRequestDetail) *checkpointDetail {
+	return &checkpointDetail{Title: detail.Title, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: cloneStrings(detail.ReviewRequests), HasConflicts: detail.HasConflicts, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Reviews: cloneObjectSlice(detail.Reviews)}
 }
 
 func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
@@ -1332,6 +1337,10 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 			checkpoint.Detail.CurrentLogin = currentLogin
 		}
 		if !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, currentLogin) {
+			if r.hasThreadResolutionFollowUpCandidate(ctx, input.Project.RepoPath, input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA, currentLogin) {
+				checkpoint.ThreadResolutionFollowUpOnly = true
+				return checkpoint, nil
+			}
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
 			checkpoint.SkipKind = "not_requested"
 			return checkpoint, nil
@@ -1597,10 +1606,6 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 	}
 	currentLogin = normalizeLogin(currentLogin)
-	if policy.RequireCurrentReviewRequest && !isCurrentUserRequested(checkpoint.Detail.ReviewRequests, currentLogin) {
-		r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, "skipped", "current_user_not_requested", "", "skipped", "current_user_not_requested")
-		return checkpoint, nil
-	}
 	limit := policy.MaxThreadsPerRun
 	if limit <= 0 {
 		limit = 10
@@ -1641,7 +1646,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 			decision = threadResolutionAgentDecision{ThreadID: thread.ID, Decision: "needs_human", Evidence: "no classifier decision returned", Confidence: "low"}
 		}
 		result.Processed++
-		auditedForHead := hasThreadResolutionAuditForHead(thread, checkpoint.Snapshot.HeadSHA)
+		auditedForHead := hasSufficientThreadResolutionAuditForDecision(policy, thread, checkpoint.Snapshot.HeadSHA, decision)
 		commented := false
 		resolved := false
 		skippedReason := ""
@@ -1706,6 +1711,32 @@ func markThreadResolutionRediscoveryOnRefreshError(checkpoint reviewerCheckpoint
 		checkpoint.ResumePolicy = "restart_from_discover"
 	}
 	return checkpoint
+}
+
+func (r *Runner) hasThreadResolutionFollowUpCandidate(ctx context.Context, cwd, repo string, prNumber int64, headSHA, currentLogin string) bool {
+	policy := r.threadResolution
+	if !policy.Enabled || policy.RequireCurrentReviewRequest || r.github == nil || strings.TrimSpace(headSHA) == "" || strings.TrimSpace(currentLogin) == "" {
+		return false
+	}
+	limit := policy.MaxThreadsPerRun
+	if limit <= 0 {
+		limit = 10
+	}
+	fetchLimit := limit * 5
+	if fetchLimit < 100 {
+		fetchLimit = 100
+	}
+	threads, err := r.github.ListReviewThreads(ctx, ListReviewThreadsInput{Repo: repo, PRNumber: prNumber, CWD: cwd, Limit: fetchLimit})
+	if err != nil {
+		r.logWarn("reviewer thread resolution follow-up candidate lookup failed", map[string]any{"repo": repo, "prNumber": prNumber, "error": err.Error()})
+		return false
+	}
+	for _, thread := range threads {
+		if r.threadResolutionCandidate(thread, headSHA, currentLogin, policy) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Runner) threadResolutionCandidate(thread ReviewThread, headSHA, currentLogin string, policy config.ReviewerThreadResolutionConfig) bool {
@@ -1882,6 +1913,13 @@ func hasThreadResolutionAuditForHead(thread ReviewThread, headSHA string) bool {
 	return false
 }
 
+func hasSufficientThreadResolutionAuditForDecision(policy config.ReviewerThreadResolutionConfig, thread ReviewThread, headSHA string, decision threadResolutionAgentDecision) bool {
+	if policy.Mode == config.ReviewerThreadResolutionModeResolveObjective && isObjectiveThreadResolutionDecision(decision) {
+		return hasObjectiveThreadResolutionAuditForHead(thread, thread.ID, headSHA)
+	}
+	return hasThreadResolutionAuditForHead(thread, headSHA)
+}
+
 func hasObjectiveThreadResolutionAuditForHead(thread ReviewThread, threadID, headSHA string) bool {
 	for _, comment := range thread.Comments {
 		body := comment.Body
@@ -1985,6 +2023,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	var err error
 	if checkpoint.PendingReview != nil {
 		return checkpoint, nil
+	}
+	if skipped, next, err := r.skipThreadResolutionFollowUpReview(ctx, input, checkpoint); skipped || err != nil {
+		return next, err
 	}
 	if checkpoint.Snapshot == nil {
 		return checkpoint, &loopError{message: "Missing PR snapshot checkpoint for review step", kind: FailureRetryableTransient}
@@ -2181,6 +2222,10 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
 		return markReviewerRunStale(checkpoint, reason), nil
 	}
+	checkpoint.Detail = checkpointDetailFromDetail(detail)
+	if skipped, next, err := r.skipThreadResolutionFollowUpReview(ctx, input, checkpoint); skipped || err != nil {
+		return next, err
+	}
 	markerResult := ReviewMarkerResult{}
 	if pending.Event == reviewEventAgentNative {
 		found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(checkpoint, detail))
@@ -2194,12 +2239,12 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, &loopError{message: "Legacy pending review checkpoint cannot be verified; rerunning review before marking publish success", kind: FailureRetryableAfterResume}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	if !isManualReviewerLoop(input.Loop) && policy.RequireReviewRequest {
+	if !isManualReviewerLoop(input.Loop) && policy.RequireReviewRequest && !markerResult.Found {
 		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
-		if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) && !markerResult.Found {
+		if !isCurrentUserRequested(detail.ReviewRequests, normalizeLogin(currentLogin)) {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", repo, prNumber)
 			return checkpoint, nil
 		}
@@ -2237,6 +2282,32 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, err
 	}
 	return checkpoint, nil
+}
+
+func (r *Runner) skipThreadResolutionFollowUpReview(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint) (bool, reviewerCheckpoint, error) {
+	if !checkpoint.ThreadResolutionFollowUpOnly {
+		return false, checkpoint, nil
+	}
+	policy := r.discoveryPolicyForProject(input.Project.ID)
+	if isManualReviewerLoop(input.Loop) || !policy.RequireReviewRequest || checkpoint.Detail == nil {
+		return false, checkpoint, nil
+	}
+	currentLogin := strings.TrimSpace(checkpoint.Detail.CurrentLogin)
+	if currentLogin == "" {
+		lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		if err != nil {
+			return false, checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		}
+		currentLogin = normalizeLogin(lookupLogin)
+		checkpoint.Detail.CurrentLogin = currentLogin
+	}
+	if isCurrentUserRequested(checkpoint.Detail.ReviewRequests, currentLogin) {
+		return false, checkpoint, nil
+	}
+	checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
+	checkpoint.SkipKind = "not_requested"
+	checkpoint.PendingReview = nil
+	return true, checkpoint, nil
 }
 
 func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepInput, headSHA string, idempotencyKey string, prAuthorLogin string) (ReviewMarkerResult, error) {
