@@ -305,16 +305,17 @@ type GitGateway interface {
 }
 
 type AgentRunInput struct {
-	ExecutionID      string
-	ProjectID        string
-	LoopID           string
-	RunID            string
-	Prompt           string
-	WorkingDirectory string
-	Timeout          time.Duration
-	HeartbeatTimeout time.Duration
-	Metadata         map[string]any
-	IdempotencyKey   string
+	ExecutionID        string
+	ProjectID          string
+	LoopID             string
+	RunID              string
+	Prompt             string
+	NativeResumePrompt string
+	WorkingDirectory   string
+	Timeout            time.Duration
+	HeartbeatTimeout   time.Duration
+	Metadata           map[string]any
+	IdempotencyKey     string
 }
 
 type AgentResult struct {
@@ -1229,6 +1230,7 @@ func (r *Runner) executeStepWithTransientExternalRetry(ctx context.Context, step
 	checkpoint := input.Checkpoint
 	var err error
 	for attempt := int64(1); attempt <= maxAttempts; attempt++ {
+		input.Checkpoint = checkpoint
 		checkpoint, err = r.executeStepOnce(ctx, step, input)
 		if err == nil {
 			if attempt > 1 {
@@ -1240,6 +1242,9 @@ func (r *Runner) executeStepWithTransientExternalRetry(ctx context.Context, step
 			break
 		}
 		delay := retryDelay(r.retryBaseDelay, attempt, err)
+		if r.shouldSkipTransientRetryDelayForNativeResume(ctx, input.Loop.ID, err) {
+			delay = 0
+		}
 		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
 			r.logWarn("reviewer transient external retry budget exhausted", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "queueItemId": input.QueueItem.ID, "step": string(step), "attempt": attempt, "maxAttempts": maxAttempts, "retryDelay": delay.String(), "error": err.Error()})
 			break
@@ -1834,6 +1839,9 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 	slices.Sort(candidateIDs)
 	idempotencyKey := fmt.Sprintf("reviewer-thread-resolution:%s:%d:%s:%s", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, strings.Join(candidateIDs, ","))
 	prompt := buildThreadResolutionPrompt(input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, threads)
+	if r.hasPendingNativeResume(ctx, input.Loop.ID) {
+		prompt = nativeResumeContinuationPrompt("thread-resolution", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, idempotencyKey)
+	}
 	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: map[string]any{"loopType": "reviewer", "phase": "thread_resolution", "repo": input.Repo, "prNumber": input.PRNumber}, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return nil, err
@@ -1844,18 +1852,25 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 	if err != nil {
 		r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.failed", "thread_resolution", executionID, reviewerAgentWaitErrorPayload(err, r.now().Sub(agentStartedAt)))
 		r.logWarn("reviewer agent wait failed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "phase": "thread_resolution", "executionId": executionID, "elapsedSeconds": durationSeconds(r.now().Sub(agentStartedAt)), "error": err.Error()})
+		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, err.Error())
 		return nil, err
 	}
 	r.appendReviewerAgentEvent(ctx, input, reviewerAgentTerminalEvent(result), "thread_resolution", executionID, reviewerAgentResultPayload(result, r.now().Sub(agentStartedAt)))
 	r.logInfo("reviewer agent completed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "phase": "thread_resolution", "executionId": executionID, "status": result.Status, "timeoutType": result.TimeoutType, "elapsedSeconds": elapsedSeconds(result, r.now().Sub(agentStartedAt)), "parseStatus": result.ParseStatus})
 	if result.Status != "completed" {
-		return nil, &loopError{message: reviewerAgentFailureMessage("thread resolution", result, "thread resolution classifier failed"), kind: FailureRetryableTransient}
+		message := reviewerAgentFailureMessage("thread resolution", result, "thread resolution classifier failed")
+		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
+		return nil, &loopError{message: message, kind: FailureRetryableTransient}
 	}
 	parsed, err := parseThreadResolutionOutput(result.Stdout)
-	if err != nil {
-		return nil, &loopError{message: err.Error(), kind: FailureNonRetryable}
+	if err == nil {
+		return parsed.Decisions, nil
 	}
-	return parsed.Decisions, nil
+	if message := transientProviderMessageFromAgentResult(result); message != "" {
+		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
+		return nil, &loopError{message: message, kind: FailureRetryableTransient}
+	}
+	return nil, &loopError{message: err.Error(), kind: FailureNonRetryable}
 }
 
 func buildThreadResolutionPrompt(repo string, prNumber int64, headSHA string, threads []ReviewThread) string {
@@ -2080,11 +2095,15 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	idempotencyKey := agentNativeReviewID(input.Loop.ID, checkpoint.Snapshot.HeadSHA)
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.effectiveReviewEvents(input.Loop.MetadataJSON), isManualReviewerLoop(input.Loop), policy.RequireReviewRequest, r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath)
+	nativeResumePrompt := ""
+	if r.hasPendingNativeResume(ctx, input.Loop.ID) {
+		nativeResumePrompt = nativeResumeContinuationPrompt("review", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, idempotencyKey)
+	}
 	metadata := map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 		metadata[key] = value
 	}
-	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey})
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, NativeResumePrompt: nativeResumePrompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey})
 	if err != nil {
 		return checkpoint, err
 	}
@@ -2109,6 +2128,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if err != nil {
 		r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.failed", "review", executionID, reviewerAgentWaitErrorPayload(err, r.now().Sub(agentStartedAt)))
 		r.logWarn("reviewer agent wait failed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "phase": "review", "executionId": executionID, "elapsedSeconds": durationSeconds(r.now().Sub(agentStartedAt)), "error": err.Error()})
+		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, err.Error())
 		return checkpoint, err
 	}
 	r.appendReviewerAgentEvent(ctx, input, reviewerAgentTerminalEvent(result), "review", executionID, reviewerAgentResultPayload(result, r.now().Sub(agentStartedAt)))
@@ -2134,6 +2154,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		} else if agent.IsAgentSetupFailureMessage(message) {
 			kind = FailureManualIntervention
 		}
+		if kind == FailureRetryableTransient {
+			r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
+		}
 		return checkpoint, &loopError{message: message, kind: kind}
 	}
 	if result.ParseStatus != "parsed" {
@@ -2149,6 +2172,10 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		if reason, ok := r.detectRediscoveryRequired(ctx, input, checkpoint); ok {
 			return markReviewerRunStale(checkpoint, reason), nil
+		}
+		if message := transientProviderMessageFromAgentResult(result); message != "" {
+			r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
+			return checkpoint, &loopError{message: message, kind: FailureRetryableTransient}
 		}
 		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, MarkerVerificationMisses: 1}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
@@ -3331,6 +3358,136 @@ func (r *Runner) isTransientExternalFailure(err error) bool {
 		return loopErr.kind == FailureRetryableTransient && isTransientModelProviderMessage(loopErr.message)
 	}
 	return false
+}
+
+func (r *Runner) markAgentExecutionNativeResumePendingForTransientProvider(ctx context.Context, executionID string, message string) bool {
+	if strings.TrimSpace(executionID) == "" || !isTransientModelProviderMessage(message) || r.repos == nil || r.repos.AgentExecutions == nil {
+		return false
+	}
+	record, err := r.repos.AgentExecutions.GetByID(ctx, executionID)
+	if err != nil {
+		r.logWarn("reviewer native resume source lookup failed", map[string]any{"executionId": executionID, "error": err.Error()})
+		return false
+	}
+	if record == nil || record.NativeSessionID == nil || strings.TrimSpace(*record.NativeSessionID) == "" {
+		return false
+	}
+	if record.NativeResumeStatus != nil && *record.NativeResumeStatus == "pending" {
+		return true
+	}
+	record.NativeResumeMode = stringPtr("native_resume")
+	record.NativeResumeStatus = stringPtr("pending")
+	record.NativeResumeError = stringPtr(strings.TrimSpace(message))
+	record.UpdatedAt = r.nowISO()
+	if err := r.repos.AgentExecutions.Upsert(ctx, *record); err != nil {
+		r.logWarn("reviewer native resume source mark failed", map[string]any{"executionId": executionID, "error": err.Error()})
+		return false
+	}
+	r.logInfo("reviewer native resume retry queued", map[string]any{"executionId": executionID, "loopId": derefString(record.LoopID), "runId": derefString(record.RunID)})
+	return true
+}
+
+func (r *Runner) hasPendingNativeResume(ctx context.Context, loopID string) bool {
+	if strings.TrimSpace(loopID) == "" || r.repos == nil || r.repos.AgentExecutions == nil {
+		return false
+	}
+	latest, err := r.repos.AgentExecutions.GetLatestByLoopID(ctx, loopID)
+	if err != nil {
+		r.logWarn("reviewer native resume pending lookup failed", map[string]any{"loopId": loopID, "error": err.Error()})
+		return false
+	}
+	return r.isResumableNativeSession(latest)
+}
+
+func (r *Runner) shouldSkipTransientRetryDelayForNativeResume(ctx context.Context, loopID string, err error) bool {
+	return isTransientModelProviderOverloadFailure(err) && r.hasPendingNativeResume(ctx, loopID)
+}
+
+func isTransientModelProviderOverloadFailure(err error) bool {
+	if err == nil || githubinfra.IsTransientError(err) {
+		return false
+	}
+	var loopErr *loopError
+	if errors.As(err, &loopErr) {
+		return loopErr.kind == FailureRetryableTransient && isTransientModelProviderOverloadMessage(loopErr.message)
+	}
+	return isTransientModelProviderOverloadMessage(err.Error())
+}
+
+func isTransientModelProviderOverloadMessage(message string) bool {
+	message = strings.ToLower(message)
+	for _, fragment := range []string{
+		"server_is_overloaded",
+		"service_unavailable_error",
+		"overloaded_error",
+		"server is overloaded",
+		"overloaded",
+		"http 529",
+		"status code: 529",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Runner) isResumableNativeSession(latest *storage.AgentExecutionRecord) bool {
+	if latest == nil || latest.NativeSessionID == nil || strings.TrimSpace(*latest.NativeSessionID) == "" {
+		return false
+	}
+	if !isRecoverableReviewerNativeResumeSource(latest.Status, latest.NativeResumeStatus) {
+		return false
+	}
+	currentVendor := config.AgentVendor(strings.TrimSpace(r.agentRuntime))
+	if currentVendor == "" {
+		return true
+	}
+	return nativeResumeSupportedForReviewer(currentVendor) && latest.Vendor == string(currentVendor)
+}
+
+func nativeResumeSupportedForReviewer(vendor config.AgentVendor) bool {
+	switch vendor {
+	case config.AgentVendorClaudeCode, config.AgentVendorCodex, config.AgentVendorOpenCode, config.AgentVendorCursorCLI:
+		return true
+	default:
+		return false
+	}
+}
+
+func isRecoverableReviewerNativeResumeSource(status string, resumeStatus *string) bool {
+	if resumeStatus == nil || *resumeStatus != "pending" {
+		return false
+	}
+	switch status {
+	case "running", "cancelling", "killed", "timeout", "failed", "completed":
+		return true
+	default:
+		return false
+	}
+}
+
+func nativeResumeContinuationPrompt(phase string, repo string, prNumber int64, headSHA string, idempotencyKey string) string {
+	return fmt.Sprintf(`Continue the existing Looper reviewer %s task in this resumed native session.
+
+Do not restart from scratch or ask for more context. Reuse the prior session context and continue from the transient provider interruption.
+
+Before any GitHub side effect, re-check the current PR/head/idempotency guards from the existing instructions:
+- PR: %s#%d
+- expected head SHA: %s
+- idempotency key: %s
+
+If the review or thread-resolution result was already posted, report the existing completion marker instead of posting a duplicate.`, strings.TrimSpace(phase), repo, prNumber, headSHA, idempotencyKey)
+}
+
+func transientProviderMessageFromAgentResult(result AgentResult) string {
+	for _, candidate := range []string{result.Summary, result.Stderr} {
+		candidate = strings.TrimSpace(candidate)
+		if isTransientModelProviderMessage(candidate) {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func (r *Runner) nowISO() string {

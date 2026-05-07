@@ -4004,6 +4004,110 @@ func TestRunReviewStepUsesStableIdempotencyKeyAcrossRuns(t *testing.T) {
 	}
 }
 
+func TestRunReviewStepKeepsFullPromptForPendingNativeResumeFallback(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Looks good", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AgentRuntime: string(config.AgentVendorOpenCode)})
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_native_resume_prompt", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_native_resume_prompt", LoopID: loop.ID, Status: "running", StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_previous_overload", ProjectID: stringPtr(project.ID), LoopID: stringPtr(loop.ID), RunID: stringPtr(run.ID), Vendor: string(config.AgentVendorOpenCode), Status: "completed", NativeSessionID: stringPtr("session-123"), NativeResumeStatus: stringPtr("pending"), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	_, err = runner.runReviewStep(ctx, stepInput{
+		Project:  *project,
+		Loop:     loop,
+		Run:      run,
+		Repo:     repo,
+		PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "feature/review-me", PreparedAt: fixture.nowISO()},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runReviewStep() error = %v", err)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) = %d, want 1", len(agent.starts))
+	}
+	prompt := agent.starts[0].Prompt
+	if strings.Contains(prompt, "Continue the existing Looper reviewer review task") {
+		t.Fatalf("prompt = %q, want full review prompt for checkpoint fallback safety", prompt)
+	}
+	if !strings.Contains(prompt, "Review pull request") && !strings.Contains(prompt, "Minimal PR seed") {
+		t.Fatalf("prompt = %q, want full review prompt for checkpoint fallback safety", prompt)
+	}
+	nativeResumePrompt := agent.starts[0].NativeResumePrompt
+	if !strings.Contains(nativeResumePrompt, "Continue the existing Looper reviewer review task") || !strings.Contains(nativeResumePrompt, "idempotency key: reviewer:loop_native_resume_prompt:abc123") {
+		t.Fatalf("native resume prompt = %q, want short native resume continuation prompt", nativeResumePrompt)
+	}
+}
+
+func TestRunReviewStepUsesFullPromptWhenPendingNativeResumeVendorDiffers(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Looks good", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AgentRuntime: string(config.AgentVendorOpenCode)})
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_native_resume_vendor_mismatch", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_native_resume_vendor_mismatch", LoopID: loop.ID, Status: "running", StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_previous_codex_overload", ProjectID: stringPtr(project.ID), LoopID: stringPtr(loop.ID), RunID: stringPtr(run.ID), Vendor: string(config.AgentVendorCodex), Status: "completed", NativeSessionID: stringPtr("session-123"), NativeResumeStatus: stringPtr("pending"), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	_, err = runner.runReviewStep(ctx, stepInput{
+		Project:  *project,
+		Loop:     loop,
+		Run:      run,
+		Repo:     repo,
+		PRNumber: prNumber,
+		Checkpoint: reviewerCheckpoint{
+			Detail:   &checkpointDetail{HeadRefName: "feature/review-me", BaseRefName: "main"},
+			Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "feature/review-me", PreparedAt: fixture.nowISO()},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runReviewStep() error = %v", err)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("len(agent.starts) = %d, want 1", len(agent.starts))
+	}
+	prompt := agent.starts[0].Prompt
+	if strings.Contains(prompt, "Continue the existing Looper reviewer review task") {
+		t.Fatalf("prompt = %q, want full review prompt when native resume is not compatible", prompt)
+	}
+	if !strings.Contains(prompt, "Review pull request") && !strings.Contains(prompt, "Minimal PR seed") {
+		t.Fatalf("prompt = %q, want full review prompt when native resume is not compatible", prompt)
+	}
+}
+
 func TestRunReviewStepPersistsRepreparedWorktreeBeforeAgentStart(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -4389,6 +4493,99 @@ func TestRetryDelayAddsBoundedJitter(t *testing.T) {
 		if got < wantMin || got > wantMax {
 			t.Fatalf("retryDelay(jittered) = %v, want between %v and %v", got, wantMin, wantMax)
 		}
+	}
+}
+
+func TestMarkAgentExecutionNativeResumePendingForTransientProvider(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	loopID := "loop_native_resume"
+	runID := "run_native_resume"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_native_resume", ProjectID: stringPtr("project_1"), LoopID: stringPtr(loopID), RunID: stringPtr(runID), Vendor: string(config.AgentVendorOpenCode), Status: "completed", NativeSessionID: stringPtr("session-123"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	if !runner.markAgentExecutionNativeResumePendingForTransientProvider(ctx, "agent_native_resume", `{"type":"error","error":{"code":"server_is_overloaded"}}`) {
+		t.Fatalf("markAgentExecutionNativeResumePendingForTransientProvider() = false, want true")
+	}
+	record, err := fixture.repos.AgentExecutions.GetByID(ctx, "agent_native_resume")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record.NativeResumeMode == nil || *record.NativeResumeMode != "native_resume" || record.NativeResumeStatus == nil || *record.NativeResumeStatus != "pending" {
+		t.Fatalf("native resume fields = mode:%v status:%v, want native_resume/pending", record.NativeResumeMode, record.NativeResumeStatus)
+	}
+	if !runner.hasPendingNativeResume(ctx, loopID) {
+		t.Fatalf("hasPendingNativeResume() = false, want true")
+	}
+}
+
+func TestNativeResumeImmediateRetryRequiresCurrentProviderOverload(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	loopID := "loop_native_resume_delay"
+	runID := "run_native_resume_delay"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_native_resume_delay", ProjectID: stringPtr("project_1"), LoopID: stringPtr(loopID), RunID: stringPtr(runID), Vendor: string(config.AgentVendorOpenCode), Status: "completed", NativeSessionID: stringPtr("session-123"), NativeResumeStatus: stringPtr("pending"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	if !runner.shouldSkipTransientRetryDelayForNativeResume(ctx, loopID, fmt.Errorf("service_unavailable_error: server_is_overloaded")) {
+		t.Fatalf("provider overload with pending native resume should skip retry delay")
+	}
+	if runner.shouldSkipTransientRetryDelayForNativeResume(ctx, loopID, &githubinfra.TransientError{Err: fmt.Errorf("GitHub GraphQL HTTP 504")}) {
+		t.Fatalf("GitHub transient failure should keep retry delay even with pending native resume")
+	}
+	if runner.shouldSkipTransientRetryDelayForNativeResume(ctx, loopID, &loopError{message: "GraphQL request failed with HTTP 504", kind: FailureRetryableTransient}) {
+		t.Fatalf("non-provider transient loop error should keep retry delay even with pending native resume")
+	}
+}
+
+func TestMarkAgentExecutionNativeResumePendingRequiresSessionAndProviderError(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	loopID := "loop_no_session"
+	runID := "run_no_session"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_no_session", ProjectID: stringPtr("project_1"), LoopID: stringPtr(loopID), RunID: stringPtr(runID), Vendor: string(config.AgentVendorOpenCode), Status: "failed", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+	if runner.markAgentExecutionNativeResumePendingForTransientProvider(ctx, "agent_no_session", "server_is_overloaded") {
+		t.Fatalf("mark without native session = true, want false")
+	}
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_non_provider", ProjectID: stringPtr("project_1"), LoopID: stringPtr(loopID), RunID: stringPtr(runID), Vendor: string(config.AgentVendorOpenCode), Status: "failed", NativeSessionID: stringPtr("session-123"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+	if runner.markAgentExecutionNativeResumePendingForTransientProvider(ctx, "agent_non_provider", "permission denied") {
+		t.Fatalf("mark non-provider failure = true, want false")
 	}
 }
 
@@ -5580,6 +5777,49 @@ func TestRunThreadResolutionStepCommentsAndResolvesObjectiveLooperThread(t *test
 	}
 	if len(agent.starts) != 1 || !strings.Contains(agent.starts[0].IdempotencyKey, "thread_1") {
 		t.Fatalf("agent starts = %#v, want thread id in idempotency key", agent.starts)
+	}
+}
+
+func TestRunThreadResolutionStepIgnoresProviderWordsInSuccessfulSummaryJSON(t *testing.T) {
+	t.Parallel()
+	policy := defaultThreadResolutionPolicy(t)
+	policy.Enabled = true
+	policy.Mode = config.ReviewerThreadResolutionModeCommentOnly
+	jsonOutput := `{"decisions":[{"threadId":"thread_1","decision":"needs_human","evidence":"the previous report mentioned service unavailable and overloaded capacity","confidence":"high"}]}`
+	github := &fakeGitHubGateway{currentLogin: "looper-bot", reviewRequests: []string{"looper-bot"}, reviewThreads: []ReviewThread{{ID: "thread_1", Comments: []ReviewThreadComment{{ID: "comment_1", Author: "looper-bot", Body: "Please update this. <!-- looper:stamp v=1 -->", CommitOID: "old-head"}}}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", ParseStatus: "missing", Summary: jsonOutput, Stdout: jsonOutput}}}
+	runner := New(Options{GitHub: github, AgentExecutor: agent, ThreadResolution: policy, Now: func() time.Time { return time.Unix(0, 0).UTC() }})
+
+	checkpoint, err := runner.runThreadResolutionStep(context.Background(), threadResolutionStepInput())
+	if err != nil {
+		t.Fatalf("runThreadResolutionStep() error = %v", err)
+	}
+	if checkpoint.ThreadResolution == nil || checkpoint.ThreadResolution.Commented != 1 {
+		t.Fatalf("ThreadResolution = %#v, want one comment", checkpoint.ThreadResolution)
+	}
+	if len(github.addThreadReplyCalls) != 1 || !strings.Contains(github.addThreadReplyCalls[0].Body, "service unavailable") {
+		t.Fatalf("addThreadReplyCalls = %#v, want evidence comment", github.addThreadReplyCalls)
+	}
+}
+
+func TestTransientProviderMessageFromAgentResultIgnoresSuccessfulStdout(t *testing.T) {
+	t.Parallel()
+
+	result := AgentResult{Status: "completed", Summary: "classified threads", Stdout: `{"decisions":[{"threadId":"thread_1","decision":"needs_human","evidence":"the previous report mentioned service unavailable and overloaded capacity","confidence":"high"}]}`}
+
+	if message := transientProviderMessageFromAgentResult(result); message != "" {
+		t.Fatalf("transientProviderMessageFromAgentResult() = %q, want empty", message)
+	}
+}
+
+func TestTransientProviderMessageFromAgentResultUsesSummaryAndStderr(t *testing.T) {
+	t.Parallel()
+
+	if message := transientProviderMessageFromAgentResult(AgentResult{Status: "completed", Summary: "server_is_overloaded"}); message == "" {
+		t.Fatalf("transientProviderMessageFromAgentResult(summary overload) = empty, want message")
+	}
+	if message := transientProviderMessageFromAgentResult(AgentResult{Status: "completed", Stderr: "service unavailable"}); message == "" {
+		t.Fatalf("transientProviderMessageFromAgentResult(stderr overload) = empty, want message")
 	}
 }
 
