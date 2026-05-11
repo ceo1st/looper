@@ -289,7 +289,17 @@ func (r *Runner) discoverIssuesAndClosures(ctx context.Context, input DiscoveryI
 			continue
 		}
 		targetID := buildTargetID(input.Repo, issue.Number)
-		if r.shouldSkipSummary(issue.Labels, issue.Author, issue.AuthorAssociation, states[targetID], roleCfg) {
+		if r.shouldSkipSummary(issue.Labels, issue.Author, states[targetID], roleCfg) {
+			result.Skipped++
+			continue
+		}
+		var associationOK bool
+		issue.AuthorAssociation, associationOK = r.summaryAuthorAssociation(ctx, input.Repo, project.RepoPath, issue.Number, issue.AuthorAssociation, roleCfg)
+		if !associationOK {
+			result.Skipped++
+			continue
+		}
+		if authorAssociationExcluded(issue.AuthorAssociation, roleCfg) {
 			result.Skipped++
 			continue
 		}
@@ -358,7 +368,17 @@ func (r *Runner) discoverPullRequestsAndClosures(ctx context.Context, input Disc
 			continue
 		}
 		targetID := buildTargetID(input.Repo, pr.Number)
-		if r.shouldSkipSummary(pr.Labels, pr.Author, pr.AuthorAssociation, states[targetID], roleCfg) {
+		if r.shouldSkipSummary(pr.Labels, pr.Author, states[targetID], roleCfg) {
+			result.Skipped++
+			continue
+		}
+		var associationOK bool
+		pr.AuthorAssociation, associationOK = r.summaryAuthorAssociation(ctx, input.Repo, project.RepoPath, pr.Number, pr.AuthorAssociation, roleCfg)
+		if !associationOK {
+			result.Skipped++
+			continue
+		}
+		if authorAssociationExcluded(pr.AuthorAssociation, roleCfg) {
 			result.Skipped++
 			continue
 		}
@@ -694,7 +714,7 @@ func gracePeriodForCategory(category string, roleCfg config.SweeperRoleConfig) i
 	}
 }
 
-func (r *Runner) shouldSkipSummary(labels []string, author string, authorAssociation string, state sweeperStateRecord, roleCfg config.SweeperRoleConfig) bool {
+func (r *Runner) shouldSkipSummary(labels []string, author string, state sweeperStateRecord, roleCfg config.SweeperRoleConfig) bool {
 	if hasAnyLabel(labels, roleCfg.Triggers.ExcludeLabels) || hasAnyLabelExcept(labels, roleCfg.Triggers.LooperInternalLabels, roleCfg.Lifecycle.ClosedLabel) || hasLabel(labels, roleCfg.Security.QuarantineLabel) {
 		return true
 	}
@@ -706,12 +726,31 @@ func (r *Runner) shouldSkipSummary(labels []string, author string, authorAssocia
 			return true
 		}
 	}
+	return false
+}
+
+func authorAssociationExcluded(authorAssociation string, roleCfg config.SweeperRoleConfig) bool {
 	for _, excluded := range roleCfg.Triggers.ExcludeAuthorAssociations {
 		if strings.EqualFold(strings.TrimSpace(excluded), strings.TrimSpace(authorAssociation)) {
 			return true
 		}
 	}
 	return false
+}
+
+func (r *Runner) summaryAuthorAssociation(ctx context.Context, repo string, cwd string, number int64, current string, roleCfg config.SweeperRoleConfig) (string, bool) {
+	if strings.TrimSpace(current) != "" || len(roleCfg.Triggers.ExcludeAuthorAssociations) == 0 || r.github == nil {
+		return current, true
+	}
+	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: strings.TrimSpace(repo), IssueNumber: number, CWD: cwd})
+	if err != nil {
+		return "", false
+	}
+	association := strings.TrimSpace(detail.AuthorAssociation)
+	if association == "" {
+		return current, true
+	}
+	return association, true
 }
 
 func (r *Runner) reopenCooldownActive(state sweeperStateRecord, roleCfg config.SweeperRoleConfig) bool {

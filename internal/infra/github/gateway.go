@@ -404,7 +404,7 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 	if strings.TrimSpace(input.Author) != "" {
 		args = append(args, "--author", strings.TrimSpace(input.Author))
 	}
-	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "authorAssociation", "reviewRequests", "reviews", "mergeStateStatus"}, ","))
+	args = append(args, "--json", strings.Join([]string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}, ","))
 
 	timeout := input.Timeout
 	if timeout <= 0 {
@@ -497,7 +497,7 @@ func (g *Gateway) ListOpenIssues(ctx context.Context, input ListOpenIssuesInput)
 	for _, label := range issueListLabels(input) {
 		args = append(args, "--label", label)
 	}
-	args = append(args, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "updatedAt", "author", "authorAssociation", "assignees", "labels"}, ","))
+	args = append(args, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "updatedAt", "author", "assignees", "labels"}, ","))
 
 	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
@@ -548,7 +548,12 @@ func issueListLabels(input ListOpenIssuesInput) []string {
 }
 
 func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDetail, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "api", fmt.Sprintf("repos/%s/issues/%d", input.Repo, input.IssueNumber))
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues/%d", repo, input.IssueNumber)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return IssueDetail{}, err
 	}
@@ -668,7 +673,7 @@ func compactIssueAssignees(values []string) []string {
 }
 
 func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "authorAssociation", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
@@ -1891,6 +1896,14 @@ func hostQualifiedRepo(nameWithOwner string, repoURL string) string {
 		return repo
 	}
 	return parsed.Hostname() + "/" + repo
+}
+
+func splitRepoHostname(repo string) (string, string) {
+	parts := strings.Split(strings.TrimSpace(repo), "/")
+	if len(parts) == 3 && strings.TrimSpace(parts[0]) != "" {
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]) + "/" + strings.TrimSpace(parts[2])
+	}
+	return "", strings.TrimSpace(repo)
 }
 
 func summarizeChecks(checks []map[string]any) string {
