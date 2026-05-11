@@ -479,8 +479,8 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !contains(result.Summary, "produced no new commits") {
-		t.Fatalf("result = %#v, want manual intervention failure for no-op repair", result)
+	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "produced no new commits") {
+		t.Fatalf("result = %#v, want retryable-after-resume failure for no-op repair", result)
 	}
 	if len(git.commitCalls) != 0 || len(git.pushCalls) != 0 || len(github.resolveCalls) != 0 {
 		t.Fatalf("commit calls=%d push calls=%d resolve calls=%d, want 0/0/0 after no-op repair", len(git.commitCalls), len(git.pushCalls), len(github.resolveCalls))
@@ -496,8 +496,83 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 	if checkpoint.Push == nil || checkpoint.Push.Pushed || checkpoint.Push.SkippedReason == "" {
 		t.Fatalf("checkpoint.Push = %#v, want recorded no-op push", checkpoint.Push)
 	}
+	if checkpoint.ResumePolicy != "restart_from_discover" {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want restart_from_discover", checkpoint.ResumePolicy)
+	}
 	if checkpoint.ResolvedComments != nil {
 		t.Fatalf("checkpoint.ResolvedComments = %#v, want unresolved comments left untouched", checkpoint.ResolvedComments)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableAfterResume) {
+		t.Fatalf("queue = %#v, want queued retryable-after-resume failure", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "queued" || loop.NextRunAt == nil {
+		t.Fatalf("loop = %#v, want queued loop scheduled for rediscovery retry", loop)
+	}
+	loopMeta := parseJSONObject(loop.MetadataJSON)
+	if got, _ := stringFromAny(loopMeta["lastNoopResolveHeadSha"]); got != "base-head" {
+		t.Fatalf("lastNoopResolveHeadSha = %q, want base-head", got)
+	}
+	if got, _ := stringFromAny(loopMeta["lastNoopResolveFixItemsHash"]); got == "" {
+		t.Fatal("lastNoopResolveFixItemsHash = empty, want captured fix-item snapshot")
+	}
+}
+
+func TestDiscoverPullRequestsSkipsFailedFixerLoopWhenFingerprintUnchanged(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(77)
+	nowISO := fixture.nowISO()
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "same-head", HeadRefName: "feature/fix-77", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+	fingerprint := buildFixerDiscoveryFingerprint(repo, prNumber, detail.HeadSHA, hashFixItems(collectFixItems(detail)))
+	metadata := fmt.Sprintf(`{"autonomousRecovery":{"lastFailedDiscoveryFingerprint":%q}}`, fingerprint)
+	targetID := buildPullRequestTargetID(repo, prNumber)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_failed_same_fp", Seq: 90, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: "same-head"}}, viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want none for unchanged failed fingerprint", result.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestsRequeuesFailedFixerLoopWhenFingerprintChanges(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(78)
+	nowISO := fixture.nowISO()
+	oldDetail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "old-head", HeadRefName: "feature/fix-78", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+	newDetail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-78", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+	fingerprint := buildFixerDiscoveryFingerprint(repo, prNumber, oldDetail.HeadSHA, hashFixItems(collectFixItems(oldDetail)))
+	metadata := fmt.Sprintf(`{"autonomousRecovery":{"lastFailedDiscoveryFingerprint":%q}}`, fingerprint)
+	targetID := buildPullRequestTargetID(repo, prNumber)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_failed_changed_fp", Seq: 91, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: "new-head"}}, viewResponses: []PullRequestDetail{newDetail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("QueueItems = %#v, want one queue item after fingerprint change", result.QueueItems)
 	}
 }
 
@@ -548,10 +623,87 @@ func TestProcessClaimedItemAllowsNoCommitWhenCommentsAlreadyResolved(t *testing.
 	}
 }
 
+func TestDiscoverPullRequestsSkipsRepeatedNoopResolveRediscovery(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{comment}}
+	fixItemsHash := hashFixItems(collectFixItems(detail))
+	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": detail.HeadSHA, "lastNoopResolveFixItemsHash": fixItemsHash})
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_noop", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: detail.HeadSHA}}, viewResponses: []PullRequestDetail{detail}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("QueueItems = %#v, want no repeated queue item for unchanged no-op resolve state", result.QueueItems)
+	}
+	if result.Skipped == 0 {
+		t.Fatalf("result = %#v, want skipped discovery count", result)
+	}
+}
+
+func TestDiscoverPullRequestsRequeuesNoopResolveLoopWhenStateChanges(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		detail PullRequestDetail
+	}{
+		{name: "head changes", detail: PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-2", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
+		{name: "fix items change", detail: PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}, {"id": "c2", "threadId": "t2", "body": "also fix this"}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			repo := "acme/looper"
+			prNumber := int64(42)
+			nowISO := fixture.nowISO()
+			baseline := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+			metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": baseline.HeadSHA, "lastNoopResolveFixItemsHash": hashFixItems(collectFixItems(baseline))})
+			loopTarget := buildPullRequestTargetID(repo, prNumber)
+			if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_noop", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+
+			github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: tc.detail.HeadSHA}}, viewResponses: []PullRequestDetail{tc.detail}}
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+			result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+			if err != nil {
+				t.Fatalf("DiscoverPullRequests() error = %v", err)
+			}
+			if len(result.QueueItems) != 1 {
+				t.Fatalf("QueueItems = %#v, want one queue item after state change", result.QueueItems)
+			}
+		})
+	}
+}
+
 func TestRunResolveCommentsStepBlocksWithoutVerifiedPushEvidence(t *testing.T) {
 	t.Parallel()
 
-	runner := New(Options{GitHub: &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+	fixture := newRunnerFixture(t)
+	loopMetadata := `{}`
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID("acme/looper", 42)
+	loop := storage.LoopRecord{ID: "loop_1", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &loopMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
 		Number:      42,
 		State:       "OPEN",
 		HeadSHA:     "base-head",
@@ -563,7 +715,8 @@ func TestRunResolveCommentsStepBlocksWithoutVerifiedPushEvidence(t *testing.T) {
 			"threadId": "t1",
 			"body":     "please fix",
 		}},
-	}}}})
+	}}}
+	runner := New(Options{Repos: fixture.repos, GitHub: github, Now: fixture.now})
 	checkpoint := fixerCheckpoint{
 		FixItems:   []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}},
 		Validation: &ValidationResult{Passed: true, Summary: "ok"},
@@ -577,24 +730,28 @@ func TestRunResolveCommentsStepBlocksWithoutVerifiedPushEvidence(t *testing.T) {
 		},
 	}
 
-	_, err := runner.runResolveCommentsStep(context.Background(), stepInput{
-		Project:    storage.ProjectRecord{RepoPath: t.TempDir()},
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:       loop,
 		Repo:       "acme/looper",
 		PRNumber:   42,
 		Checkpoint: checkpoint,
 	})
 	if err == nil {
-		t.Fatal("runResolveCommentsStep() error = nil, want manual intervention")
+		t.Fatal("runResolveCommentsStep() error = nil, want rediscoverable retry")
 	}
 	var loopErr *loopError
 	if !errors.As(err, &loopErr) {
 		t.Fatalf("error = %T, want *loopError", err)
 	}
-	if loopErr.kind != FailureManualIntervention {
-		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	if loopErr.kind != FailureRetryableAfterResume {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureRetryableAfterResume)
 	}
 	if !contains(loopErr.Error(), "produced no new commits") {
 		t.Fatalf("error = %q, want no-new-commits message", loopErr.Error())
+	}
+	if updated.ResumePolicy != "restart_from_discover" {
+		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
 	}
 }
 
@@ -1085,7 +1242,7 @@ func TestProcessClaimedItemPersistsCheckpointWhenRepairReturnsNonCompleted(t *te
 	}
 }
 
-func TestProcessClaimedItemTreatsAgentSetupFailureAsManualIntervention(t *testing.T) {
+func TestProcessClaimedItemTreatsAgentSetupFailureAsRetryableTransient(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{
@@ -1112,15 +1269,22 @@ func TestProcessClaimedItemTreatsAgentSetupFailureAsManualIntervention(t *testin
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !contains(result.Summary, "requires a newer version") {
-		t.Fatalf("result = %#v, want manual_intervention with real agent error", result)
+	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !contains(result.Summary, "requires a newer version") {
+		t.Fatalf("result = %#v, want retryable_transient with real agent error", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != string(FailureManualIntervention) || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) {
-		t.Fatalf("queue = %#v, want terminal manual_intervention failure", queue)
+	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) {
+		t.Fatalf("queue = %#v, want queued retryable_transient failure", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "queued" || loop.NextRunAt == nil {
+		t.Fatalf("loop = %#v, want queued loop awaiting retry", loop)
 	}
 }
 
@@ -1236,7 +1400,7 @@ func TestCreateRunContextRewindsToPrepareWhenPostRepairResumeCheckpointParseStat
 	}
 }
 
-func TestCreateRunContextRestartsManualInterventionFromDiscover(t *testing.T) {
+func TestCreateRunContextRestartsFromDiscoverForRediscoverableCheckpoint(t *testing.T) {
 	t.Parallel()
 
 	fixture := newRunnerFixture(t)
@@ -1260,7 +1424,7 @@ func TestCreateRunContextRestartsManualInterventionFromDiscover(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
-		ResumePolicy: "manual_intervention",
+		ResumePolicy: "restart_from_discover",
 		Detail: &checkpointDetail{
 			State:       "OPEN",
 			HeadSHA:     "head-1",
@@ -1651,8 +1815,8 @@ func TestProcessClaimedItemAutoPushDisabledSkipsManualIntervention(t *testing.T)
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "skipped" || !contains(result.Summary, "Auto push disabled") {
-		t.Fatalf("result = %#v, want skipped auto-push summary", result)
+	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !contains(result.Summary, "Auto push disabled") {
+		t.Fatalf("result = %#v, want manual-intervention auto-push summary", result)
 	}
 	if len(git.pushCalls) != 0 {
 		t.Fatalf("len(git.pushCalls) = %d, want 0", len(git.pushCalls))
@@ -1661,15 +1825,103 @@ func TestProcessClaimedItemAutoPushDisabledSkipsManualIntervention(t *testing.T)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "completed" {
-		t.Fatalf("queue = %#v, want completed", queue)
+	if queue == nil || queue.Status != string(FailureManualIntervention) || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) {
+		t.Fatalf("queue = %#v, want failed manual_intervention queue item", queue)
 	}
 	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
 	if err != nil {
 		t.Fatalf("Runs.GetByID() error = %v", err)
 	}
-	if run == nil || run.LastCompletedStep == nil || *run.LastCompletedStep != string(stepPush) {
-		t.Fatalf("run = %#v, want lastCompletedStep=push", run)
+	if run == nil || run.Status != "failed" || run.CurrentStep == nil || *run.CurrentStep != string(stepPush) {
+		t.Fatalf("run = %#v, want failed push step run", run)
+	}
+	checkpoint := parseCheckpoint(run.CheckpointJSON)
+	if checkpoint.ResumePolicy != "manual_intervention" {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want manual_intervention", checkpoint.ResumePolicy)
+	}
+	if checkpoint.Push == nil || checkpoint.Push.SkippedReason != "Auto push disabled" {
+		t.Fatalf("checkpoint.Push = %#v, want recorded auto-push-disabled checkpoint", checkpoint.Push)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused hard-hold loop", loop)
+	}
+}
+
+func TestRunPrepareWorktreeStepPausesDirtyWorktree(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{Git: &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"}, prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: false}}})
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		Checkpoint: fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main"}},
+	})
+	if err == nil {
+		t.Fatal("runPrepareWorktreeStep() error = nil, want manual intervention")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("error = %T, want *loopError", err)
+	}
+	if loopErr.kind != FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	}
+	if checkpoint.ResumePolicy != "manual_intervention" {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want manual_intervention", checkpoint.ResumePolicy)
+	}
+}
+
+func TestRunRepairStepRequiresManualInterventionForRiskyConflictWhenDisabled(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{AllowRiskyFixes: false})
+	checkpoint, err := runner.runRepairStep(context.Background(), stepInput{
+		Repo:     "acme/looper",
+		PRNumber: 42,
+		Checkpoint: fixerCheckpoint{
+			FixItems: []FixItem{{Type: "conflict", Summary: "merge conflict"}},
+		},
+	})
+	if err == nil {
+		t.Fatal("runRepairStep() error = nil, want manual intervention")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("error = %T, want *loopError", err)
+	}
+	if loopErr.kind != FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	}
+	if checkpoint.ResumePolicy != "manual_intervention" {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want manual_intervention", checkpoint.ResumePolicy)
+	}
+	if !contains(loopErr.Error(), "risky conflict fixes require manual intervention") {
+		t.Fatalf("error = %q, want risky conflict summary", loopErr.Error())
+	}
+}
+
+func TestReconcileCommitsRequiresManualInterventionWhenAutoCommitDisabledAndDirty(t *testing.T) {
+	t.Parallel()
+
+	runner := New(Options{Git: &fakeGitGateway{inspectResults: []InspectHeadResult{{HeadSHA: "head-1", HasUncommittedChanges: true, ChangedFiles: []string{"file.txt"}}}}, AllowAutoCommit: false})
+	checkpoint, err := runner.reconcileCommits(context.Background(), fixerCheckpoint{Worktree: &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "head-1", BaseHeadSHA: "head-1"}}, "fix: test")
+	if err == nil {
+		t.Fatal("reconcileCommits() error = nil, want manual intervention")
+	}
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("error = %T, want *loopError", err)
+	}
+	if loopErr.kind != FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	}
+	if checkpoint.ResumePolicy != "manual_intervention" {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want manual_intervention", checkpoint.ResumePolicy)
 	}
 }
 

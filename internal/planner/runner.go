@@ -20,6 +20,7 @@ import (
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -518,7 +519,8 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
-		loopResult, err := r.ensureLoopForIssue(ctx, *project, input.Repo, issue)
+		fingerprint := buildPlannerDiscoveryFingerprint(input.Repo, r.now(), issue)
+		loopResult, err := r.ensureLoopForIssue(ctx, *project, input.Repo, issue, fingerprint)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -529,7 +531,14 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
-		queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: project.ID, LoopID: loopResult.record.ID, Repo: input.Repo, IssueNumber: issue.Number, Payload: map[string]any{"issueNumber": issue.Number, "title": issue.Title, "body": issue.Body, "url": issue.URL, "assignees": issue.Assignees, "labels": issue.Labels, "currentUserLogin": login}})
+		// Anti-thrash: skip enqueue when ensureLoopForIssue left a previously
+		// failed loop in place because its discovery inputs match the last
+		// terminal failure.
+		if loopResult.record.Status == "failed" {
+			result.Skipped++
+			continue
+		}
+		queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: project.ID, LoopID: loopResult.record.ID, Repo: input.Repo, IssueNumber: issue.Number, Payload: map[string]any{"issueNumber": issue.Number, "title": issue.Title, "body": issue.Body, "url": issue.URL, "assignees": issue.Assignees, "labels": issue.Labels, "currentUserLogin": login, plannerQueuePayloadFPKey: fingerprint}})
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -599,10 +608,11 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 			updated.Status = "queued"
 			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 		} else {
-			if failureKind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+			if loops.ShouldPauseLoopAfterFailure(string(failureKind), failedQueue, "") {
 				updated.Status = "paused"
 			} else {
 				updated.Status = "failed"
+				r.stampFailedDiscoveryFingerprint(updated, queueItem)
 			}
 			updated.NextRunAt = nil
 		}
@@ -679,18 +689,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if err != nil {
 			failure := r.classifyFailure(err)
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
-			resumePolicy := latest.ResumePolicy
-			switch failure.kind {
-			case FailureRetryableAfterResume:
-				resumePolicy = "advance_from_checkpoint"
-			case FailureManualIntervention:
-				resumePolicy = "manual_intervention"
-			default:
-				if resumePolicy == "" {
-					resumePolicy = "replay_step"
-				}
-			}
-			latest.ResumePolicy = resumePolicy
+			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 			if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 				return ProcessResult{}, err
 			}
@@ -708,10 +707,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					updated.Status = "queued"
 					updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 				} else {
-					if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+					if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, latest.ResumePolicy) {
 						updated.Status = "paused"
 					} else {
 						updated.Status = "failed"
+						r.stampFailedDiscoveryFingerprint(updated, queueItem)
 					}
 					updated.NextRunAt = nil
 				}
@@ -943,7 +943,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			message := firstNonEmpty(result.Summary, result.Stderr, "Planner agent "+result.Status)
 			kind := FailureRetryableTransient
 			if agent.IsAgentSetupFailureMessage(message) {
-				kind = FailureManualIntervention
+				kind = FailureRetryableTransient
 			}
 			return checkpoint, &loopError{message: message, kind: kind}
 		}
@@ -992,9 +992,10 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 		return checkpoint, nil
 	}
 	if !r.allowAutoPush {
-		checkpoint.SkipReason = fmt.Sprintf("Auto push disabled; manual publish required for planner %s", input.Loop.ID)
-		checkpoint.ResumePolicy = "manual_intervention"
-		return checkpoint, nil
+		message := fmt.Sprintf("Auto push disabled; manual publish required for planner %s", input.Loop.ID)
+		checkpoint.SkipReason = message
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		return checkpoint, &loopError{message: message, kind: FailureManualIntervention}
 	}
 	issue, err := requireIssue(checkpoint)
 	if err != nil {
@@ -1245,7 +1246,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		check = parseCheckpoint(latestRun.CheckpointJSON)
 		lastCompleted = asPlannerStep(derefString(latestRun.LastCompletedStep))
 	}
-	shouldResume := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && check.ResumePolicy != "manual_intervention" && lastCompleted != ""
+	shouldResume := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(check.ResumePolicy) && lastCompleted != ""
 	startStep := stepDiscoverIssues
 	if shouldResume {
 		if next := nextPlannerStep(lastCompleted); next != "" {
@@ -1367,19 +1368,20 @@ type loopUpsertResult struct {
 	created bool
 }
 
-func (r *Runner) ensureLoopForIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary) (loopUpsertResult, error) {
+func (r *Runner) ensureLoopForIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, currentFingerprint string) (loopUpsertResult, error) {
 	nowISO := r.nowISO()
 	targetID := buildIssueTargetID(repo, issue.Number)
-	loops, err := r.repos.Loops.List(ctx)
+	existingLoops, err := r.repos.Loops.List(ctx)
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
-	for _, existing := range loops {
+	for _, existing := range existingLoops {
 		if existing.Type == "planner" && existing.ProjectID == project.ID && existing.TargetType == "issue" && derefString(existing.TargetID) == targetID {
 			pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed"
 			updated := existing
 			updated.Repo = stringPtr(repo)
-			if !pausedOrCompleted && updated.Status != "running" {
+			suppressFailedRevival := loops.ShouldSuppressFailedRediscovery(existing.Status, loops.LastFailedDiscoveryFingerprint(existing.MetadataJSON), currentFingerprint)
+			if !pausedOrCompleted && !suppressFailedRevival && updated.Status != "running" {
 				updated.Status = "queued"
 				updated.NextRunAt = &nowISO
 			}
@@ -1835,6 +1837,70 @@ func hasRequestedReviewerSources(project storage.ProjectRecord, loop storage.Loo
 func buildIssueTargetID(repo string, issueNumber int64) string {
 	return fmt.Sprintf("issue:%s:%d", repo, issueNumber)
 }
+
+// plannerQueuePayloadFPKey is the JSON key used to forward the planner
+// discovery fingerprint into the queue payload so failure handlers can stamp
+// it onto the loop without recomputing inputs from scratch.
+const plannerQueuePayloadFPKey = "discoveryFingerprint"
+
+// buildPlannerDiscoveryFingerprint returns a stable fingerprint over the
+// inputs that planner discovery uses to decide whether a previously-failed
+// loop should be revived. specPath is included so deliberate spec-path
+// changes (e.g. issue title edits affecting slug, or day rollover) trigger
+// rediscovery.
+func buildPlannerDiscoveryFingerprint(repo string, now time.Time, issue IssueSummary) string {
+	labels := loops.CanonicalSortedStrings(issue.Labels)
+	assignees := loops.CanonicalSortedStrings(issue.Assignees)
+	specPath := buildSpecPath(now, issue.Number, issue.Title)
+	return loops.ComputeDiscoveryFingerprint(
+		"planner",
+		repo,
+		fmt.Sprintf("%d", issue.Number),
+		strings.TrimSpace(issue.Title),
+		strings.TrimSpace(issue.Body),
+		strings.TrimSpace(issue.URL),
+		specPath,
+		strings.Join(labels, ","),
+		strings.Join(assignees, ","),
+	)
+}
+
+// plannerQueueDiscoveryFingerprint reads the persisted fingerprint from a
+// queue item's payload, returning empty when missing or invalid.
+func plannerQueueDiscoveryFingerprint(payloadJSON *string) string {
+	if payloadJSON == nil {
+		return ""
+	}
+	raw := strings.TrimSpace(*payloadJSON)
+	if raw == "" {
+		return ""
+	}
+	parsed := map[string]any{}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return ""
+	}
+	value, _ := parsed[plannerQueuePayloadFPKey].(string)
+	return strings.TrimSpace(value)
+}
+
+// stampFailedDiscoveryFingerprint records the queue item's discovery
+// fingerprint on the loop's metadata so the next discovery tick can suppress
+// autonomous rediscovery while inputs are unchanged.
+func (r *Runner) stampFailedDiscoveryFingerprint(updated *storage.LoopRecord, queueItem storage.QueueItemRecord) {
+	fingerprint := plannerQueueDiscoveryFingerprint(queueItem.PayloadJSON)
+	if fingerprint == "" {
+		return
+	}
+	merged, err := loops.MergeLastFailedDiscoveryFingerprint(updated.MetadataJSON, fingerprint)
+	if err != nil {
+		if r.logger != nil {
+			r.logger.Warn("planner fingerprint stamp failed", map[string]any{"loopId": updated.ID, "error": err.Error()})
+		}
+		return
+	}
+	updated.MetadataJSON = stringPtr(merged)
+}
+
 func buildPlannerDedupeKey(projectID, loopID, repo string, issueNumber int64) string {
 	return fmt.Sprintf("planner:%s:%s:%s:%d", projectID, loopID, repo, issueNumber)
 }

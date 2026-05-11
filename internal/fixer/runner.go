@@ -24,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -818,11 +819,12 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		loopResult, err := r.ensureLoopForPullRequest(ctx, *project, input.Repo, pr.Number)
+		fixItemsHash := hashFixItems(fixItems)
+		loopResult, err := r.ensureLoopForPullRequest(ctx, *project, input.Repo, pr.Number, detail.HeadSHA, fixItemsHash)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
-		if loopResult.record.Status == "paused" {
+		if loopResult.record.Status == "paused" || loopResult.record.Status == "failed" || loopResult.skipped {
 			result.Skipped++
 			continue
 		}
@@ -839,7 +841,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			Repo:         input.Repo,
 			PRNumber:     pr.Number,
 			HeadSHA:      headSHA,
-			FixItemsHash: hashFixItems(fixItems),
+			FixItemsHash: fixItemsHash,
 		})
 		if err != nil {
 			return DiscoveryResult{}, err
@@ -956,10 +958,11 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 			updated.Status = "queued"
 			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 		} else {
-			if failureKind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+			if loops.ShouldPauseLoopAfterFailure(string(failureKind), failedQueue, "") {
 				updated.Status = "paused"
 			} else {
 				updated.Status = "failed"
+				stampFixerFailedDiscoveryFingerprint(updated, queueItem)
 			}
 			updated.NextRunAt = nil
 		}
@@ -1034,9 +1037,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if err := validateFixerResumeCheckpoint(resumedRun.StartStep, checkpoint); err != nil {
 		failure := r.classifyFailure(err)
 		latest := r.getLatestCheckpoint(ctx, run, checkpoint)
-		if latest.ResumePolicy == "" {
-			latest.ResumePolicy = "replay_step"
-		}
+		latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 		if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 			return ProcessResult{}, err
 		}
@@ -1050,10 +1051,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				updated.Status = "queued"
 				updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 			} else {
-				if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+				if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, latest.ResumePolicy) {
 					updated.Status = "paused"
 				} else {
 					updated.Status = "failed"
+					stampFixerFailedDiscoveryFingerprint(updated, queueItem)
 				}
 				updated.NextRunAt = nil
 			}
@@ -1100,19 +1102,8 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
 		if err != nil {
 			failure := r.classifyFailure(err)
-			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
-			resumePolicy := latest.ResumePolicy
-			switch failure.kind {
-			case FailureRetryableAfterResume:
-				resumePolicy = "advance_from_checkpoint"
-			case FailureManualIntervention:
-				resumePolicy = "manual_intervention"
-			default:
-				if resumePolicy == "" {
-					resumePolicy = "replay_step"
-				}
-			}
-			latest.ResumePolicy = resumePolicy
+			latest := checkpoint
+			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 			if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 				return ProcessResult{}, err
 			}
@@ -1129,10 +1120,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					updated.Status = "queued"
 					updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 				} else {
-					if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+					if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, latest.ResumePolicy) {
 						updated.Status = "paused"
 					} else {
 						updated.Status = "failed"
+						stampFixerFailedDiscoveryFingerprint(updated, queueItem)
 					}
 					updated.NextRunAt = nil
 				}
@@ -1319,6 +1311,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 		return checkpoint, err
 	}
 	if !prepared.Clean {
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 		return checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty for branch %s; manual intervention required", branch), kind: FailureManualIntervention}
 	}
 	preparedAt := r.nowISO()
@@ -1346,9 +1339,8 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if !r.allowRiskyFixes {
 		for _, item := range checkpoint.FixItems {
 			if item.Type == "conflict" {
-				checkpoint.SkipReason = fmt.Sprintf("Skipped %s#%d because risky conflict fixes require manual intervention", input.Repo, input.PRNumber)
-				checkpoint.ResumePolicy = "manual_intervention"
-				return checkpoint, nil
+				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+				return checkpoint, &loopError{message: fmt.Sprintf("Skipped %s#%d because risky conflict fixes require manual intervention", input.Repo, input.PRNumber), kind: FailureManualIntervention}
 			}
 		}
 	}
@@ -1382,11 +1374,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		message := firstNonEmpty(result.Summary, result.Stderr, "Fixer agent "+result.Status)
-		kind := FailureRetryableTransient
-		if agent.IsAgentSetupFailureMessage(message) {
-			kind = FailureManualIntervention
-		}
-		return checkpoint, &loopError{message: message, kind: kind}
+		return checkpoint, &loopError{message: message, kind: FailureRetryableTransient}
 	}
 	if err := validateCompletedRepairCheckpoint(&checkpointRepair{Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 		return checkpoint, err
@@ -1485,9 +1473,9 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	}
 	if !r.allowAutoPush {
 		r.appendEvent(ctx, eventInput{eventType: "fixer.push.skipped", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "reason": "auto_push_disabled"}})
-		checkpoint.SkipReason = fmt.Sprintf("Auto push disabled; manual fix push required for branch %s", branch)
-		checkpoint.ResumePolicy = "manual_intervention"
-		return checkpoint, nil
+		checkpoint.Push = &checkpointPush{Pushed: false, Branch: branch, Remote: "origin", SkippedReason: "Auto push disabled"}
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		return checkpoint, &loopError{message: fmt.Sprintf("Auto push disabled; manual fix push required for branch %s", branch), kind: FailureManualIntervention}
 	}
 	if checkpoint.ReconcileCommits == nil {
 		return checkpoint, &loopError{message: "Missing reconcile-commits checkpoint for push step", kind: FailureRetryableAfterResume}
@@ -1585,7 +1573,15 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 	}
 	if shouldBlockResolveWithoutFix(checkpoint, fixItems, verifiedNoPushHeadSHA != "" && verifiedNoPushHeadSHA == detailHeadSHA(checkpoint.Detail)) {
-		return checkpoint, &loopError{message: "resolve-comments refused because fixer produced no new commits to push; leaving review threads unresolved", kind: FailureManualIntervention}
+		metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"lastNoopResolveHeadSha": detailHeadSHA(checkpoint.Detail), "lastNoopResolveFixItemsHash": currentFixItemsHash, "lastNoopResolveAt": r.nowISO()})
+		if err != nil {
+			return checkpoint, err
+		}
+		if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
+			return checkpoint, err
+		}
+		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+		return checkpoint, &loopError{message: "resolve-comments refused because fixer produced no new commits to push; leaving review threads unresolved", kind: FailureRetryableAfterResume}
 	}
 	if checkpoint.ResolvedComments == nil {
 		checkpoint.ResolvedComments = &checkpointResolvedComments{Items: []checkpointResolvedComment{}}
@@ -2102,7 +2098,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	resumeFromPrepare := false
 	if latestRun != nil {
 		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
-		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, failureSummary) || shouldRestartManualInterventionFromDiscover(latestRun.Status, checkpoint)
+		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, failureSummary) || loops.ShouldRestartFromDiscover(latestRun.Status, checkpoint.ResumePolicy)
 		resumeFromPrepare = shouldResumeFromPrepare(latestRun.Status, failedStep, checkpoint)
 	}
 	startStep := stepDiscoverPR
@@ -2229,18 +2225,22 @@ func (r *Runner) getLatestCheckpoint(ctx context.Context, run storage.RunRecord,
 type loopUpsertResult struct {
 	record  storage.LoopRecord
 	created bool
+	skipped bool
 }
 
-func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64) (loopUpsertResult, error) {
+func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, headSHA, fixItemsHash string) (loopUpsertResult, error) {
 	nowISO := r.nowISO()
-	loops, err := r.repos.Loops.List(ctx)
+	existingLoops, err := r.repos.Loops.List(ctx)
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
-	for _, existing := range loops {
+	for _, existing := range existingLoops {
 		if existing.Type == "fixer" && existing.ProjectID == project.ID && derefString(existing.Repo) == repo && derefInt64(existing.PRNumber) == prNumber {
 			if existing.Status == "paused" {
 				return loopUpsertResult{record: existing, created: false}, nil
+			}
+			if loops.ShouldSuppressFailedRediscovery(existing.Status, loops.LastFailedDiscoveryFingerprint(existing.MetadataJSON), buildFixerDiscoveryFingerprint(repo, prNumber, headSHA, fixItemsHash)) || shouldSkipRediscoveryAfterNoopResolve(existing.MetadataJSON, headSHA, fixItemsHash) {
+				return loopUpsertResult{record: existing, created: false, skipped: true}, nil
 			}
 			updated := existing
 			if active, err := r.hasActiveRunningRun(ctx, updated.ID); err == nil && active {
@@ -2304,7 +2304,8 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	lockKey := fmt.Sprintf("pr:%s:%d", input.Repo, input.PRNumber)
 	projectID := input.ProjectID
 	loopID := input.LoopID
-	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &input.Repo, PRNumber: &input.PRNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, CreatedAt: nowISO, UpdatedAt: nowISO}
+	payload := mustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint(input.Repo, input.PRNumber, input.HeadSHA, input.FixItemsHash)})
+	queueItem := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &input.Repo, PRNumber: &input.PRNumber, DedupeKey: dedupeKey, Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: r.retryMaxAttempts, LockKey: &lockKey, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := r.repos.Queue.Upsert(ctx, queueItem); err != nil {
 		return storage.QueueItemRecord{}, err
 	}
@@ -2378,6 +2379,7 @@ func (r *Runner) reconcileCommits(ctx context.Context, checkpoint fixerCheckpoin
 	committedByLoop := false
 	if initial.HasUncommittedChanges {
 		if !r.allowAutoCommit {
+			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 			return checkpoint, &loopError{message: fmt.Sprintf("Auto commit disabled but fixer worktree has uncommitted changes: %s", firstNonEmpty(strings.Join(initial.ChangedFiles, ", "), "unknown files")), kind: FailureManualIntervention}
 		}
 		if _, err := r.git.Commit(ctx, CommitInput{WorktreePath: worktree.Path, Message: commitMessage}); err != nil {
@@ -2932,13 +2934,6 @@ func shouldRestartFromDiscover(status string, failedStep FixerStep, failureSumma
 	return strings.Contains(failureSummary, "PR head changed before resolving comments")
 }
 
-func shouldRestartManualInterventionFromDiscover(status string, checkpoint fixerCheckpoint) bool {
-	if status != "failed" && status != "interrupted" {
-		return false
-	}
-	return checkpoint.ResumePolicy == "manual_intervention"
-}
-
 func shouldRebuildWorktree(checkpoint fixerCheckpoint) bool {
 	return checkpoint.Worktree != nil && checkpoint.Worktree.Path != "" && checkpoint.Worktree.PreparedAt == ""
 }
@@ -3125,6 +3120,36 @@ func resolveCommentsVerifiedNoPushHeadSHA(push *checkpointPush, loopMetadataJSON
 		return ""
 	}
 	return lastFixHeadSHA
+}
+
+func shouldSkipRediscoveryAfterNoopResolve(loopMetadataJSON *string, headSHA, fixItemsHash string) bool {
+	if headSHA == "" || fixItemsHash == "" {
+		return false
+	}
+	metadata := parseJSONObject(loopMetadataJSON)
+	lastHeadSHA, _ := stringFromAny(metadata["lastNoopResolveHeadSha"])
+	lastFixItemsHash, _ := stringFromAny(metadata["lastNoopResolveFixItemsHash"])
+	return lastHeadSHA != "" && lastHeadSHA == headSHA && lastFixItemsHash != "" && lastFixItemsHash == fixItemsHash
+}
+
+func buildFixerDiscoveryFingerprint(repo string, prNumber int64, headSHA, fixItemsHash string) string {
+	if headSHA == "" {
+		headSHA = "unknown"
+	}
+	return loops.ComputeDiscoveryFingerprint("fixer", repo, fmt.Sprintf("%d", prNumber), headSHA, fixItemsHash)
+}
+
+func stampFixerFailedDiscoveryFingerprint(updated *storage.LoopRecord, queueItem storage.QueueItemRecord) {
+	metadata := parseJSONObject(queueItem.PayloadJSON)
+	fingerprint, _ := stringFromAny(metadata["discoveryFingerprint"])
+	if strings.TrimSpace(fingerprint) == "" {
+		return
+	}
+	merged, err := loops.MergeLastFailedDiscoveryFingerprint(updated.MetadataJSON, fingerprint)
+	if err != nil {
+		return
+	}
+	updated.MetadataJSON = stringPtr(merged)
 }
 
 func detailHeadSHA(detail *checkpointDetail) string {

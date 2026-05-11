@@ -24,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -704,18 +705,19 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
-		loopResult, err := r.ensureLoopForDiscoveredIssue(ctx, *project, input.Repo, issue)
+		fingerprint := buildWorkerDiscoveryFingerprint(input.Repo, firstNonEmpty(derefString(project.BaseBranch), "main"), issue)
+		loopResult, err := r.ensureLoopForDiscoveredIssue(ctx, *project, input.Repo, issue, fingerprint)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		if loopResult.created {
 			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
 		}
-		if loopResult.record.Status == "paused" || loopResult.record.Status == "completed" {
+		if loopResult.record.Status == "paused" || loopResult.record.Status == "completed" || loopResult.record.Status == "failed" {
 			result.Skipped++
 			continue
 		}
-		queueItem, err := r.enqueueDiscoveredIssue(ctx, *project, loopResult.record, input.Repo, issue)
+		queueItem, err := r.enqueueDiscoveredIssue(ctx, *project, loopResult.record, input.Repo, issue, fingerprint)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -785,10 +787,11 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 			updated.Status = "queued"
 			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 		} else {
-			if failureKind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+			if loops.ShouldPauseLoopAfterFailure(string(failureKind), failedQueue, "") {
 				updated.Status = "paused"
 			} else {
 				updated.Status = "failed"
+				stampWorkerFailedDiscoveryFingerprint(updated, queueItem)
 			}
 			updated.NextRunAt = nil
 		}
@@ -890,10 +893,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				updated.Status = "queued"
 				updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 			} else {
-				if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+				if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, latest.ResumePolicy) {
 					updated.Status = "paused"
 				} else {
 					updated.Status = "failed"
+					stampWorkerFailedDiscoveryFingerprint(updated, queueItem)
 				}
 				updated.NextRunAt = nil
 			}
@@ -912,16 +916,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if err != nil {
 			failure := r.classifyFailure(err)
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
-			switch failure.kind {
-			case FailureRetryableAfterResume:
-				latest.ResumePolicy = "advance_from_checkpoint"
-			case FailureManualIntervention:
-				latest.ResumePolicy = "manual_intervention"
-			default:
-				if latest.ResumePolicy == "" {
-					latest.ResumePolicy = "replay_step"
-				}
-			}
+			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 			if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 				return ProcessResult{}, err
 			}
@@ -940,10 +935,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					updated.Status = "queued"
 					updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 				} else {
-					if failure.kind == FailureManualIntervention || (failedQueue != nil && failedQueue.Status == "cancelled") {
+					if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, latest.ResumePolicy) {
 						updated.Status = "paused"
 					} else {
 						updated.Status = "failed"
+						stampWorkerFailedDiscoveryFingerprint(updated, queueItem)
 					}
 					updated.NextRunAt = nil
 				}
@@ -1292,7 +1288,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			message := firstNonEmpty(result.Summary, result.Stderr, fmt.Sprintf("Worker agent %s", result.Status))
 			kind := FailureRetryableTransient
 			if agent.IsAgentSetupFailureMessage(message) {
-				kind = FailureManualIntervention
+				kind = FailureRetryableTransient
 			}
 			return checkpoint, &loopError{message: message, kind: kind}
 		}
@@ -1396,6 +1392,11 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 		return checkpoint, err
 	}
 	checkpoint.Validation = &result
+	if !result.Passed {
+		failure := classifyValidationFailure(result)
+		checkpoint.ResumePolicy = failure.resumePolicy
+		return checkpoint, &loopError{message: failure.message, kind: failure.kind}
+	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -1407,7 +1408,9 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		return checkpoint, err
 	}
 	if checkpoint.Validation != nil && !checkpoint.Validation.Passed {
-		return checkpoint, &loopError{message: firstNonEmpty(checkpoint.Validation.Summary, "Validation failed"), kind: FailureManualIntervention}
+		failure := classifyValidationFailure(*checkpoint.Validation)
+		checkpoint.ResumePolicy = failure.resumePolicy
+		return checkpoint, &loopError{message: failure.message, kind: failure.kind}
 	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
@@ -1430,9 +1433,10 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		pushedByFallback := false
 		if !checkpoint.Lifecycle.Pushed {
 			if !r.allowAutoPush {
-				checkpoint.SkipReason = fmt.Sprintf("Auto push disabled; manual PR opening required for worker %s", input.Loop.ID)
-				checkpoint.ResumePolicy = "manual_intervention"
-				return checkpoint, nil
+				message := fmt.Sprintf("Auto push disabled; manual PR opening required for worker %s", input.Loop.ID)
+				checkpoint.SkipReason = message
+				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+				return checkpoint, &loopError{message: message, kind: FailureManualIntervention}
 			}
 			if err := r.git.Push(ctx, PushInput{WorktreePath: worktree.Path, Branch: worktree.Branch, ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -1449,9 +1453,10 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	}
 	if work.ExecutionMode == "push-existing" {
 		if !r.allowAutoPush {
-			checkpoint.SkipReason = fmt.Sprintf("Auto push disabled; manual PR opening required for worker %s", input.Loop.ID)
-			checkpoint.ResumePolicy = "manual_intervention"
-			return checkpoint, nil
+			message := fmt.Sprintf("Auto push disabled; manual PR opening required for worker %s", input.Loop.ID)
+			checkpoint.SkipReason = message
+			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+			return checkpoint, &loopError{message: message, kind: FailureManualIntervention}
 		}
 		if err := r.git.Push(ctx, PushInput{WorktreePath: worktree.Path, Branch: firstNonEmpty(work.Branch, worktree.Branch), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -1472,18 +1477,20 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	}
 	if r.openPRStrategy == config.OpenPRStrategyManual {
 		checkpoint.SkipReason = fmt.Sprintf("Worker completed; PR opening is manual for %s", input.Loop.ID)
-		checkpoint.ResumePolicy = "manual_intervention"
+		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		return checkpoint, nil
 	}
 	if !r.githubCLIAutoPROpeningAvailable(ctx, work.Repo, input.Project.RepoPath) {
-		checkpoint.SkipReason = fmt.Sprintf("GitHub CLI unavailable; PR opening is manual for worker %s", input.Loop.ID)
-		checkpoint.ResumePolicy = "manual_intervention"
-		return checkpoint, nil
+		message := fmt.Sprintf("GitHub CLI unavailable; PR opening is manual for worker %s", input.Loop.ID)
+		checkpoint.SkipReason = message
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		return checkpoint, &loopError{message: message, kind: FailureManualIntervention}
 	}
 	if !r.allowAutoPush {
-		checkpoint.SkipReason = fmt.Sprintf("Auto push disabled; manual PR opening required for worker %s", input.Loop.ID)
-		checkpoint.ResumePolicy = "manual_intervention"
-		return checkpoint, nil
+		message := fmt.Sprintf("Auto push disabled; manual PR opening required for worker %s", input.Loop.ID)
+		checkpoint.SkipReason = message
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		return checkpoint, &loopError{message: message, kind: FailureManualIntervention}
 	}
 	aliases := buildWorkerBranchAliases(work, input.Loop.ID)
 	if existing, err := r.findOpenPullRequestForBranch(ctx, work.Repo, aliases, work.BaseBranch, input.Project.RepoPath); err == nil && existing != nil {
@@ -1636,6 +1643,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	checkpoint := workerCheckpoint{}
 	var lastCompletedStep WorkerStep
 	var failedStep WorkerStep
+	restartFromDiscover := false
 	if latestRun != nil {
 		checkpoint, err = parseCheckpoint(latestRun.CheckpointJSON)
 		if err != nil {
@@ -1646,11 +1654,15 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 			return resumedRunContext{}, fmt.Errorf("unknown worker last completed step %q", derefString(latestRun.LastCompletedStep))
 		}
 		failedStep = asWorkerStep(derefString(latestRun.CurrentStep))
+		restartFromDiscover = loops.ShouldRestartFromDiscover(latestRun.Status, checkpoint.ResumePolicy)
 	}
 	startStep := stepPrepareWork
 	resumedCheckpoint := checkpoint
-	if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && lastCompletedStep != "" {
-		if shouldReplayExecuteOnResume(latestRun.Status, failedStep, checkpoint) {
+	if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(checkpoint.ResumePolicy) && lastCompletedStep != "" {
+		if restartFromDiscover {
+			startStep = stepPrepareWork
+			resumedCheckpoint = workerCheckpoint{ResumePolicy: loops.ResumePolicyReplayStep}
+		} else if shouldReplayExecuteOnResume(latestRun.Status, failedStep, checkpoint) {
 			startStep = stepExecute
 			resumedCheckpoint = rewindCheckpointForExecuteRetry(checkpoint)
 		} else if next := nextWorkerStep(lastCompletedStep); next != "" {
@@ -1662,7 +1674,9 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Lifecycle: resumedCheckpoint.Lifecycle, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if resumed {
-		if shouldReplayExecuteOnResume(latestRun.Status, failedStep, checkpoint) {
+		if restartFromDiscover {
+			run.LastCompletedStep = nil
+		} else if shouldReplayExecuteOnResume(latestRun.Status, failedStep, checkpoint) {
 			if prev := previousWorkerStep(startStep); prev != "" {
 				value := string(prev)
 				run.LastCompletedStep = &value
@@ -1764,6 +1778,36 @@ func (r *Runner) getLatestCheckpoint(ctx context.Context, run storage.RunRecord,
 	if err != nil {
 		return fallback
 	}
+	if fallback.ResumePolicy != "" {
+		checkpoint.ResumePolicy = fallback.ResumePolicy
+	}
+	if fallback.Work != nil {
+		checkpoint.Work = fallback.Work
+	}
+	if fallback.Worktree != nil {
+		checkpoint.Worktree = fallback.Worktree
+	}
+	if fallback.Plan != nil {
+		checkpoint.Plan = fallback.Plan
+	}
+	if fallback.Execution != nil {
+		checkpoint.Execution = fallback.Execution
+	}
+	if fallback.Lifecycle != nil {
+		checkpoint.Lifecycle = fallback.Lifecycle
+	}
+	if fallback.Validation != nil {
+		checkpoint.Validation = fallback.Validation
+	}
+	if fallback.PullRequest != nil {
+		checkpoint.PullRequest = fallback.PullRequest
+	}
+	if fallback.SkipReason != "" {
+		checkpoint.SkipReason = fallback.SkipReason
+	}
+	if fallback.ClaimedLockKey != "" {
+		checkpoint.ClaimedLockKey = fallback.ClaimedLockKey
+	}
 	return checkpoint
 }
 
@@ -1797,6 +1841,36 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 	}
 
 	return ValidationResult{Passed: true, Summary: "Validation passed", Output: strings.Join(outputs, "\n")}, nil
+}
+
+type validationFailure struct {
+	message      string
+	kind         QueueFailureKind
+	resumePolicy string
+}
+
+func classifyValidationFailure(result ValidationResult) validationFailure {
+	message := firstNonEmpty(strings.TrimSpace(result.Summary), "Validation failed")
+	details := strings.ToLower(strings.TrimSpace(strings.Join([]string{result.Summary, result.Output}, "\n")))
+	if containsAnyValidationHint(details, []string{"dirty worktree", "uncommitted changes", "merge conflict", "conflict markers", "ambiguous repo", "unsafe repo"}) {
+		return validationFailure{message: message, kind: FailureManualIntervention, resumePolicy: loops.ResumePolicyManualIntervention}
+	}
+	if containsAnyValidationHint(details, []string{"stale checkpoint", "stale repo", "stale repo context", "stale worktree", "head changed", "base changed", "branch changed", "out of date", "no longer matches"}) {
+		return validationFailure{message: message, kind: FailureRetryableAfterResume, resumePolicy: loops.ResumePolicyRestartFromDiscover}
+	}
+	if containsAnyValidationHint(details, []string{"command not found", "executable file not found", "timed out", "timeout", "connection reset", "connection refused", "temporary failure", "service unavailable", "network is unreachable", "transport error"}) {
+		return validationFailure{message: message, kind: FailureRetryableTransient, resumePolicy: loops.ResumePolicyReplayStep}
+	}
+	return validationFailure{message: message, kind: FailureRetryableAfterResume, resumePolicy: loops.ResumePolicyReplayStep}
+}
+
+func containsAnyValidationHint(message string, hints []string) bool {
+	for _, hint := range hints {
+		if strings.Contains(message, hint) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Runner) findOpenPullRequestForBranch(ctx context.Context, repo string, branches []string, baseBranch, cwd string) (*PullRequestSummary, error) {
@@ -1870,22 +1944,23 @@ func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.L
 	})
 }
 
-func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary) (loopUpsertResult, error) {
+func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, currentFingerprint string) (loopUpsertResult, error) {
 	nowISO := r.nowISO()
 	targetID := buildIssueTargetID(repo, issue.Number)
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
 	work := workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL, AutoDiscovered: true}
 	workerMeta := map[string]any{"worker": mergeWorkerMetadata(parseJSONObject(nil), work)}
-	loops, err := r.repos.Loops.List(ctx)
+	existingLoops, err := r.repos.Loops.List(ctx)
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
-	for _, existing := range loops {
+	for _, existing := range existingLoops {
 		if existing.Type == "worker" && existing.ProjectID == project.ID && existing.TargetType == "issue" && derefString(existing.TargetID) == targetID {
 			pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed"
 			updated := existing
 			updated.Repo = &repo
-			if !pausedOrCompleted && updated.Status != "running" {
+			suppressFailedRevival := loops.ShouldSuppressFailedRediscovery(existing.Status, loops.LastFailedDiscoveryFingerprint(existing.MetadataJSON), currentFingerprint)
+			if !pausedOrCompleted && !suppressFailedRevival && updated.Status != "running" {
 				updated.Status = "queued"
 				updated.NextRunAt = &nowISO
 			}
@@ -1912,7 +1987,7 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 	return loopUpsertResult{record: loop, created: true}, nil
 }
 
-func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, repo string, issue IssueSummary) (storage.QueueItemRecord, error) {
+func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, repo string, issue IssueSummary, fingerprint string) (storage.QueueItemRecord, error) {
 	dedupeKey := buildWorkerIssueDedupeKey(project.ID, repo, issue.Number)
 	existing, err := r.repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
 	if err != nil {
@@ -1923,7 +1998,7 @@ func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.Pro
 	}
 	nowISO := r.nowISO()
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
-	payload := mustMarshalJSON(workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL, AutoDiscovered: true})
+	payload := mustMarshalJSON(map[string]any{"title": firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), "repo": repo, "baseBranch": baseBranch, "executionMode": "create-pr", "issueNumber": issue.Number, "issueUrl": issue.URL, "autoDiscovered": true, "discoveryFingerprint": fingerprint})
 	targetID := buildIssueTargetID(repo, issue.Number)
 	lockKey := targetID
 	projectID := project.ID
@@ -2698,6 +2773,33 @@ func buildIssueTargetID(repo string, issueNumber int64) string {
 
 func buildWorkerIssueDedupeKey(projectID, repo string, issueNumber int64) string {
 	return fmt.Sprintf("worker:%s:%s:%d", projectID, repo, issueNumber)
+}
+
+func buildWorkerDiscoveryFingerprint(repo, baseBranch string, issue IssueSummary) string {
+	return loops.ComputeDiscoveryFingerprint(
+		"worker",
+		repo,
+		fmt.Sprintf("%d", issue.Number),
+		strings.TrimSpace(baseBranch),
+		strings.TrimSpace(issue.Title),
+		strings.TrimSpace(issue.Body),
+		strings.TrimSpace(issue.URL),
+		strings.Join(loops.CanonicalSortedStrings(issue.Labels), ","),
+		strings.Join(loops.CanonicalSortedStrings(issue.Assignees), ","),
+	)
+}
+
+func stampWorkerFailedDiscoveryFingerprint(updated *storage.LoopRecord, queueItem storage.QueueItemRecord) {
+	metadata := parseJSONObject(queueItem.PayloadJSON)
+	fingerprint := stringFromAnyDefault(metadata["discoveryFingerprint"])
+	if strings.TrimSpace(fingerprint) == "" {
+		return
+	}
+	merged, err := loops.MergeLastFailedDiscoveryFingerprint(updated.MetadataJSON, fingerprint)
+	if err != nil {
+		return
+	}
+	updated.MetadataJSON = stringPtr(merged)
 }
 
 func normalizeLogin(login string) string { return strings.ToLower(strings.TrimSpace(login)) }
