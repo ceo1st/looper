@@ -3631,7 +3631,7 @@ func (r *Runner) requeueOrFailQueueItem(ctx context.Context, queueItem storage.Q
 			return nil, err
 		}
 	} else {
-		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 			return nil, err
 		}
 	}

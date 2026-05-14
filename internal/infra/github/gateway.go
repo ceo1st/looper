@@ -74,7 +74,9 @@ type PullRequestDetail struct {
 	Body              string
 	URL               string
 	State             string
+	CreatedAt         string
 	UpdatedAt         string
+	ClosedAt          string
 	IsDraft           bool
 	ReviewDecision    string
 	Labels            []string
@@ -84,12 +86,63 @@ type PullRequestDetail struct {
 	BaseSHA           string
 	Author            string
 	AuthorAssociation string
+	CommentCount      int
 	ReviewRequests    []string
 	HasConflicts      bool
 	Comments          []map[string]any
-	IssueComments     []map[string]any
+	IssueComments     []CommentInfo
 	Reviews           []map[string]any
 	Checks            []map[string]any
+}
+
+type CommentInfo struct {
+	ID                int64
+	Author            string
+	AuthorAssociation string
+	Body              string
+	CreatedAt         string
+	UpdatedAt         string
+	URL               string
+}
+
+type IssueTimelineInput struct {
+	Repo        string
+	IssueNumber int64
+	CWD         string
+}
+type IssueReactionInput struct {
+	Repo        string
+	IssueNumber int64
+	CommentID   int64
+	CWD         string
+}
+type LinkedPullRequestsInput struct {
+	Repo        string
+	IssueNumber int64
+	CWD         string
+}
+type PullRequestReviewStateInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
+}
+
+type IssueReaction struct {
+	ID        int64
+	Content   string
+	UserLogin string
+}
+type LinkedPullRequest struct {
+	Number         int64
+	State          string
+	Merged         bool
+	MergedAt       string
+	MergeCommitSHA string
+}
+type PullRequestReviewState struct {
+	RequestedReviewers  []string
+	LatestReviewPerUser map[string]string
+	LastReviewAt        string
 }
 
 type PullRequestHeadAndAuthor struct {
@@ -111,7 +164,23 @@ type IssueSummary struct {
 	IsPullRequest     bool
 }
 
-type IssueDetail = IssueSummary
+type IssueDetail struct {
+	Number            int64
+	Title             string
+	Body              string
+	URL               string
+	State             string
+	CreatedAt         string
+	UpdatedAt         string
+	ClosedAt          string
+	Author            string
+	AuthorAssociation string
+	Assignees         []string
+	Labels            []string
+	IsPullRequest     bool
+	CommentCount      int
+	Comments          []CommentInfo
+}
 
 type IssueCommentInput struct {
 	Repo        string
@@ -333,6 +402,7 @@ type ReviewThreadComment struct {
 	ID                string
 	Body              string
 	Author            string
+	AuthorAssociation string
 	CreatedAt         string
 	UpdatedAt         string
 	Path              string
@@ -598,19 +668,92 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 	if err != nil {
 		return IssueDetail{}, err
 	}
+	commentArgs := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber)}
+	if hostname != "" {
+		commentArgs = append(commentArgs, "--hostname", hostname)
+	}
+	commentsResult, err := g.runGh(ctx, input.CWD, "", commentArgs...)
+	if err != nil {
+		return IssueDetail{}, err
+	}
+	commentRows, err := decodeJSONArrayOrPages(commentsResult.Stdout)
+	if err != nil {
+		return IssueDetail{}, err
+	}
 	return IssueDetail{
 		Number:            asInt64(row["number"]),
 		Title:             asString(row["title"]),
 		Body:              asString(row["body"]),
 		URL:               firstNonEmpty(asString(row["html_url"]), asString(row["url"])),
 		State:             asString(row["state"]),
+		CreatedAt:         firstNonEmpty(asString(row["created_at"]), asString(row["createdAt"])),
 		UpdatedAt:         firstNonEmpty(asString(row["updated_at"]), asString(row["updatedAt"])),
+		ClosedAt:          firstNonEmpty(asString(row["closed_at"]), asString(row["closedAt"])),
 		Author:            extractAuthor(firstNonNil(row["user"], row["author"])),
 		AuthorAssociation: asString(row["author_association"]),
 		Assignees:         extractActorLogins(row["assignees"]),
 		Labels:            extractLabelNames(row["labels"]),
 		IsPullRequest:     row["pull_request"] != nil,
+		CommentCount:      len(commentRows),
+		Comments:          extractCommentInfos(commentRows),
 	}, nil
+}
+
+func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) ([]CommentInfo, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	return extractCommentInfos(rows), nil
+}
+
+func (g *Gateway) ListIssueTimeline(ctx context.Context, input IssueTimelineInput) ([]map[string]any, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/timeline", repo, input.IssueNumber), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	return decodeJSONArrayOrPages(result.Stdout)
+}
+
+func (g *Gateway) ListIssueReactions(ctx context.Context, input IssueReactionInput) ([]IssueReaction, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	endpoint := fmt.Sprintf("repos/%s/issues/%d/reactions", repo, input.IssueNumber)
+	if input.CommentID > 0 {
+		endpoint = fmt.Sprintf("repos/%s/issues/comments/%d/reactions", repo, input.CommentID)
+	}
+	args := []string{"api", "--paginate", "--slurp", endpoint, "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]IssueReaction, 0, len(rows))
+	for _, row := range rows {
+		if reaction, ok := normalizeReaction(row); ok {
+			out = append(out, IssueReaction{ID: reaction.ID, Content: reaction.Content, UserLogin: reaction.UserLogin})
+		}
+	}
+	return out, nil
 }
 
 func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInput) (IssueCommentResult, error) {
@@ -710,7 +853,7 @@ func compactIssueAssignees(values []string) []string {
 }
 
 func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", strings.Join([]string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}, ","))
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
@@ -728,7 +871,9 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 		Body:              asString(row["body"]),
 		URL:               asString(row["url"]),
 		State:             asString(row["state"]),
+		CreatedAt:         asString(row["createdAt"]),
 		UpdatedAt:         asString(row["updatedAt"]),
+		ClosedAt:          asString(row["closedAt"]),
 		IsDraft:           asBool(row["isDraft"]),
 		ReviewDecision:    asString(row["reviewDecision"]),
 		Labels:            extractLabelNames(row["labels"]),
@@ -738,13 +883,58 @@ func (g *Gateway) ViewPullRequest(ctx context.Context, input ViewPullRequestInpu
 		BaseSHA:           asString(row["baseRefOid"]),
 		Author:            extractAuthor(row["author"]),
 		AuthorAssociation: asString(row["authorAssociation"]),
+		CommentCount:      len(toObjectSlice(row["comments"])),
 		ReviewRequests:    extractReviewRequestLogins(row["reviewRequests"]),
 		HasConflicts:      asString(row["mergeStateStatus"]) == "DIRTY",
 		Comments:          threads,
-		IssueComments:     toObjectSlice(row["comments"]),
+		IssueComments:     extractCommentInfos(toObjectSlice(row["comments"])),
 		Reviews:           toObjectSlice(row["reviews"]),
 		Checks:            toObjectSlice(row["statusCheckRollup"]),
 	}, nil
+}
+
+func (g *Gateway) ListLinkedPullRequests(ctx context.Context, input LinkedPullRequestsInput) ([]LinkedPullRequest, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	owner, repoName := splitRepoOwnerName(repo)
+	out := make([]LinkedPullRequest, 0, 20)
+	cursor := ""
+	for {
+		nodes, nextCursor, hasNextPage, err := g.fetchLinkedPullRequestsPage(ctx, input.CWD, hostname, owner, repoName, input.IssueNumber, cursor)
+		if err != nil {
+			return nil, err
+		}
+		for _, node := range nodes {
+			mergeCommit, _ := node["mergeCommit"].(map[string]any)
+			out = append(out, LinkedPullRequest{Number: asInt64(node["number"]), State: asString(node["state"]), Merged: asString(node["state"]) == "MERGED" || asString(node["mergedAt"]) != "", MergedAt: asString(node["mergedAt"]), MergeCommitSHA: asString(mergeCommit["oid"])})
+		}
+		if !hasNextPage || nextCursor == "" {
+			break
+		}
+		cursor = nextCursor
+	}
+	return out, nil
+}
+
+func (g *Gateway) ListPullRequestReviewState(ctx context.Context, input PullRequestReviewStateInput) (PullRequestReviewState, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--json", "reviewRequests,reviews")
+	if err != nil {
+		return PullRequestReviewState{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return PullRequestReviewState{}, err
+	}
+	latest := map[string]string{}
+	last := ""
+	for _, review := range toObjectSlice(row["reviews"]) {
+		if user := extractAuthor(review["author"]); user != "" {
+			latest[user] = asString(review["state"])
+		}
+		if at := firstNonEmpty(asString(review["submittedAt"]), asString(review["updatedAt"])); at > last {
+			last = at
+		}
+	}
+	return PullRequestReviewState{RequestedReviewers: extractReviewRequestLogins(row["reviewRequests"]), LatestReviewPerUser: latest, LastReviewAt: last}, nil
 }
 
 func (g *Gateway) ClosePullRequest(ctx context.Context, input ClosePullRequestInput) error {
@@ -1796,7 +1986,7 @@ func (g *Gateway) fetchReviewThreadPage(ctx context.Context, cwd, owner, name st
 		"          id isResolved path line",
 		"          comments(first: 100) {",
 		"            nodes {",
-		"              id body createdAt updatedAt path line url",
+		"              id body createdAt updatedAt path line url authorAssociation",
 		"              author { login }",
 		"              originalCommit { oid }",
 		"              commit { oid }",
@@ -1832,7 +2022,7 @@ func (g *Gateway) fetchReviewThreadsSummaryPage(ctx context.Context, cwd, owner,
 		"          path",
 		"          line",
 		"          comments(first: 100) {",
-		"            nodes { id body updatedAt url path line author { login } }",
+		"            nodes { id body updatedAt url path line authorAssociation author { login } }",
 		"            pageInfo { hasNextPage endCursor }",
 		"          }",
 		"        }",
@@ -1859,7 +2049,7 @@ func (g *Gateway) fetchReviewThreadCommentsPage(ctx context.Context, cwd, thread
 		"    ... on PullRequestReviewThread {",
 		"      comments(first: 100, after: $after) {",
 		"        nodes {",
-		"          id body createdAt updatedAt path line url",
+		"          id body createdAt updatedAt path line url authorAssociation",
 		"          author { login }",
 		"          originalCommit { oid }",
 		"          commit { oid }",
@@ -1903,6 +2093,55 @@ func decodeReviewThreadsResponse(stdout string) ([]any, string, bool, error) {
 	return nodes, asString(pageInfo["endCursor"]), asBool(pageInfo["hasNextPage"]), nil
 }
 
+func (g *Gateway) fetchLinkedPullRequestsPage(ctx context.Context, cwd, hostname, owner, repo string, issueNumber int64, cursor string) ([]map[string]any, string, bool, error) {
+	args := []string{"api", "graphql", "-f", "query=" + strings.Join([]string{
+		"query($owner: String!, $repo: String!, $number: Int!, $after: String) {",
+		"  repository(owner: $owner, name: $repo) {",
+		"    issue(number: $number) {",
+		"      closedByPullRequestsReferences(first: 20, after: $after) {",
+		"        nodes {",
+		"          number",
+		"          state",
+		"          mergedAt",
+		"          mergeCommit { oid }",
+		"        }",
+		"        pageInfo { hasNextPage endCursor }",
+		"      }",
+		"    }",
+		"  }",
+		"}",
+	}, "\n"), "-F", "owner=" + owner, "-F", "repo=" + repo, "-F", fmt.Sprintf("number=%d", issueNumber)}
+	if cursor != "" {
+		args = append(args, "-F", "after="+cursor)
+	}
+	if strings.TrimSpace(hostname) != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, cwd, "", args...)
+	if err != nil {
+		return nil, "", false, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return nil, "", false, err
+	}
+	data, _ := row["data"].(map[string]any)
+	repository, _ := data["repository"].(map[string]any)
+	issue, _ := repository["issue"].(map[string]any)
+	refs, _ := issue["closedByPullRequestsReferences"].(map[string]any)
+	nodesAny, _ := refs["nodes"].([]any)
+	nodes := make([]map[string]any, 0, len(nodesAny))
+	for _, node := range nodesAny {
+		nodeRow, _ := node.(map[string]any)
+		if nodeRow == nil {
+			continue
+		}
+		nodes = append(nodes, nodeRow)
+	}
+	pageInfo, _ := refs["pageInfo"].(map[string]any)
+	return nodes, asString(pageInfo["endCursor"]), asBool(pageInfo["hasNextPage"]), nil
+}
+
 func appendReviewThreadComments(dst []ReviewThreadComment, nodes []any) []ReviewThreadComment {
 	for _, commentNode := range nodes {
 		commentRow, _ := commentNode.(map[string]any)
@@ -1910,7 +2149,7 @@ func appendReviewThreadComments(dst []ReviewThreadComment, nodes []any) []Review
 		if commentID == "" {
 			continue
 		}
-		dst = append(dst, ReviewThreadComment{ID: commentID, Body: asString(commentRow["body"]), Author: extractAuthor(commentRow["author"]), CreatedAt: asString(commentRow["createdAt"]), UpdatedAt: asString(commentRow["updatedAt"]), Path: asString(commentRow["path"]), Line: asInt64(commentRow["line"]), OriginalCommitOID: extractOID(commentRow["originalCommit"]), CommitOID: extractOID(commentRow["commit"]), URL: asString(commentRow["url"])})
+		dst = append(dst, ReviewThreadComment{ID: commentID, Body: asString(commentRow["body"]), Author: extractAuthor(commentRow["author"]), AuthorAssociation: asString(commentRow["authorAssociation"]), CreatedAt: asString(commentRow["createdAt"]), UpdatedAt: asString(commentRow["updatedAt"]), Path: asString(commentRow["path"]), Line: asInt64(commentRow["line"]), OriginalCommitOID: extractOID(commentRow["originalCommit"]), CommitOID: extractOID(commentRow["commit"]), URL: asString(commentRow["url"])})
 	}
 	return dst
 }
@@ -2306,6 +2545,46 @@ func toObjectSlice(value any) []map[string]any {
 		}
 	}
 	return out
+}
+
+func extractCommentInfos(value any) []CommentInfo {
+	items := toObjectSlice(value)
+	if len(items) == 0 {
+		if rows, ok := value.([]map[string]any); ok {
+			items = append(items, rows...)
+		}
+	}
+	out := make([]CommentInfo, 0, len(items))
+	for _, row := range items {
+		out = append(out, CommentInfo{
+			ID:                asInt64(firstNonNil(row["id"], row["databaseId"])),
+			Author:            extractAuthor(firstNonNil(row["author"], row["user"])),
+			AuthorAssociation: firstNonEmpty(asString(row["authorAssociation"]), asString(row["author_association"])),
+			Body:              asString(row["body"]),
+			CreatedAt:         firstNonEmpty(asString(row["createdAt"]), asString(row["created_at"])),
+			UpdatedAt:         firstNonEmpty(asString(row["updatedAt"]), asString(row["updated_at"])),
+			URL:               firstNonEmpty(asString(row["url"]), asString(row["html_url"])),
+		})
+	}
+	return out
+}
+
+func splitRepoOwnerName(repo string) (string, string) {
+	parts := strings.SplitN(strings.TrimSpace(repo), "/", 2)
+	if len(parts) != 2 {
+		return strings.TrimSpace(repo), ""
+	}
+	return parts[0], parts[1]
+}
+
+func digNodes(row map[string]any, path ...string) []map[string]any {
+	current := any(row)
+	for _, key := range path {
+		object, _ := current.(map[string]any)
+		current = object[key]
+	}
+	object, _ := current.(map[string]any)
+	return toObjectSlice(object["nodes"])
 }
 
 func extractAuthor(value any) string {

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,7 +46,9 @@ type pullRequestState struct {
 	Body              string              `json:"body,omitempty"`
 	URL               string              `json:"url,omitempty"`
 	State             string              `json:"state,omitempty"`
+	CreatedAt         string              `json:"createdAt,omitempty"`
 	UpdatedAt         string              `json:"updatedAt,omitempty"`
+	ClosedAt          string              `json:"closedAt,omitempty"`
 	IsDraft           bool                `json:"isDraft,omitempty"`
 	ReviewDecision    string              `json:"reviewDecision,omitempty"`
 	Labels            []string            `json:"labels,omitempty"`
@@ -200,6 +203,10 @@ func handleAPI(mode string, st state, stdin string) error {
 		if len(payload) == 0 || payload[len(payload)-1] != '\n' {
 			_, _ = fmt.Fprintln(os.Stdout)
 		}
+		return nil
+	}
+	if slices.Contains(args, "--paginate") {
+		_, _ = fmt.Fprintln(os.Stdout, `[]`)
 		return nil
 	}
 	if strings.Contains(route, "/compare/") {
@@ -485,6 +492,9 @@ func hydratePullRequest(pr pullRequestState) pullRequestState {
 	if pr.UpdatedAt == "" {
 		pr.UpdatedAt = "2026-05-12T00:00:00Z"
 	}
+	if pr.CreatedAt == "" {
+		pr.CreatedAt = pr.UpdatedAt
+	}
 	return pr
 }
 
@@ -500,8 +510,12 @@ func pullRequestFieldValue(pr pullRequestState, field string) any {
 		return pr.URL
 	case "state":
 		return pr.State
+	case "createdAt":
+		return pr.CreatedAt
 	case "updatedAt":
 		return pr.UpdatedAt
+	case "closedAt":
+		return pr.ClosedAt
 	case "isDraft":
 		return pr.IsDraft
 	case "reviewDecision":
@@ -770,6 +784,10 @@ func defaultValue(field string) any {
 		return "NONE"
 	case "updatedAt":
 		return "2026-05-12T00:00:00Z"
+	case "createdAt":
+		return "2026-05-12T00:00:00Z"
+	case "closedAt":
+		return ""
 	case "isDraft":
 		return false
 	case "reviewDecision":

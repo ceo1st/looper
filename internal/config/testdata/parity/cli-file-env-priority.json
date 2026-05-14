@@ -280,6 +280,17 @@
             "reopenCooldownDays": 30,
             "maxPerTick": 10
           },
+          "filter": {
+            "mode": "deterministic"
+          },
+          "proposer": {
+            "diagnosticMode": false,
+            "mode": "agent_apply",
+            "timeoutRateDryRunMinSamples": 3,
+            "timeoutRateDryRunThreshold": 0.5,
+            "timeoutSeconds": 180,
+            "schemaVersion": 2
+          },
           "lifecycle": {
             "pendingLabel": "looper:sweep-pending",
             "closedLabel": "looper:swept",

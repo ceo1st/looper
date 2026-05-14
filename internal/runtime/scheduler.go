@@ -56,6 +56,10 @@ type sweeperScheduler interface {
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*sweeper.ProcessResult, error)
 }
 
+type sweeperOperatorStatsProvider interface {
+	RepoOperatorStats(context.Context, string, string, int) (sweeper.RepoStats, error)
+}
+
 type snapshotScheduler interface {
 	CapturePullRequestSnapshot(context.Context, githubinfra.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error)
 }
@@ -81,6 +85,7 @@ type defaultSchedulerTickInput struct {
 	Worker                   workerScheduler
 	Sweeper                  sweeperScheduler
 	Snapshotter              snapshotScheduler
+	Config                   *config.Config
 	PlannerDiscoveryEnabled  *bool
 	ReviewerDiscoveryEnabled *bool
 	FixerDiscoveryEnabled    *bool
@@ -279,7 +284,7 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 	if err != nil {
 		return reviewer.PullRequestDetail{}, err
 	}
-	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, HasConflicts: detail.HasConflicts, ChecksSummary: summarizeCheckStates(detail.Checks), Comments: detail.Comments, IssueComments: detail.IssueComments, Reviews: detail.Reviews}, nil
+	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, HasConflicts: detail.HasConflicts, ChecksSummary: summarizeCheckStates(detail.Checks), Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Reviews: detail.Reviews}, nil
 }
 
 func (a reviewerGitHubAdapter) GetPullRequestHeadSHA(ctx context.Context, input reviewer.ViewPullRequestInput) (string, error) {
@@ -355,6 +360,9 @@ func (a reviewerGitHubAdapter) ResolveReviewThread(ctx context.Context, input re
 type reviewerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
 type reviewerAgentExecutionAdapter struct{ execution agent.Execution }
 
+type sweeperAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
+type sweeperAgentExecutionAdapter struct{ execution agent.Execution }
+
 type reviewerGitAdapter struct{ gateway *gitinfra.Gateway }
 
 func (a reviewerGitAdapter) CreateWorktree(ctx context.Context, input reviewer.CreateWorktreeInput) (reviewer.CreateWorktreeResult, error) {
@@ -397,6 +405,26 @@ func (a reviewerAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
+func (a sweeperAgentExecutorAdapter) Start(ctx context.Context, input sweeper.AgentRunInput) (sweeper.AgentExecution, error) {
+	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	if err != nil {
+		return nil, err
+	}
+	return sweeperAgentExecutionAdapter{execution: execution}, nil
+}
+
+func (a sweeperAgentExecutionAdapter) Wait(ctx context.Context) (sweeper.AgentResult, error) {
+	result, err := a.execution.Wait(ctx)
+	if err != nil {
+		return sweeper.AgentResult{}, err
+	}
+	return sweeper.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
+}
+
+func (a sweeperAgentExecutionAdapter) Kill(reason string) error {
+	return a.execution.Kill(reason)
+}
+
 type fixerGitHubAdapter struct {
 	gateway *githubinfra.Gateway
 	stamper disclosure.Stamper
@@ -427,7 +455,23 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 	if err != nil {
 		return fixer.PullRequestDetail{}, err
 	}
-	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: detail.IssueComments, Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+}
+
+func commentInfosToObjects(items []githubinfra.CommentInfo) []map[string]any {
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		out = append(out, map[string]any{
+			"id":                item.ID,
+			"author":            map[string]any{"login": item.Author},
+			"authorAssociation": item.AuthorAssociation,
+			"body":              item.Body,
+			"createdAt":         item.CreatedAt,
+			"updatedAt":         item.UpdatedAt,
+			"url":               item.URL,
+		})
+	}
+	return out
 }
 
 func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.ListReviewThreadsInput) ([]fixer.ReviewThread, error) {
@@ -851,6 +895,22 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 		LogDir: cfg.Daemon.LogDir,
 		Now:    now,
 	})
+	sweeperAgentModel := cfg.Roles.Sweeper.Proposer.Model
+	if sweeperAgentModel == nil || strings.TrimSpace(*sweeperAgentModel) == "" {
+		sweeperAgentModel = cfg.Agent.Model
+	}
+	sweeperAgentExecutor := agent.New(agent.ExecutorOptions{
+		Config: agent.ExecutorConfig{
+			Vendor:              *cfg.Agent.Vendor,
+			Model:               sweeperAgentModel,
+			Params:              cfg.Agent.Params,
+			Env:                 cfg.Agent.Env,
+			NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
+		},
+		Repos:  repos,
+		LogDir: cfg.Daemon.LogDir,
+		Now:    now,
+	})
 	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
 	stamper := disclosure.FromConfig(cfg)
 	agentRuntime := ""
@@ -985,7 +1045,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
 		},
 	})
-	sweeperRunner = sweeper.New(sweeper.Options{Repos: repos, GitHub: githubGateway, Logger: logger, Now: now, Config: &cfg})
+	sweeperRunner = sweeper.New(sweeper.Options{Repos: repos, GitHub: githubGateway, Agent: sweeperAgentExecutorAdapter{executor: sweeperAgentExecutor}, Logger: logger, Now: now, Config: &cfg, AgentRuntime: agentRuntime, AgentModel: sweeperAgentModel})
 
 	return func(ctx context.Context, services Services) error {
 		var runner schedulerAsyncRunner
@@ -1005,6 +1065,7 @@ func buildDefaultSchedulerTick(cfg config.Config, logger bootstrap.Logger, coord
 			Worker:                   workerRunner,
 			Sweeper:                  sweeperRunner,
 			Snapshotter:              githubGateway,
+			Config:                   &cfg,
 			PlannerDiscoveryEnabled:  boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
 			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
 			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
@@ -1159,6 +1220,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			continue
 		}
 		if input.Sweeper != nil && discoveryEnabled(input.SweeperDiscoveryEnabled) {
+			appendErr(applySweeperBackpressure(ctx, input, project, repo))
 			_, err := input.Sweeper.DiscoverIssues(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
 			appendErr(wrapSchedulerError("sweeper issue discovery", project.ID, repo, err))
 			_, err = input.Sweeper.DiscoverPullRequests(ctx, sweeper.DiscoveryInput{ProjectID: project.ID, Repo: repo})
@@ -1393,7 +1455,7 @@ func failSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord, in
 	if kind == "retryable_transient" && nextAttempts < item.MaxAttempts {
 		return input.Repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: item.ID, AvailableAt: nowISO, Attempts: nextAttempts, ErrorMessage: &message, ErrorKind: kind, UpdatedAt: nowISO})
 	}
-	return input.Repos.Queue.Fail(ctx, storage.QueueFailInput{ID: item.ID, FinishedAt: nowISO, ErrorMessage: &message, ErrorKind: kind, UpdatedAt: nowISO})
+	return input.Repos.Queue.Fail(ctx, storage.QueueFailInput{ID: item.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: &message, ErrorKind: kind, UpdatedAt: nowISO})
 }
 
 func repoFromProjectMetadata(metadataJSON *string) string {
@@ -1406,6 +1468,92 @@ func repoFromProjectMetadata(metadataJSON *string) string {
 	}
 	repo, _ := metadata["repo"].(string)
 	return strings.TrimSpace(repo)
+}
+
+func applySweeperBackpressure(ctx context.Context, input defaultSchedulerTickInput, project storage.ProjectRecord, repo string) error {
+	if input.Config == nil || input.Sweeper == nil || input.Repos == nil || input.Repos.Projects == nil {
+		return nil
+	}
+	statsProvider, ok := input.Sweeper.(sweeperOperatorStatsProvider)
+	if !ok {
+		return nil
+	}
+	roleCfg := config.ProjectRoleConfigs(*input.Config, project.ID).Sweeper
+	threshold := roleCfg.Proposer.TimeoutRateDryRunThreshold
+	minSamples := roleCfg.Proposer.TimeoutRateDryRunMinSamples
+	if threshold <= 0 {
+		return nil
+	}
+	meta := parseSchedulerProjectMetadata(project.MetadataJSON)
+	if meta.Sweeper.AutoDryRun {
+		return nil
+	}
+	stats, err := statsProvider.RepoOperatorStats(ctx, project.ID, repo, 1000)
+	if err != nil {
+		return fmt.Errorf("compute sweeper backpressure stats: %w", err)
+	}
+	if stats.AgentProposalCount < minSamples || stats.AgentTimeoutRate < threshold {
+		return nil
+	}
+	nowFn := input.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	nowISO := formatJavaScriptISOString(nowFn().UTC())
+	reason := fmt.Sprintf("agent timeout rate %.2f exceeded threshold %.2f across %d agent proposals", stats.AgentTimeoutRate, threshold, stats.AgentProposalCount)
+	updatedMetadata, err := mergeSchedulerProjectMetadata(project.MetadataJSON, map[string]any{"sweeper": map[string]any{"autoDryRun": true, "autoDryRunReason": reason, "autoDryRunSetAt": nowISO}})
+	if err != nil {
+		return fmt.Errorf("update sweeper backpressure metadata: %w", err)
+	}
+	updated := project
+	updated.MetadataJSON = &updatedMetadata
+	updated.UpdatedAt = nowISO
+	if err := input.Repos.Projects.Upsert(ctx, updated); err != nil {
+		return fmt.Errorf("persist sweeper backpressure override: %w", err)
+	}
+	if input.Repos.Notifications != nil {
+		dedupeKey := fmt.Sprintf("runtime.sweeper.auto_dry_run:%s:%s", project.ID, repo)
+		payloadJSON := fmt.Sprintf(`{"repo":%q,"reason":%q}`, repo, reason)
+		_ = input.Repos.Notifications.Upsert(ctx, storage.NotificationRecord{ID: dedupeKey, ProjectID: stringPtr(project.ID), EntityType: stringPtr("project"), EntityID: stringPtr(project.ID), Channel: "in_app", Level: "warning", Title: "Looper Sweeper Auto Dry-Run", Subtitle: stringPtr(repo), Body: reason, Status: "sent", DedupeKey: &dedupeKey, PayloadJSON: &payloadJSON, SentAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO})
+	}
+	if input.Logger != nil {
+		input.Logger.Warn("sweeper auto-enabled dry-run backpressure", map[string]any{"projectId": project.ID, "repo": repo, "reason": reason})
+	}
+	return nil
+}
+
+type schedulerProjectMetadata struct {
+	Sweeper struct {
+		AutoDryRun bool `json:"autoDryRun"`
+	} `json:"sweeper"`
+}
+
+func parseSchedulerProjectMetadata(metadataJSON *string) schedulerProjectMetadata {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return schedulerProjectMetadata{}
+	}
+	var metadata schedulerProjectMetadata
+	if err := json.Unmarshal([]byte(strings.TrimSpace(*metadataJSON)), &metadata); err != nil {
+		return schedulerProjectMetadata{}
+	}
+	return metadata
+}
+
+func mergeSchedulerProjectMetadata(current *string, updates map[string]any) (string, error) {
+	metadata := map[string]any{}
+	if current != nil && strings.TrimSpace(*current) != "" {
+		if err := json.Unmarshal([]byte(strings.TrimSpace(*current)), &metadata); err != nil {
+			return "", err
+		}
+	}
+	for key, value := range updates {
+		metadata[key] = value
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
 }
 
 func wrapSchedulerError(action, projectID, repo string, err error) error {
