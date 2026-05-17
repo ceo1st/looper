@@ -433,7 +433,7 @@ func (m *webhookForwarderManager) captureForwarderOutput(forwarder *managedWebho
 func (m *webhookForwarderManager) recordForwarderOutput(forwarder *managedWebhookForwarder, stream string, line string) {
 	entry := stream + ": " + line
 	m.mu.Lock()
-	forwarder.status.Tail = appendTail(forwarder.status.Tail, entry, m.tailLimit)
+	forwarder.status.Tail = appendManagerTail(forwarder.status.Tail, entry, m.tailLimit)
 	m.mu.Unlock()
 	if m.logger == nil {
 		return
@@ -542,7 +542,7 @@ func webhookForwardEndpoint(cfg config.Config) (*string, []string) {
 	if ghPath == "" {
 		reasons = append(reasons, "configured/resolved gh executable is missing")
 	}
-	if !isLoopbackHost(cfg.Server.Host) {
+	if !isManagerLoopbackHost(cfg.Server.Host) {
 		reasons = append(reasons, fmt.Sprintf("server host %q is not loopback", cfg.Server.Host))
 	}
 	if len(reasons) > 0 {
@@ -553,7 +553,7 @@ func webhookForwardEndpoint(cfg config.Config) (*string, []string) {
 		if err != nil {
 			return nil, []string{fmt.Sprintf("server.baseUrl is invalid: %s", err.Error())}
 		}
-		if !isLoopbackHost(base.Hostname()) {
+		if !isManagerLoopbackHost(base.Hostname()) {
 			return nil, []string{fmt.Sprintf("server.baseUrl host %q is not loopback", base.Hostname())}
 		}
 		resolved := base.ResolveReference(&url.URL{Path: webhookForwardPath})
@@ -564,7 +564,7 @@ func webhookForwardEndpoint(cfg config.Config) (*string, []string) {
 	return &endpoint, nil
 }
 
-func isLoopbackHost(host string) bool {
+func isManagerLoopbackHost(host string) bool {
 	host = strings.TrimSpace(host)
 	if host == "" {
 		return false
@@ -577,7 +577,7 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func appendTail(lines []string, line string, limit int) []string {
+func appendManagerTail(lines []string, line string, limit int) []string {
 	lines = append(lines, line)
 	if limit > 0 && len(lines) > limit {
 		return append([]string{}, lines[len(lines)-limit:]...)

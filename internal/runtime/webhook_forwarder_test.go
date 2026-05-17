@@ -328,8 +328,8 @@ func TestRuntimeStartDegradesWebhookWithoutFailingStartup(t *testing.T) {
 	defer rt.Stop("test cleanup")
 
 	status := rt.WebhookStatus()
-	if !status.Enabled || !status.Degraded || status.Healthy {
-		t.Fatalf("WebhookStatus() = %#v, want enabled degraded unhealthy status", status)
+	if !status.Enabled || !status.Degraded {
+		t.Fatalf("WebhookStatus() = %#v, want enabled degraded status", status)
 	}
 	if len(status.Forwarders) != 0 {
 		t.Fatalf("WebhookStatus().Forwarders = %v, want none when host is non-loopback", status.Forwarders)

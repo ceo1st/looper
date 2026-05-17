@@ -19,6 +19,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/webhookforward"
 )
 
 func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
@@ -1504,6 +1505,91 @@ func TestRuntimeTriggerSchedulerClaimRunsImmediatelyWithoutWaitingForPolling(t *
 	}
 }
 
+func TestRuntimeRecordWebhookDeliveryTriggersSchedulerTick(t *testing.T) {
+	t.Parallel()
+
+	wakeCh := make(chan struct{}, 1)
+	claimWakeCh := make(chan struct{}, 1)
+	rt := &Runtime{
+		schedulerWake:      wakeCh,
+		schedulerClaimWake: claimWakeCh,
+		webhook: &webhookRuntime{
+			now:    func() time.Time { return time.Date(2026, time.May, 16, 12, 0, 0, 0, time.UTC) },
+			status: WebhookStatus{RecentOutcomes: []WebhookRecentOutcome{}},
+		},
+	}
+
+	rt.RecordWebhookDelivery("pull_request", "delivery-1")
+
+	select {
+	case <-wakeCh:
+	default:
+		t.Fatal("schedulerWake was not triggered")
+	}
+	select {
+	case <-claimWakeCh:
+	default:
+		t.Fatal("schedulerClaimWake was not triggered")
+	}
+	status := rt.webhook.Status()
+	if status.Counters.DeliveriesReceived != 1 {
+		t.Fatalf("Status().Counters.DeliveriesReceived = %d, want 1", status.Counters.DeliveriesReceived)
+	}
+}
+
+func TestRuntimeWebhookStatusMergesForwarderStats(t *testing.T) {
+	t.Parallel()
+
+	rt := &Runtime{
+		webhook: &webhookRuntime{status: WebhookStatus{Enabled: true, RecentOutcomes: []WebhookRecentOutcome{{At: "2026-05-16T12:00:00.000Z", Outcome: "acknowledged", Message: "stale"}}}},
+		webhookForwarder: stubRuntimeWebhookForwarder{stats: webhookforward.Stats{
+			DeliveriesReceived:  7,
+			DeliveriesDeduped:   1,
+			DeliveriesIgnored:   2,
+			QueueCapacity:       128,
+			QueueEnqueued:       4,
+			QueueCoalesced:      3,
+			QueueRejected:       1,
+			ExecutionsSucceeded: 5,
+			ExecutionsFailed:    2,
+			InFlight:            2,
+			Queued:              6,
+			RecentOutcomes: []webhookforward.Outcome{{
+				At:         "2026-05-16T12:01:00.000Z",
+				Repo:       "nexu-io/looper",
+				ObjectType: "pull_request",
+				Number:     379,
+				EventType:  "pull_request",
+				Status:     "completed",
+			}},
+		}},
+	}
+
+	status := rt.WebhookStatus()
+	if status.Queue.Pending != 6 || status.Queue.Capacity != 128 || status.Queue.ActiveWorkers != 2 {
+		t.Fatalf("Status().Queue = %#v, want pending=6 capacity=128 activeWorkers=2", status.Queue)
+	}
+	if status.Counters.DeliveriesReceived != 7 || status.Counters.Coalesced != 3 || status.Counters.Dropped != 4 || status.Counters.Queued != 4 || status.Counters.Processed != 5 || status.Counters.Failed != 2 {
+		t.Fatalf("Status().Counters = %#v, want merged forwarder counters", status.Counters)
+	}
+	if len(status.RecentOutcomes) != 1 {
+		t.Fatalf("len(Status().RecentOutcomes) = %d, want 1", len(status.RecentOutcomes))
+	}
+	if status.RecentOutcomes[0].Outcome != "completed" || status.RecentOutcomes[0].Message != "nexu-io/looper · pull_request #379 · pull_request" {
+		t.Fatalf("Status().RecentOutcomes[0] = %#v, want merged forwarder outcome", status.RecentOutcomes[0])
+	}
+}
+
+type stubRuntimeWebhookForwarder struct{ stats webhookforward.Stats }
+
+func (s stubRuntimeWebhookForwarder) Forward(context.Context, webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error) {
+	return webhookforward.ForwardResult{}, nil
+}
+
+func (s stubRuntimeWebhookForwarder) Stats() webhookforward.Stats { return s.stats }
+
+func (stubRuntimeWebhookForwarder) Close() {}
+
 func TestRuntimeSchedulerPollIntervalUsesWebhookFallbackWhenEnabled(t *testing.T) {
 	t.Parallel()
 
@@ -1515,17 +1601,15 @@ func TestRuntimeSchedulerPollIntervalUsesWebhookFallbackWhenEnabled(t *testing.T
 	cfg.Webhook.Enabled = true
 	cfg.Webhook.FallbackPollIntervalSeconds = 90
 
-	rt := &Runtime{config: cfg}
-	if got := rt.schedulerPollInterval(); got != 90*time.Second {
-		t.Fatalf("schedulerPollInterval() = %s, want 90s", got)
+	if got := schedulerFullPollInterval(cfg); got != 90*time.Second {
+		t.Fatalf("schedulerFullPollInterval() = %s, want 90s", got)
 	}
 
-	rt.config.Webhook.Enabled = false
-	if got := rt.schedulerPollInterval(); got != 30*time.Second {
-		t.Fatalf("schedulerPollInterval() = %s, want 30s when webhook disabled", got)
+	cfg.Webhook.Enabled = false
+	if got := schedulerFullPollInterval(cfg); got != 30*time.Second {
+		t.Fatalf("schedulerFullPollInterval() = %s, want 30s when webhook disabled", got)
 	}
 }
-
 func TestRuntimeStopClosesCoordinatorAndUnblocksWaitForShutdown(t *testing.T) {
 	t.Parallel()
 

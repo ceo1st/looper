@@ -94,9 +94,12 @@
           },
           "webhook": {
             "enabled": false,
-            "healthy": true,
+            "endpointUrl": "http://127.0.0.1:17310/webhook/forward",
+            "fallbackPollIntervalSeconds": 300,
             "degraded": false,
-            "forwarders": []
+            "degradedReasons": [],
+            "configuredForwarders": 0,
+            "runningForwarders": 0
           },
           "loops": {
             "planner": {

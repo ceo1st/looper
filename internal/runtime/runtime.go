@@ -116,9 +116,7 @@ type Runtime struct {
 	recoveryDone       chan struct{}
 	activeExecutions   *ActiveExecutionRegistry
 	githubGateway      *githubinfra.Gateway
-	webhookForwarders  *webhookForwarderManager
-	webhookContext     context.Context
-	webhookCancel      context.CancelFunc
+	webhook            *webhookRuntime
 	webhookForwarder   WebhookForwarder
 	schedulerDisabled  bool
 	startupReadyOnce   sync.Once
@@ -180,6 +178,7 @@ func New(options Options) *Runtime {
 		recovery:               createEmptyRecoverySummary(),
 		shutdownCh:             make(chan struct{}),
 		activeExecutions:       NewActiveExecutionRegistry(),
+		webhook:                newWebhookRuntime(options.Config, options.Logger, now),
 	}
 	if !customSchedulerTick {
 		rt.runSchedulerTick = rt.executeDefaultSchedulerTick
@@ -214,17 +213,8 @@ func (r *Runtime) Stop(reason string) {
 		}
 
 		r.stopDeferredReviewerRecovery()
-		r.mu.RLock()
-		webhookCancel := r.webhookCancel
-		webhookForwarders := r.webhookForwarders
-		r.mu.RUnlock()
-		if webhookCancel != nil {
-			webhookCancel()
-		}
-		if webhookForwarders != nil {
-			webhookForwarders.Stop()
-		}
 		r.stopSchedulerLoop()
+		r.stopWebhookRuntime()
 
 		r.mu.Lock()
 		r.stopped = true
@@ -311,35 +301,100 @@ func (r *Runtime) RecoverySummary() RecoverySummary {
 	return r.recovery
 }
 
-func (r *Runtime) WebhookStatus() WebhookRuntimeStatus {
+func (r *Runtime) WebhookStatus() WebhookStatus {
 	r.mu.RLock()
-	manager := r.webhookForwarders
+	webhook := r.webhook
+	forwarder := r.webhookForwarder
 	r.mu.RUnlock()
-	if manager == nil {
-		return WebhookRuntimeStatus{}
+	if webhook == nil {
+		return WebhookStatus{}
 	}
-	return manager.Status()
+	status := webhook.Status()
+	if forwarder == nil {
+		return status
+	}
+	stats := forwarder.Stats()
+	status.Queue.Pending = stats.Queued
+	status.Queue.Capacity = stats.QueueCapacity
+	status.Queue.ActiveWorkers = stats.InFlight
+	status.Counters.DeliveriesReceived = int(stats.DeliveriesReceived)
+	status.Counters.Coalesced = int(stats.QueueCoalesced)
+	status.Counters.Dropped = int(stats.DeliveriesDeduped + stats.DeliveriesIgnored + stats.QueueRejected)
+	status.Counters.Queued = int(stats.QueueEnqueued)
+	status.Counters.Processed = int(stats.ExecutionsSucceeded)
+	status.Counters.Failed = int(stats.ExecutionsFailed)
+	status.RecentOutcomes = webhookRecentOutcomesFromStats(stats.RecentOutcomes)
+	return status
+}
+
+func (r *Runtime) RecordWebhookDelivery(eventType, deliveryID string) {
+	r.mu.RLock()
+	webhook := r.webhook
+	r.mu.RUnlock()
+	if webhook != nil {
+		webhook.RecordDelivery(eventType, deliveryID)
+		r.TriggerSchedulerTick()
+	}
+}
+
+func webhookRecentOutcomesFromStats(outcomes []webhookforward.Outcome) []WebhookRecentOutcome {
+	if len(outcomes) == 0 {
+		return []WebhookRecentOutcome{}
+	}
+	recent := make([]WebhookRecentOutcome, 0, len(outcomes))
+	for _, outcome := range outcomes {
+		recent = append(recent, WebhookRecentOutcome{
+			At:      outcome.At,
+			Outcome: outcome.Status,
+			Message: formatWebhookOutcomeMessage(outcome),
+		})
+	}
+	return recent
+}
+
+func formatWebhookOutcomeMessage(outcome webhookforward.Outcome) string {
+	parts := make([]string, 0, 4)
+	if repo := strings.TrimSpace(outcome.Repo); repo != "" {
+		parts = append(parts, repo)
+	}
+	if objectType := strings.TrimSpace(outcome.ObjectType); objectType != "" && outcome.Number > 0 {
+		parts = append(parts, fmt.Sprintf("%s #%d", objectType, outcome.Number))
+	}
+	if eventType := strings.TrimSpace(outcome.EventType); eventType != "" {
+		parts = append(parts, eventType)
+	}
+	message := strings.Join(parts, " · ")
+	if err := strings.TrimSpace(outcome.Error); err != "" {
+		if message == "" {
+			return err
+		}
+		return message + ": " + err
+	}
+	return message
+}
+
+func (r *Runtime) ReconcileWebhookForwarders() {
+	r.mu.RLock()
+	webhook := r.webhook
+	repositories := r.services.Repositories
+	r.mu.RUnlock()
+	if webhook != nil {
+		webhook.Reconcile(repositories)
+	}
 }
 
 func (r *Runtime) RefreshWebhookForwarders() error {
-	r.mu.RLock()
-	manager := r.webhookForwarders
-	repositories := r.services.Repositories
-	webhookCtx := r.webhookContext
-	stopped := r.stopped
-	r.mu.RUnlock()
-	if stopped || manager == nil || repositories == nil || repositories.Projects == nil || webhookCtx == nil {
-		return nil
-	}
-	projectsList, err := repositories.Projects.List(context.Background())
-	if err != nil {
-		return err
-	}
-	if err := webhookCtx.Err(); err != nil {
-		return nil
-	}
-	manager.Sync(webhookCtx, projectsList)
+	r.ReconcileWebhookForwarders()
 	return nil
+}
+
+func (r *Runtime) stopWebhookRuntime() {
+	r.mu.RLock()
+	webhook := r.webhook
+	r.mu.RUnlock()
+	if webhook != nil {
+		webhook.Stop()
+	}
 }
 
 func (r *Runtime) start(ctx context.Context) error {
@@ -428,22 +483,10 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	loopService := &loops.Service{DB: coordinator.DB(), Repos: repositories, Now: r.now}
 	runService := &runs.Service{DB: coordinator.DB(), Repos: repositories, Loops: loopService, Now: r.now}
-	webhookForwarderCtx, webhookCancel := context.WithCancel(context.Background())
-	defer func() {
-		if !started {
-			webhookCancel()
-		}
-	}()
-	webhookForwarders := newWebhookForwarderManager(webhookForwarderManagerOptions{Config: r.config, Logger: r.logger, Now: r.now, StopTimeout: r.shutdownTimeout})
 	startedAt := r.now().UTC()
 	if err := r.syncConfiguredProjects(ctx, projectService, r.config, startedAt); err != nil {
 		return err
 	}
-	projectsList, err := repositories.Projects.List(context.Background())
-	if err != nil {
-		return err
-	}
-	webhookForwarders.Sync(webhookForwarderCtx, projectsList)
 	r.mu.Lock()
 	if r.stopped {
 		r.mu.Unlock()
@@ -471,9 +514,6 @@ func (r *Runtime) start(ctx context.Context) error {
 		schedulerDisabled = r.config.Agent.Vendor == nil
 	}
 	r.githubGateway = githubGateway
-	r.webhookForwarders = webhookForwarders
-	r.webhookContext = webhookForwarderCtx
-	r.webhookCancel = webhookCancel
 	r.schedulerDisabled = schedulerDisabled
 	r.mu.Unlock()
 
@@ -535,6 +575,9 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		}
 		if !schedulerDisabled {
 			r.startSchedulerLoop()
+		}
+		if r.webhook != nil {
+			r.webhook.Start(repositories)
 		}
 		r.startDeferredReviewerRecovery(githubGateway)
 
@@ -646,7 +689,7 @@ func runtimeShouldRetryDependencyError(err error) bool {
 }
 
 func (r *Runtime) startSchedulerLoop() {
-	pollInterval := r.schedulerPollInterval()
+	pollInterval := schedulerFullPollInterval(r.config)
 	stopCh := make(chan struct{})
 	doneCh := make(chan struct{})
 	wakeCh := make(chan struct{}, 1)
@@ -701,12 +744,11 @@ func (r *Runtime) startSchedulerLoop() {
 	}()
 }
 
-func (r *Runtime) schedulerPollInterval() time.Duration {
-	pollIntervalSeconds := r.config.Scheduler.PollIntervalSeconds
-	if r.config.Webhook.Enabled {
-		pollIntervalSeconds = r.config.Webhook.FallbackPollIntervalSeconds
+func schedulerFullPollInterval(cfg config.Config) time.Duration {
+	if cfg.Webhook.Enabled {
+		return time.Duration(cfg.Webhook.FallbackPollIntervalSeconds) * time.Second
 	}
-	return time.Duration(pollIntervalSeconds) * time.Second
+	return time.Duration(cfg.Scheduler.PollIntervalSeconds) * time.Second
 }
 
 func (r *Runtime) stopSchedulerLoop() {

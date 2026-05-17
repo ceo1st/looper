@@ -354,8 +354,8 @@ func TestHandlerUnauthorized(t *testing.T) {
 
 func TestHandlerWebhookForwardAcceptsLoopbackAndTriggersSchedulerTick(t *testing.T) {
 	fixture := newTestFixture(t)
-	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
 	fixture.config.Webhook.Enabled = true
+	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
 	triggered := 0
 	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, WebhookForwarder: forwarder, TriggerSchedulerTick: func() { triggered++ }})
 
@@ -945,6 +945,31 @@ func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 	}
 }
 
+func TestHandlerProjectsCreateRouteReconcilesWebhookForwarders(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	reconciled := 0
+	runtime := webhookReconcileRuntime{Runtime: fixture.runtime, reconcile: func() { reconciled++ }}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewReader([]byte(`{"repoPath":"/tmp/repos/looper","name":"Looper"}`)))
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: runtime, ProjectsService: fakeProjectService{
+		addProject: func(context.Context, projects.AddInput) (projects.AddResult, error) {
+			metadataJSON := `{"repo":"acme/looper","worktreeRoot":null,"source":"api"}`
+			return projects.AddResult{
+				Project: storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/repos/looper", BaseBranch: stringPtr("main"), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
+			}, nil
+		},
+	}}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if reconciled != 1 {
+		t.Fatalf("ReconcileWebhookForwarders() calls = %d, want 1", reconciled)
+	}
+}
+
 func TestHandlerProjectsCreateRouteReturnsSuccessWhenWebhookRefreshFails(t *testing.T) {
 	t.Parallel()
 
@@ -1011,6 +1036,27 @@ func TestHandlerProjectsRemoveRouteDeletesProject(t *testing.T) {
 	}
 	if project != nil {
 		t.Fatalf("project after delete = %#v, want nil", project)
+	}
+}
+
+func TestHandlerProjectsRemoveRouteReconcilesWebhookForwarders(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	reconciled := 0
+	runtime := webhookReconcileRuntime{Runtime: fixture.runtime, reconcile: func() { reconciled++ }}
+	if err := runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/projects/project_1", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: runtime}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if reconciled != 1 {
+		t.Fatalf("ReconcileWebhookForwarders() calls = %d, want 1", reconciled)
 	}
 }
 
@@ -4829,6 +4875,43 @@ type testFixture struct {
 	now     time.Time
 	config  config.Config
 	runtime *looperdruntime.Runtime
+}
+
+type webhookReconcileRuntime struct {
+	*looperdruntime.Runtime
+	reconcile func()
+}
+
+func (r webhookReconcileRuntime) ReconcileWebhookForwarders() {
+	if r.reconcile != nil {
+		r.reconcile()
+	}
+}
+
+func (r webhookReconcileRuntime) RefreshWebhookForwarders() error {
+	r.ReconcileWebhookForwarders()
+	return nil
+}
+
+type webhookForwardRuntime struct {
+	*looperdruntime.Runtime
+	status func() looperdruntime.WebhookStatus
+	record func(string, string)
+}
+
+func (r webhookForwardRuntime) WebhookStatus() looperdruntime.WebhookStatus {
+	if r.status != nil {
+		return r.status()
+	}
+	return r.Runtime.WebhookStatus()
+}
+
+func (r webhookForwardRuntime) RecordWebhookDelivery(eventType, deliveryID string) {
+	if r.record != nil {
+		r.record(eventType, deliveryID)
+		return
+	}
+	r.Runtime.RecordWebhookDelivery(eventType, deliveryID)
 }
 
 func newTestFixture(t *testing.T) testFixture {

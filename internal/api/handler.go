@@ -41,6 +41,7 @@ const (
 	javaScriptISOString        = "2006-01-02T15:04:05.000Z"
 	loopLogsFollowPollInterval = 200 * time.Millisecond
 	activeRunHeartbeatTTL      = 30 * time.Minute
+	webhookListenerPath        = "/webhook/forward"
 )
 
 var nonProjectIDPattern = regexp.MustCompile(`[^a-z0-9]+`)
@@ -239,6 +240,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		h.writeSuccess(w, requestID, h.buildConfigResponse())
+		return
+	case apiBasePath + "/webhook/status":
+		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
+			return
+		}
+
+		h.writeSuccess(w, requestID, h.buildWebhookStatusResponse())
 		return
 	case apiBasePath + "/events":
 		payload, err := h.buildEventsRouteResponse(r)
@@ -489,11 +497,24 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 	if h.webhookForwarder == nil {
 		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Webhook forwarding is not configured"}
 	}
+	if runtimeWithWebhook, ok := any(h.context.Runtime).(interface {
+		WebhookStatus() looperdruntime.WebhookStatus
+	}); ok {
+		status := runtimeWithWebhook.WebhookStatus()
+		if !status.Enabled {
+			return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusServiceUnavailable, message: "webhook runtime is disabled; deliveries are not being processed"}
+		}
+		if status.Degraded {
+			return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusServiceUnavailable, message: "webhook runtime is degraded; deliveries are not being processed"}
+		}
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
-	result, err := h.webhookForwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: r.Header.Get("X-GitHub-Delivery"), EventType: r.Header.Get("X-GitHub-Event"), Payload: body})
+	deliveryID := r.Header.Get("X-GitHub-Delivery")
+	eventType := r.Header.Get("X-GitHub-Event")
+	result, err := h.webhookForwarder.Forward(r.Context(), webhookforward.DeliveryRequest{DeliveryID: deliveryID, EventType: eventType, Payload: body})
 	if err != nil {
 		status := http.StatusBadRequest
 		code := pkgapi.ErrorCodeValidationFailed
@@ -506,6 +527,12 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 			status = http.StatusServiceUnavailable
 		}
 		return webhookforward.ForwardResult{}, apiError{code: code, status: status, message: message}
+	}
+	if (strings.EqualFold(result.Status, "accepted") || result.WorkItems > 0) && any(h.context.Runtime) != nil {
+		runtimeWithWebhook, ok := any(h.context.Runtime).(interface{ RecordWebhookDelivery(string, string) })
+		if ok {
+			runtimeWithWebhook.RecordWebhookDelivery(eventType, deliveryID)
+		}
 	}
 	return result, nil
 }
@@ -785,12 +812,13 @@ type statusScheduler struct {
 }
 
 type statusWebhook struct {
-	Enabled         bool                                    `json:"enabled"`
-	Healthy         bool                                    `json:"healthy"`
-	Degraded        bool                                    `json:"degraded"`
-	Endpoint        *string                                 `json:"endpoint,omitempty"`
-	DegradedReasons []string                                `json:"degradedReasons,omitempty"`
-	Forwarders      []looperdruntime.WebhookForwarderStatus `json:"forwarders"`
+	Enabled                     bool     `json:"enabled"`
+	EndpointURL                 string   `json:"endpointUrl"`
+	FallbackPollIntervalSeconds int      `json:"fallbackPollIntervalSeconds"`
+	Degraded                    bool     `json:"degraded"`
+	DegradedReasons             []string `json:"degradedReasons"`
+	ConfiguredForwarders        int      `json:"configuredForwarders"`
+	RunningForwarders           int      `json:"runningForwarders"`
 }
 
 type statusLoopType struct {
@@ -898,6 +926,48 @@ func (h *Handler) buildConfigResponse() configResponse {
 	}
 }
 
+func (h *Handler) buildWebhookStatusResponse() looperdruntime.WebhookStatus {
+	if runtimeWithWebhook, ok := any(h.context.Runtime).(interface {
+		WebhookStatus() looperdruntime.WebhookStatus
+	}); ok {
+		return runtimeWithWebhook.WebhookStatus()
+	}
+	return looperdruntime.WebhookStatus{
+		Enabled:                     h.context.Config.Webhook.Enabled,
+		FallbackPollIntervalSeconds: h.context.Config.Webhook.FallbackPollIntervalSeconds,
+		ListenerPath:                "/webhook/forward",
+		EndpointURL:                 strings.TrimRight(serverBaseURL(h.context.Config.Server), "/") + "/webhook/forward",
+		DegradedReasons:             []string{},
+		RecentOutcomes:              []looperdruntime.WebhookRecentOutcome{},
+		Forwarders:                  []looperdruntime.WebhookForwarderState{},
+	}
+}
+
+func summarizeWebhookStatus(status looperdruntime.WebhookStatus) statusWebhook {
+	running := 0
+	for _, forwarder := range status.Forwarders {
+		if forwarder.Running {
+			running++
+		}
+	}
+	return statusWebhook{
+		Enabled:                     status.Enabled,
+		EndpointURL:                 status.EndpointURL,
+		FallbackPollIntervalSeconds: status.FallbackPollIntervalSeconds,
+		Degraded:                    status.Degraded,
+		DegradedReasons:             append([]string{}, status.DegradedReasons...),
+		ConfiguredForwarders:        len(status.Forwarders),
+		RunningForwarders:           running,
+	}
+}
+
+func serverBaseURL(cfg config.ServerConfig) string {
+	if cfg.BaseURL != nil && strings.TrimSpace(*cfg.BaseURL) != "" {
+		return strings.TrimSpace(*cfg.BaseURL)
+	}
+	return fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
+}
+
 func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, error) {
 	storageState, err := h.loadStorageState(ctx)
 	if err != nil {
@@ -927,20 +997,6 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	currentTarget := currentLooperdTarget()
 	installDir := filepath.Join(homeDirOrEmpty(), ".looper", "bin")
 	artifactName := looperdArtifactName(currentTarget)
-	webhookStatus := statusWebhook{Forwarders: []looperdruntime.WebhookForwarderStatus{}}
-	if runtimeWithWebhooks, ok := any(h.context.Runtime).(interface {
-		WebhookStatus() looperdruntime.WebhookRuntimeStatus
-	}); ok {
-		runtimeStatus := runtimeWithWebhooks.WebhookStatus()
-		webhookStatus = statusWebhook{
-			Enabled:         runtimeStatus.Enabled,
-			Healthy:         runtimeStatus.Healthy,
-			Degraded:        runtimeStatus.Degraded,
-			Endpoint:        runtimeStatus.Endpoint,
-			DegradedReasons: append([]string{}, runtimeStatus.DegradedReasons...),
-			Forwarders:      append([]looperdruntime.WebhookForwarderStatus{}, runtimeStatus.Forwarders...),
-		}
-	}
 
 	return statusResponse{
 		Service: statusService{
@@ -975,7 +1031,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			TotalRuns:      len(runs),
 			ActiveRuns:     runCounts["running"],
 		},
-		Webhook: webhookStatus,
+		Webhook: summarizeWebhookStatus(h.buildWebhookStatusResponse()),
 		Loops:   loopCounts,
 		Safety: statusSafety{
 			AllowAutoCommit:    h.context.Config.Defaults.AllowAutoCommit,
@@ -4933,11 +4989,13 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 }
 
 func (h *Handler) refreshWebhookForwarders() error {
-	refresher, ok := any(h.context.Runtime).(interface{ RefreshWebhookForwarders() error })
-	if !ok {
-		return nil
+	if refresher, ok := any(h.context.Runtime).(interface{ RefreshWebhookForwarders() error }); ok {
+		return refresher.RefreshWebhookForwarders()
 	}
-	return refresher.RefreshWebhookForwarders()
+	if refresher, ok := any(h.context.Runtime).(interface{ ReconcileWebhookForwarders() }); ok {
+		refresher.ReconcileWebhookForwarders()
+	}
+	return nil
 }
 
 func serializeProject(project storage.ProjectRecord, defaultBaseBranch string) projectResponse {
