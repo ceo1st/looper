@@ -896,18 +896,18 @@ type PartialCoordinatorDispatchConfig struct {
 	AssignTo   *string                                     `json:"assignTo,omitempty"`
 }
 
+type PartialCoordinatorDependenciesConfig struct {
+	Enabled           *bool `json:"enabled,omitempty"`
+	APITimeoutSeconds *int  `json:"apiTimeoutSeconds,omitempty"`
+	APIRetryAttempts  *int  `json:"apiRetryAttempts,omitempty"`
+}
+
 type PartialCoordinatorRoleConfig struct {
 	Enabled      *bool                                 `json:"enabled,omitempty"`
 	PollInterval *string                               `json:"pollInterval,omitempty"`
 	Triage       *PartialCoordinatorTriageConfig       `json:"triage,omitempty"`
 	Dispatch     *PartialCoordinatorDispatchConfig     `json:"dispatch,omitempty"`
 	Dependencies *PartialCoordinatorDependenciesConfig `json:"dependencies,omitempty"`
-}
-
-type PartialCoordinatorDependenciesConfig struct {
-	Enabled           *bool `json:"enabled,omitempty"`
-	APITimeoutSeconds *int  `json:"apiTimeoutSeconds,omitempty"`
-	APIRetryAttempts  *int  `json:"apiRetryAttempts,omitempty"`
 }
 
 type PartialRoleConfigs struct {
