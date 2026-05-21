@@ -183,6 +183,46 @@ func TestGatewayCreatesRestoresAndCleansWorktreesWithBranchProtection(t *testing
 	}
 }
 
+func TestGatewayWorktreeCleanIgnoresIgnoredFiles(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/ignore",
+		BaseBranch:   "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	writeFile(t, filepath.Join(worktree.WorktreePath, ".gitignore"), "*.log\n")
+	runGit(t, worktree.WorktreePath, "add", ".gitignore")
+	runGit(t, worktree.WorktreePath, "commit", "-m", "ignore logs")
+	runGit(t, worktree.WorktreePath, "config", "status.showIgnored", "matching")
+
+	writeFile(t, filepath.Join(worktree.WorktreePath, "debug.log"), "ignored\n")
+	clean, err := gateway.WorktreeClean(ctx, worktree.WorktreePath)
+	if err != nil {
+		t.Fatalf("WorktreeClean(ignored file) error = %v", err)
+	}
+	if !clean {
+		t.Fatal("WorktreeClean(ignored file) = false, want true")
+	}
+
+	writeFile(t, filepath.Join(worktree.WorktreePath, "note.txt"), "untracked\n")
+	clean, err = gateway.WorktreeClean(ctx, worktree.WorktreePath)
+	if err != nil {
+		t.Fatalf("WorktreeClean(untracked file) error = %v", err)
+	}
+	if clean {
+		t.Fatal("WorktreeClean(untracked file) = true, want false")
+	}
+}
+
 func TestGatewayKeepsPrimaryCheckoutCleanForDetachedFixerWorktree(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)

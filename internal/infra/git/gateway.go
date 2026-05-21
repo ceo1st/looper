@@ -481,6 +481,14 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 	return nil
 }
 
+func (g *Gateway) WorktreeClean(ctx context.Context, worktreePath string) (bool, error) {
+	entries, err := g.readStatus(ctx, worktreePath)
+	if err != nil {
+		return false, err
+	}
+	return len(entries) == 0, nil
+}
+
 func (g *Gateway) Push(ctx context.Context, input PushInput) error {
 	if err := g.AssertWritableBranch(input.Branch, input.ProtectedBranches); err != nil {
 		return err
@@ -919,7 +927,7 @@ type statusEntry struct {
 }
 
 func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntry, error) {
-	result, err := g.runGitResult(ctx, repoPath, nil, "status", "--porcelain", "--untracked-files=all")
+	result, err := g.runGitResult(ctx, repoPath, nil, "status", "--porcelain", "--untracked-files=all", "--ignored=no")
 	if err != nil {
 		return nil, err
 	}
@@ -931,6 +939,9 @@ func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntr
 			continue
 		}
 		if len(line) < 3 {
+			continue
+		}
+		if line[:2] == "!!" {
 			continue
 		}
 		entries = append(entries, statusEntry{Code: line[:2], Path: strings.TrimSpace(line[3:])})
