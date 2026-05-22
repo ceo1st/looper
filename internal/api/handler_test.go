@@ -4988,12 +4988,18 @@ func newTestFixture(t *testing.T) testFixture {
 	t.Helper()
 
 	rootDir := t.TempDir()
+	homeDir := t.TempDir()
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", homeDir, err)
+	}
+	t.Setenv("HOME", homeDir)
 	cfg, err := config.DefaultConfig(rootDir)
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
 
 	backupDir := filepath.Join(rootDir, "backups")
+	cfg.Network = config.NetworkConfig{}
 	cfg.Storage.DBPath = filepath.Join(rootDir, "state", "looper.sqlite")
 	cfg.Storage.BackupDir = &backupDir
 	cfg.Daemon.LogDir = filepath.Join(rootDir, "logs")
