@@ -129,6 +129,23 @@ func TestDiscoverPullRequestRoutedModeRequiresMatchingTargetLabel(t *testing.T) 
 	}
 }
 
+func TestDiscoverPullRequestRoutedModeAllowsUnknownReviewRequestUsers(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "reviewer", labels: []string{"looper:target:red"}, reviewRequestsUnknown: true}
+	autoDiscovery := true
+	cfg := config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}, Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{AutoDiscovery: &autoDiscovery}}}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true}, CustomInstructions: &cfg})
+
+	result, err := runner.DiscoverPullRequest(context.Background(), TargetedDiscoveryInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequest() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || len(result.CreatedLoopIDs) != 1 || result.Skipped != 0 {
+		t.Fatalf("result = %#v, want routed PR queued when review request users are unknown", result)
+	}
+}
+
 func TestDiscoverPullRequestsRoutedModeSelfReviewLoginRefreshFailureSkipsWithoutError(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -169,6 +186,20 @@ func TestRunFilterStepSkipsRoutedPullRequestWhenReviewRequestRemoved(t *testing.
 	}
 	if checkpoint.SkipKind != "routed_claim_ineligible" {
 		t.Fatalf("checkpoint = %#v, want routed_claim_ineligible skip", checkpoint)
+	}
+}
+
+func TestRunFilterStepAllowsRoutedPullRequestWhenReviewRequestUsersUnknown(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	cfg := config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{currentLogin: "reviewer"}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Labels: []string{"looper:target:red"}, ReviewRequests: nil, ReviewRequestUsers: nil}}})
+	if err != nil {
+		t.Fatalf("runFilterStep() error = %v", err)
+	}
+	if checkpoint.SkipKind != "" || checkpoint.SkipReason != "" {
+		t.Fatalf("checkpoint = %#v, want routed PR allowed when review request users are unknown", checkpoint)
 	}
 }
 
@@ -266,6 +297,30 @@ func TestRevalidateRoutedReviewerClaimAllowsSelfReviewWithoutReviewRequest(t *te
 	prNumber := int64(42)
 	if err := runner.revalidateRoutedReviewerClaim(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, storage.QueueItemRecord{Repo: &repo, PRNumber: &prNumber}); err != nil {
 		t.Fatalf("revalidateRoutedReviewerClaim() error = %v", err)
+	}
+}
+
+func TestRevalidateRoutedReviewerClaimAllowsUnknownReviewRequestUsers(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{labels: []string{"looper:target:red"}, reviewRequestsUnknown: true}
+	cfg := config.Config{
+		Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42},
+		Projects: []config.ProjectRefConfig{{
+			ID:       "project_1",
+			Name:     "Demo",
+			RepoPath: "/tmp/repo",
+			Network:  config.ProjectNetworkConfig{Mode: config.NetworkModeRouted},
+		}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := runner.revalidateRoutedReviewerClaim(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, storage.QueueItemRecord{Repo: &repo, PRNumber: &prNumber}); err != nil {
+		t.Fatalf("revalidateRoutedReviewerClaim() error = %v", err)
+	}
+	if github.currentLoginCalls != 0 {
+		t.Fatalf("GetCurrentUserLogin calls = %d, want 0 for unknown review request users", github.currentLoginCalls)
 	}
 }
 
@@ -1129,7 +1184,11 @@ func TestDiscoverPullRequestsRequeuesFollowUpOnNewHeadWithoutFreshReviewRequest(
 		t.Fatalf("len(QueueItems) = %d, want 1", len(result.QueueItems))
 	}
 	if result.QueueItems[0].PayloadJSON == nil || !contains(*result.QueueItems[0].PayloadJSON, `"headSha":"new-head"`) {
-		t.Fatalf("queue payload = %#v, want new head recorded", result.QueueItems[0].PayloadJSON)
+		payload := ""
+		if result.QueueItems[0].PayloadJSON != nil {
+			payload = *result.QueueItems[0].PayloadJSON
+		}
+		t.Fatalf("queue payload = %q, want new head recorded", payload)
 	}
 	persistedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
 	if err != nil {
@@ -2387,6 +2446,42 @@ func TestProcessClaimedItemSkipsQueuedAutomaticLoopWhenCurrentUserIsNotRequested
 	}
 	if got := intFromAny(loopMeta["iterationCount"]); got != 0 {
 		t.Fatalf("iterationCount = %d, want 0 for filter-only skip", got)
+	}
+}
+
+func TestProcessClaimedItemAllowsQueuedAutomaticLoopWhenReviewRequestsUnknown(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequestsUnknown: true, currentLogin: "bob", reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings; added clean signal", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings; added clean signal"}`, ParseStatus: "parsed"}}}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loop := storage.LoopRecord{ID: "loop_unknown_review_requests", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+
+	result, err := runner.ProcessClaimedItem(ctx, *claimed)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("agent starts=%d, want reviewer work to run when review request state is unknown", len(agent.starts))
 	}
 }
 
@@ -7797,6 +7892,7 @@ type fakeGitHubGateway struct {
 	reviewDecisionAfterFirstView    string
 	commentsAfterFirstView          []map[string]any
 	reviewRequests                  []string
+	reviewRequestsUnknown           bool
 	currentLogin                    string
 	currentLoginErr                 error
 	currentLoginCalls               int
@@ -7860,7 +7956,7 @@ func (g *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOp
 	}
 	author := g.effectiveAuthor()
 	users := append([]networkpolicy.GitHubUser(nil), g.reviewRequestUsers...)
-	if len(users) == 0 {
+	if len(users) == 0 && reviewRequests != nil {
 		users = make([]networkpolicy.GitHubUser, 0, len(reviewRequests))
 		for _, login := range reviewRequests {
 			users = append(users, networkpolicy.GitHubUser{Login: login})
@@ -7898,7 +7994,7 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 	}
 	reviewRequests := g.effectiveReviewRequests()
 	if g.removeReviewRequestOnSecondView && g.viewCalls >= 2 {
-		reviewRequests = nil
+		reviewRequests = []string{}
 	}
 	reviewDecision := g.reviewDecision
 	comments := g.comments
@@ -7922,7 +8018,7 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 		diff = "diff --git a/a.ts b/a.ts"
 	}
 	users := append([]networkpolicy.GitHubUser(nil), g.reviewRequestUsers...)
-	if len(users) == 0 {
+	if len(users) == 0 && reviewRequests != nil {
 		users = make([]networkpolicy.GitHubUser, 0, len(reviewRequests))
 		for _, login := range reviewRequests {
 			users = append(users, networkpolicy.GitHubUser{Login: login})
@@ -7985,8 +8081,13 @@ func cloneCommentMaps(comments []map[string]any) []map[string]any {
 }
 
 func (g *fakeGitHubGateway) effectiveReviewRequests() []string {
+	if g.reviewRequestsUnknown {
+		return nil
+	}
 	if g.reviewRequests != nil {
-		return append([]string(nil), g.reviewRequests...)
+		reviewRequests := make([]string, len(g.reviewRequests))
+		copy(reviewRequests, g.reviewRequests)
+		return reviewRequests
 	}
 	return []string{"octocat"}
 }
