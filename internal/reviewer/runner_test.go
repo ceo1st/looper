@@ -476,6 +476,34 @@ func TestReviewerFailedLoopRecoveryEligibilityWhitelist(t *testing.T) {
 	}
 }
 
+func TestReviewerFailedLoopRecoveryEligibilityUsesFreshDetailHeadForApproval(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"})
+	github := &fakeGitHubGateway{
+		viewHeadSHA: "fresh-head",
+		reviews: []map[string]any{{
+			"author": map[string]any{"login": "octocat"},
+			"state":  "APPROVED",
+			"commit": map[string]any{"oid": "fresh-head"},
+		}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true}})
+	loop, _ := fixture.repos.Loops.GetByID(context.Background(), loopID)
+
+	eligible, _, reason, err := runner.failedReviewerLoopRecoveryEligibility(context.Background(), *loop, PullRequestSummary{Number: 42, State: "OPEN", HeadSHA: "stale-head"})
+	if err != nil {
+		t.Fatalf("failedReviewerLoopRecoveryEligibility() error = %v", err)
+	}
+	if eligible || reason != "approved" {
+		t.Fatalf("eligible=%v reason=%q, want approved suppression", eligible, reason)
+	}
+	if github.viewCalls != 1 {
+		t.Fatalf("viewCalls = %d, want 1", github.viewCalls)
+	}
+}
+
 func TestReviewerFailedLoopRecoveryEnhancedTransientIsOptIn(t *testing.T) {
 	t.Parallel()
 	message := `Post "https://api.github.com/graphql": EOF`
@@ -6549,6 +6577,48 @@ func TestDiscoverPullRequestsUsesReviewRequestedQueryWhenReviewRequestRequired(t
 	}
 	if len(result.QueueItems) != 1 || result.QueueItems[0].PRNumber == nil || *result.QueueItems[0].PRNumber != 77 {
 		t.Fatalf("queue items = %#v, want PR 77 queued", result.QueueItems)
+	}
+}
+
+func TestDiscoverPullRequestsSuppressesConflictedLastFilterSkipFromReviewRequestedQuery(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		currentLogin: "OctoCat",
+		reviewRequestedPullRequests: []PullRequestSummary{{
+			Number:             77,
+			Title:              "Conflicted review request",
+			State:              "OPEN",
+			HeadSHA:            "head77",
+			BaseSHA:            "base77",
+			HasConflicts:       true,
+			Author:             "contributor",
+			ReviewRequests:     []string{"octocat"},
+			ReviewRequestUsers: []networkpolicy.GitHubUser{{Login: "octocat"}},
+		}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{}, LabelMode: config.LabelModeAll}})
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(77)
+	metadata := `{"followUpdates":true,"lastFilterSkip":{"kind":"conflicted","reason":"Skipped conflicted pull request acme/looper#77","recordedAt":"2026-06-05T10:00:00Z","headSha":"head77"}}`
+	loop := storage.LoopRecord{ID: "loop_conflicted_review_request", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo, Limit: 10})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(github.listReviewRequestedCalls) != 1 {
+		t.Fatalf("review-requested calls = %#v, want one call", github.listReviewRequestedCalls)
+	}
+	if len(result.QueueItems) != 0 {
+		t.Fatalf("queue items = %#v, want conflicted lastFilterSkip preserved", result.QueueItems)
+	}
+	if result.Skipped != 1 {
+		t.Fatalf("Skipped = %d, want conflicted lastFilterSkip suppression", result.Skipped)
 	}
 }
 

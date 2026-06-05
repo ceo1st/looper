@@ -30,8 +30,9 @@ const (
 )
 
 var (
-	prListJSONFields = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}
-	prViewJSONFields = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}
+	prListJSONFields          = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "mergeStateStatus"}
+	prDiscoveryListJSONFields = []string{"number", "title", "url", "state", "updatedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
+	prViewJSONFields          = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "comments", "reviews", "statusCheckRollup", "mergeStateStatus"}
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
@@ -700,14 +701,6 @@ query($searchQuery: String!, $first: Int!) {
         baseRefOid
         mergeStateStatus
         author { login }
-        reviews(last: 20) {
-          nodes {
-            state
-            author { login }
-            submittedAt
-            updatedAt
-          }
-        }
       }
     }
   }
@@ -749,16 +742,19 @@ query($searchQuery: String!, $first: Int!) {
 			Author:             extractAuthor(node["author"]),
 			ReviewRequests:     []string{reviewer},
 			ReviewRequestUsers: []GitHubUser{{Login: reviewer}},
-			Reviews:            extractReviewNodesFromConnection(node["reviews"]),
 		})
 	}
 	return out, nil
 }
 
 func (g *Gateway) listOpenPullRequestsRaw(ctx context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
-	rows, err := g.listOpenPullRequestRows(ctx, input, prListJSONFields)
+	return g.listOpenPullRequestsWithFields(ctx, input, prListJSONFields)
+}
+
+func (g *Gateway) listOpenPullRequestsWithFields(ctx context.Context, input ListOpenPullRequestsInput, fields []string) ([]PullRequestSummary, error) {
+	rows, err := g.listOpenPullRequestRows(ctx, input, fields)
 	if err != nil && IsInaccessibleReviewRequestReviewerError(err) {
-		rows, err = g.listOpenPullRequestRows(ctx, input, withoutJSONField(prListJSONFields, "reviewRequests"))
+		rows, err = g.listOpenPullRequestRows(ctx, input, withoutJSONField(fields, "reviewRequests"))
 	}
 	if err != nil {
 		return nil, err
