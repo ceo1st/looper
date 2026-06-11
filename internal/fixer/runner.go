@@ -1490,7 +1490,7 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	if err := r.reconcileRecoveredLoop(ctx, queueItem, failedQueue, failure.kind); err != nil {
 		return nil, err
 	}
-	if queueItem.LoopID != nil && queueItem.Repo != nil && queueItem.PRNumber != nil && (failedQueue == nil || failedQueue.Status != "queued") {
+	if queueItem.LoopID != nil && queueItem.Repo != nil && queueItem.PRNumber != nil && queueResultIsTerminalForCleanup(failedQueue) {
 		loop, err := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
 		if err != nil {
 			return nil, err
@@ -1521,12 +1521,8 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 			updated.Status = "queued"
 			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 		} else {
-			if loops.ShouldPauseLoopAfterFailure(string(failureKind), failedQueue, "") {
-				updated.Status = "paused"
-			} else {
-				updated.Status = "failed"
-				stampFixerFailedDiscoveryFingerprint(updated, queueItem)
-			}
+			updated.Status = "paused"
+			stampFixerFailedDiscoveryFingerprint(updated, queueItem)
 			updated.NextRunAt = nil
 		}
 	})
@@ -1633,18 +1629,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				updated.Status = "queued"
 				updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 			} else {
-				if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, latest.ResumePolicy) {
-					updated.Status = "paused"
-				} else {
-					updated.Status = "failed"
-					stampFixerFailedDiscoveryFingerprint(updated, queueItem)
-				}
+				updated.Status = "paused"
+				stampFixerFailedDiscoveryFingerprint(updated, queueItem)
 				updated.NextRunAt = nil
 			}
 		}); err != nil {
 			return ProcessResult{}, err
 		}
-		if failedQueue == nil || failedQueue.Status != "queued" {
+		if queueResultIsTerminalForCleanup(failedQueue) {
 			if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 				return ProcessResult{}, err
 			} else if scheduled {
@@ -1652,7 +1644,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 			}
 		}
-		if failedQueue == nil || failedQueue.Status != "queued" {
+		if queueResultIsTerminalForCleanup(failedQueue) {
 			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
 		}
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
@@ -1769,18 +1761,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					updated.Status = "queued"
 					updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 				} else {
-					if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, latest.ResumePolicy) {
-						updated.Status = "paused"
-					} else {
-						updated.Status = "failed"
-						stampFixerFailedDiscoveryFingerprint(updated, queueItem)
-					}
+					updated.Status = "paused"
+					stampFixerFailedDiscoveryFingerprint(updated, queueItem)
 					updated.NextRunAt = nil
 				}
 			}); err != nil {
 				return ProcessResult{}, err
 			}
-			if failedQueue == nil || failedQueue.Status != "queued" {
+			if queueResultIsTerminalForCleanup(failedQueue) {
 				if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 					return ProcessResult{}, err
 				} else if scheduled {
@@ -1788,7 +1776,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 				}
 			}
-			if failedQueue == nil || failedQueue.Status != "queued" {
+			if queueResultIsTerminalForCleanup(failedQueue) {
 				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
@@ -4266,15 +4254,15 @@ func (r *Runner) requeueQueueItem(ctx context.Context, queueItem storage.QueueIt
 
 func (r *Runner) requeueOrFailQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string, nextAttempts int64) (*storage.QueueItemRecord, error) {
 	nowISO := r.nowISO()
-	if isRetryableFailure(kind) && nextAttempts < queueItem.MaxAttempts {
-		retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, nextAttempts)))
-		if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
-			return nil, err
-		}
-	} else {
+	if !shouldRetryQueueFailure(kind, nextAttempts, queueItem.MaxAttempts) {
 		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 			return nil, err
 		}
+		return r.repos.Queue.GetByID(ctx, queueItem.ID)
+	}
+	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, cappedRetryDelayAttempt(nextAttempts, queueItem.MaxAttempts))))
+	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		return nil, err
 	}
 	return r.repos.Queue.GetByID(ctx, queueItem.ID)
 }
@@ -5010,6 +4998,10 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 	}
 	checkpoint.Worktree.CleanedAt = r.nowISO()
 	r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.cleaned", projectID: project.ID, entityType: "pull_request", entityID: project.ID, payload: map[string]any{"path": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch}})
+}
+
+func queueResultIsTerminalForCleanup(queue *storage.QueueItemRecord) bool {
+	return queue == nil || (queue.Status != "queued" && queue.Status != "manual_intervention")
 }
 
 type waitForPullRequestHeadSHAInput struct {
@@ -6002,6 +5994,13 @@ func backoffDelay(base time.Duration, attempts int64) time.Duration {
 
 func isRetryableFailure(kind QueueFailureKind) bool {
 	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume
+}
+
+func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
+	if !isRetryableFailure(kind) {
+		return false
+	}
+	return maxAttempts <= 0 || nextAttempts < maxAttempts
 }
 
 func normalizePRState(value string) string {
@@ -7058,6 +7057,16 @@ func optionalString(value string) *string {
 }
 
 func stringPtr(value string) *string { return &value }
+
+func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
+	if attempts <= 0 {
+		return 1
+	}
+	if maxAttempts > 0 && attempts > maxAttempts {
+		return maxAttempts
+	}
+	return attempts
+}
 
 func derefString(value *string) string {
 	if value == nil {

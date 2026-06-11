@@ -1277,11 +1277,81 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				return RecoverySummary{}, err
 			}
 			eventsWritten += 1
+			terminalNormalizedLoopIDs[loop.ID] = struct{}{}
 			continue
 		}
 
 		_, latestRunHasActiveAgent := activeAgentRunIDs[derefRunID(latestRun)]
 		_, latestRunHasUncertainAgent := uncertainAgentRunIDs[derefRunID(latestRun)]
+		if latestQueueIsManualIntervention(latestQueue) && (loop.Status == "running" || loop.Status == "queued") {
+			if latestQueue.Status == "manual_intervention" {
+				normalizedLoop := loop
+				normalizedLoop.Status = normalizeStaleQueuedLoopStatus(loop, derefRunOrZero(latestRun))
+				normalizedLoop.NextRunAt = nil
+				if latestRun != nil {
+					normalizedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
+				}
+				normalizedLoop.UpdatedAt = nowISO
+				if err := repositories.Loops.Upsert(ctx, normalizedLoop); err != nil {
+					return RecoverySummary{}, err
+				}
+				terminalNormalizedLoopIDs[loop.ID] = struct{}{}
+				latestRunStatus := ""
+				if latestRun != nil {
+					latestRunStatus = latestRun.Status
+				}
+				if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+					ID:         newRuntimeEventID(),
+					EventType:  "looperd.recovery.loop_queue_normalized",
+					LoopID:     stringPtr(loop.ID),
+					EntityType: stringPtr("loop"),
+					EntityID:   stringPtr(loop.ID),
+					PayloadJSON: mustMarshalJSON(map[string]any{
+						"previousStatus":  loop.Status,
+						"recoveredStatus": normalizedLoop.Status,
+						"latestRunStatus": latestRunStatus,
+					}),
+					CreatedAt: nowISO,
+				}); err != nil {
+					return RecoverySummary{}, err
+				}
+				eventsWritten += 1
+				continue
+			}
+
+			requeuedLoop := loop
+			requeuedLoop.Status = "queued"
+			requeuedLoop.NextRunAt = stringPtr(nowISO)
+			if latestRun != nil {
+				requeuedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
+			}
+			requeuedLoop.UpdatedAt = nowISO
+			if _, err := repositories.Queue.RequeueRunningByLoop(ctx, loop.ID, nowISO); err != nil {
+				return RecoverySummary{}, err
+			}
+			if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
+				return RecoverySummary{}, err
+			}
+			requeuedLoopIDs[loop.ID] = struct{}{}
+			if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+				ID:         newRuntimeEventID(),
+				EventType:  "looperd.recovery.loop_manual_intervention_requeued",
+				LoopID:     stringPtr(loop.ID),
+				EntityType: stringPtr("loop"),
+				EntityID:   stringPtr(loop.ID),
+				PayloadJSON: mustMarshalJSON(map[string]any{
+					"previousStatus":  loop.Status,
+					"recoveredStatus": requeuedLoop.Status,
+					"queueItemId":     latestQueue.ID,
+					"lastErrorKind":   derefString(latestQueue.LastErrorKind),
+				}),
+				CreatedAt: nowISO,
+			}); err != nil {
+				return RecoverySummary{}, err
+			}
+			eventsWritten += 1
+			continue
+		}
 		if shouldRequeueLoop(loop, latestRun, latestRunHasActiveAgent || latestRunHasUncertainAgent) {
 			requeuedLoop := loop
 			requeuedLoop.Status = "queued"
@@ -1830,6 +1900,43 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 	summary := staleRunQueueRepairSummary{}
 	if repositories == nil || repositories.Queue == nil {
 		return summary, nil
+	}
+	latestQueue, err := repositories.Queue.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil {
+		return staleRunQueueRepairSummary{}, err
+	}
+	if latestQueueIsManualIntervention(latestQueue) {
+		if loop.Status == "running" || loop.Status == "queued" {
+			if latestQueue.Status == "manual_intervention" {
+				normalizedLoop := loop
+				normalizedLoop.Status = normalizeStaleQueuedLoopStatus(loop, derefRunOrZero(latestRun))
+				normalizedLoop.NextRunAt = nil
+				if latestRun != nil {
+					normalizedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
+				}
+				normalizedLoop.UpdatedAt = nowISO
+				if err := repositories.Loops.Upsert(ctx, normalizedLoop); err != nil {
+					return staleRunQueueRepairSummary{}, err
+				}
+			} else if latestQueue.Status == "running" {
+				requeuedLoop := loop
+				requeuedLoop.Status = "queued"
+				requeuedLoop.NextRunAt = stringPtr(nowISO)
+				if latestRun != nil {
+					requeuedLoop.LastRunAt = coalesceString(latestRun.EndedAt, stringPtr(latestRun.StartedAt), loop.LastRunAt)
+				}
+				requeuedLoop.UpdatedAt = nowISO
+				if _, err := repositories.Queue.RequeueRunningByLoop(ctx, loop.ID, nowISO); err != nil {
+					return staleRunQueueRepairSummary{}, err
+				}
+				if err := repositories.Loops.Upsert(ctx, requeuedLoop); err != nil {
+					return staleRunQueueRepairSummary{}, err
+				}
+				summary.LoopsRequeued = 1
+				summary.QueueItemsRequeued = 1
+				return summary, nil
+			}
+		}
 	}
 	if shouldRequeueLoop(loop, latestRun, latestRunHasLiveAgent) {
 		requeuedLoop := loop
@@ -2870,8 +2977,19 @@ func normalizeStaleQueuedLoopStatus(loop storage.LoopRecord, latestRun storage.R
 	case "interrupted", "running":
 		return "interrupted"
 	default:
-		return "failed"
+		return "paused"
 	}
+}
+
+func latestQueueIsManualIntervention(queue *storage.QueueItemRecord) bool {
+	return queue != nil && (queue.Status == "manual_intervention" || (queue.LastErrorKind != nil && *queue.LastErrorKind == "manual_intervention"))
+}
+
+func derefRunOrZero(run *storage.RunRecord) storage.RunRecord {
+	if run == nil {
+		return storage.RunRecord{}
+	}
+	return *run
 }
 
 func mustMarshalJSON(value any) string {

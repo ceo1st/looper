@@ -1354,11 +1354,7 @@ func (r *Runner) finalizeClaimSetupFailure(ctx context.Context, queueItem storag
 			updated.Status = "queued"
 			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 		} else {
-			if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, "") {
-				updated.Status = "paused"
-			} else {
-				updated.Status = "failed"
-			}
+			updated.Status = "paused"
 			updated.NextRunAt = nil
 		}
 	})
@@ -1514,17 +1510,16 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					terminalFailure = true
 					updated.Status = "failed"
 					updated.NextRunAt = nil
+				} else if failure.interrupted && terminalReviewerLoopReason(*updated) == "failed" {
+					updated.Status = "paused"
+					updated.NextRunAt = nil
 				} else if updated.Status == "paused" {
 					updated.NextRunAt = nil
 				} else if failedQueue != nil && failedQueue.Status == "queued" {
 					updated.Status = "queued"
 					updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 				} else {
-					if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, latest.ResumePolicy) {
-						updated.Status = "paused"
-					} else {
-						updated.Status = "failed"
-					}
+					updated.Status = "paused"
 					updated.NextRunAt = nil
 				}
 			})
@@ -1532,12 +1527,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				return ProcessResult{}, loopErr
 			}
 			if terminalFailure && failedQueue != nil && failedQueue.Status == "queued" {
-				if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: failedQueue.ID, Attempts: failedQueue.Attempts, FinishedAt: r.nowISO(), ErrorMessage: optionalString(failure.message), ErrorKind: string(failure.kind), UpdatedAt: r.nowISO()}); err != nil {
+				if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: failedQueue.ID, FinishedAt: r.nowISO(), ErrorMessage: optionalString(failure.message), ErrorKind: string(failure.kind), UpdatedAt: r.nowISO()}); err != nil {
 					return ProcessResult{}, err
 				}
 				failedQueue.Status = "failed"
 			}
-			if failedQueue == nil || failedQueue.Status != "queued" {
+			if queueResultIsTerminalForCleanup(failedQueue) {
 				r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &latest)
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: runStatus, Summary: failure.message, FailureKind: failure.kind}, nil
@@ -4345,22 +4340,32 @@ func buildReviewerDedupeKey(projectID, loopID, repo string, prNumber int64) stri
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
 	nextAttempts := queueItem.Attempts + 1
 	nowISO := r.nowISO()
-	if isRetryableFailure(kind) && nextAttempts < queueItem.MaxAttempts {
-		delay := backoffDelay(r.retryBaseDelay, nextAttempts, r.retryMaxDelayForProject(derefString(queueItem.ProjectID)))
-		retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(delay))
-		if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
-			return nil, err
-		}
-	} else {
+	if !shouldRetryQueueFailure(kind, nextAttempts, queueItem.MaxAttempts) {
 		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 			return nil, err
 		}
+		return r.repos.Queue.GetByID(ctx, queueItem.ID)
+	}
+	delay := backoffDelay(r.retryBaseDelay, cappedRetryDelayAttempt(nextAttempts, queueItem.MaxAttempts), r.retryMaxDelayForProject(derefString(queueItem.ProjectID)))
+	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(delay))
+	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		return nil, err
 	}
 	updated, err := r.repos.Queue.GetByID(ctx, queueItem.ID)
 	if err != nil {
 		return nil, err
 	}
 	return updated, nil
+}
+
+func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
+	if attempts <= 0 {
+		return 1
+	}
+	if maxAttempts > 0 && attempts > maxAttempts {
+		return maxAttempts
+	}
+	return attempts
 }
 
 func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, error) {
@@ -5852,6 +5857,10 @@ func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project 
 	checkpoint.Worktree.CleanedAt = r.nowISO()
 }
 
+func queueResultIsTerminalForCleanup(queue *storage.QueueItemRecord) bool {
+	return queue == nil || (queue.Status != "queued" && queue.Status != "manual_intervention")
+}
+
 func requireWorktree(checkpoint reviewerCheckpoint) (*checkpointWorktree, error) {
 	if checkpoint.Worktree == nil {
 		return nil, &loopError{message: "Missing reviewer worktree checkpoint for review step", kind: FailureRetryableTransient}
@@ -6046,6 +6055,13 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 
 func isRetryableFailure(kind QueueFailureKind) bool {
 	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume
+}
+
+func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
+	if !isRetryableFailure(kind) {
+		return false
+	}
+	return maxAttempts <= 0 || nextAttempts < maxAttempts
 }
 
 func cloneStrings(values []string) []string {

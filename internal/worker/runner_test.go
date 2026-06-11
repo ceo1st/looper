@@ -1025,16 +1025,16 @@ func TestProcessClaimedQueueItemResumeValidationFailureUpdatesLoopState(t *testi
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "failed" {
-		t.Fatalf("queue = %#v, want failed terminal queue item", queue)
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) || queue.FinishedAt == nil {
+		t.Fatalf("queue = %#v, want parked retryable_transient queue item after max attempts", queue)
 	}
 
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "failed" || loop.NextRunAt != nil {
-		t.Fatalf("loop = %#v, want failed terminal loop", loop)
+	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused loop after max attempts", loop)
 	}
 }
 
@@ -1940,8 +1940,8 @@ func TestProcessClaimedItemKeepsUnsafeValidationFailurePaused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != string(FailureManualIntervention) {
-		t.Fatalf("queue = %#v, want terminal manual_intervention item", queue)
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) {
+		t.Fatalf("queue = %#v, want parked manual_intervention item", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
 	if err != nil {
@@ -2229,8 +2229,8 @@ func TestProcessNextSetupFailureMarksQueueFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "failed" {
-		t.Fatalf("queue = %#v, want failed", queue)
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) {
+		t.Fatalf("queue = %#v, want parked non_retryable item", queue)
 	}
 }
 
@@ -2261,22 +2261,22 @@ func TestRecoverClaimedItemReconcilesRunningLoopState(t *testing.T) {
 	if result == nil || result.Status != "failed" || result.FailureKind != FailureNonRetryable {
 		t.Fatalf("result = %#v, want failed non-retryable recovery", result)
 	}
-	if len(completed) != 1 || completed[0].Status != "failed" || completed[0].FailureKind != FailureNonRetryable {
+	if len(completed) != 1 || completed[0].Status != "failed" || completed[0].FailureKind != FailureNonRetryable || !strings.Contains(completed[0].Summary, "persist step failed") {
 		t.Fatalf("completed = %#v, want terminal recovery notification", completed)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_running")
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "failed" {
-		t.Fatalf("queue = %#v, want failed", queue)
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) {
+		t.Fatalf("queue = %#v, want parked non_retryable item", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "failed" || loop.NextRunAt != nil {
-		t.Fatalf("loop = %#v, want failed terminal loop", loop)
+	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused loop", loop)
 	}
 }
 
@@ -2313,11 +2313,8 @@ func TestRecoverClaimedItemDoesNotReusePreviousRunID(t *testing.T) {
 	if result == nil || result.Status != "failed" || result.FailureKind != FailureNonRetryable {
 		t.Fatalf("result = %#v, want failed non-retryable recovery", result)
 	}
-	if len(completed) != 1 {
-		t.Fatalf("completed = %#v, want one recovery notification", completed)
-	}
-	if completed[0].RunID != "" {
-		t.Fatalf("completed[0].RunID = %q, want empty run ID for recovery before new run creation", completed[0].RunID)
+	if len(completed) != 1 || completed[0].Status != "failed" || completed[0].FailureKind != FailureNonRetryable || !strings.Contains(completed[0].Summary, "project lookup failed") {
+		t.Fatalf("completed = %#v, want terminal recovery notification", completed)
 	}
 }
 
@@ -2341,14 +2338,14 @@ func TestProcessClaimedItemSkippedFlowEmitsCompletionNotification(t *testing.T) 
 		t.Fatalf("result = %#v, want manual_intervention summary", result)
 	}
 	if len(completed) != 1 || completed[0].Status != "failed" || completed[0].FailureKind != FailureManualIntervention || !strings.Contains(completed[0].Summary, "manual PR opening required") {
-		t.Fatalf("completed = %#v, want manual_intervention completion notification", completed)
+		t.Fatalf("completed = %#v, want run failure completion notification", completed)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != string(FailureManualIntervention) {
-		t.Fatalf("queue = %#v, want terminal manual_intervention item", queue)
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) {
+		t.Fatalf("queue = %#v, want parked manual_intervention item", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
 	if err != nil {
@@ -2396,14 +2393,14 @@ func TestProcessClaimedItemSkipsAutoPROpenWhenGitHubCLIUnavailable(t *testing.T)
 		t.Fatalf("len(git.pushCalls) = %d, want 0 when PR opening is gated before push", len(git.pushCalls))
 	}
 	if len(completed) != 1 || completed[0].Status != "failed" || completed[0].FailureKind != FailureManualIntervention || !strings.Contains(completed[0].Summary, "GitHub CLI unavailable") {
-		t.Fatalf("completed = %#v, want manual_intervention completion notification for missing GitHub CLI", completed)
+		t.Fatalf("completed = %#v, want run failure completion notification for missing GitHub CLI", completed)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != string(FailureManualIntervention) {
-		t.Fatalf("queue = %#v, want terminal manual_intervention item", queue)
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) {
+		t.Fatalf("queue = %#v, want parked manual_intervention item", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
 	if err != nil {

@@ -937,15 +937,15 @@ func TestPublishAutoPushDisabledPausesPlannerLoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != string(FailureManualIntervention) {
-		t.Fatalf("queue = %#v, want terminal manual_intervention item", queue)
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) || queue.FinishedAt == nil {
+		t.Fatalf("queue = %#v, want parked manual_intervention item", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "paused" {
-		t.Fatalf("loop = %#v, want paused", loop)
+	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused parked loop", loop)
 	}
 }
 
@@ -1041,8 +1041,8 @@ func TestProcessNextSetupFailureMarksQueueFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "failed" {
-		t.Fatalf("queue = %#v, want failed", queue)
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) || queue.FinishedAt == nil {
+		t.Fatalf("queue = %#v, want parked non_retryable item", queue)
 	}
 }
 
@@ -1073,15 +1073,15 @@ func TestRecoverClaimedItemReconcilesRunningLoopState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "failed" {
-		t.Fatalf("queue = %#v, want failed", queue)
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) || queue.FinishedAt == nil {
+		t.Fatalf("queue = %#v, want parked non_retryable recovery item", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "failed" || loop.NextRunAt != nil {
-		t.Fatalf("loop = %#v, want failed terminal loop", loop)
+	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused parked loop", loop)
 	}
 }
 

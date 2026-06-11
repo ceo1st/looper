@@ -153,6 +153,56 @@ func TestHandlerLoopRetryAllowsFailedReviewerLoop(t *testing.T) {
 	}
 }
 
+func TestHandlerLoopRetryAllowsManualInterventionQueueItem(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_manual_intervention"
+	loopID := "loop_retry_manual_intervention"
+	targetID := projectID
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 48, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	lastErrorKind := "manual_intervention"
+	lastError := "dirty worker worktree"
+	finishedAt := "2026-04-11T12:01:00.000Z"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_retry_manual_intervention", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, DedupeKey: "worker:retry_manual_intervention", Priority: storage.QueuePriorityWorker, Status: "manual_intervention", AvailableAt: nowISO, Attempts: 2, MaxAttempts: 3, LastError: &lastError, LastErrorKind: &lastErrorKind, FinishedAt: &finishedAt, CreatedAt: nowISO, UpdatedAt: finishedAt}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/48/retry", strings.NewReader(`{"mode":"auto","resetAttempts":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	if loop.Status != "queued" {
+		t.Fatalf("loop.Status = %q, want queued", loop.Status)
+	}
+	items, err := services.Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	var replacement *storage.QueueItemRecord
+	for i := range items {
+		if items[i].LoopID != nil && *items[i].LoopID == loopID && items[i].Status == "queued" {
+			replacement = &items[i]
+		}
+	}
+	if replacement == nil || replacement.ID == "queue_retry_manual_intervention" || replacement.Attempts != 0 || replacement.LastErrorKind != nil {
+		t.Fatalf("replacement queue = %#v, want new queued item with reset attempts and cleared error", replacement)
+	}
+}
+
 func TestHandlerLoopRetryRejectsTerminalReviewerMetadata(t *testing.T) {
 	fixture := newTestFixture(t, func(options *looperdruntime.Options) {
 		options.DeferRecovery = true
@@ -368,6 +418,51 @@ func TestHandlerActiveRunsSurfacesResumePolicyManualIntervention(t *testing.T) {
 	assertEqual(t, item["resumePolicy"], "manual_intervention")
 }
 
+func TestHandlerActiveRunsSurfacesBackingOffDisplayStatus(t *testing.T) {
+	for _, lastErrorKind := range []string{"retryable_transient", "retryable_after_resume"} {
+		t.Run(lastErrorKind, func(t *testing.T) {
+			rt, cfg := startTestRuntime(t)
+			h := NewHandler(Context{Config: cfg, Runtime: rt})
+			services := rt.Services()
+			now := time.Now().UTC()
+			nowISO := now.Format(time.RFC3339Nano)
+			availableAt := now.Add(5 * time.Minute).Format(time.RFC3339Nano)
+			projectID := "project_backing_off_" + lastErrorKind
+			loopID := "loop_backing_off_" + lastErrorKind
+			targetID := projectID
+			lastError := "temporary network failure"
+
+			if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+			if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 50, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+			if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_backing_off_" + lastErrorKind, ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, DedupeKey: "worker:backing_off:" + lastErrorKind, Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: availableAt, Attempts: 1, MaxAttempts: 3, LastError: &lastError, LastErrorKind: &lastErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+				t.Fatalf("Queue.Upsert() error = %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/runs/active", nil)
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+			}
+			body := parseJSONMap(t, recorder.Body.Bytes())
+			items := body["data"].(map[string]any)["items"].([]any)
+			if len(items) != 1 {
+				t.Fatalf("items len = %d, want 1: %#v", len(items), items)
+			}
+			item := items[0].(map[string]any)
+			assertEqual(t, item["status"], "queued")
+			assertEqual(t, item["displayStatus"], "backing_off")
+			assertEqual(t, item["loopStatus"], "queued")
+			assertEqual(t, item["lastFailureKind"], lastErrorKind)
+			assertEqual(t, item["lastFailureReason"], "temporary network failure")
+		})
+	}
+}
+
 func TestHandlerActiveRunsDefaultIncludesInterruptedManualResumeAndExcludesCompleted(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})
@@ -519,6 +614,7 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	if queuedItems+runningItems != float64(1) {
 		t.Fatalf("scheduler queued+running = %v, want 1 (queued=%v running=%v)", queuedItems+runningItems, queuedItems, runningItems)
 	}
+	assertEqual(t, scheduler["failedItems"], float64(1))
 	assertEqual(t, scheduler["totalRuns"], float64(1))
 	assertEqual(t, scheduler["activeRuns"], float64(1))
 
@@ -5938,6 +6034,31 @@ func seedStatusData(t *testing.T, rt *looperdruntime.Runtime) {
 		UpdatedAt:   nowISO,
 	}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	manualReason := "dirty worker worktree"
+	manualKind := "manual_intervention"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID:            "queue_manual_1",
+		ProjectID:     &projectID,
+		LoopID:        &loopID,
+		Type:          "reviewer",
+		TargetType:    "pull_request",
+		TargetID:      "pr:acme/looper:42",
+		Repo:          stringPtr("acme/looper"),
+		PRNumber:      int64Ptr(42),
+		DedupeKey:     "reviewer:acme/looper:42:manual",
+		Priority:      2,
+		Status:        "manual_intervention",
+		AvailableAt:   nowISO,
+		Attempts:      1,
+		MaxAttempts:   3,
+		LastError:     &manualReason,
+		LastErrorKind: &manualKind,
+		CreatedAt:     nowISO,
+		UpdatedAt:     nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(queue_manual_1) error = %v", err)
 	}
 }
 

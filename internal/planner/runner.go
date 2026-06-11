@@ -620,12 +620,8 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 			updated.Status = "queued"
 			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 		} else {
-			if loops.ShouldPauseLoopAfterFailure(string(failureKind), failedQueue, "") {
-				updated.Status = "paused"
-			} else {
-				updated.Status = "failed"
-				r.stampFailedDiscoveryFingerprint(updated, queueItem)
-			}
+			updated.Status = "paused"
+			r.stampFailedDiscoveryFingerprint(updated, queueItem)
 			updated.NextRunAt = nil
 		}
 	})
@@ -719,12 +715,8 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					updated.Status = "queued"
 					updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
 				} else {
-					if loops.ShouldPauseLoopAfterFailure(string(failure.kind), failedQueue, latest.ResumePolicy) {
-						updated.Status = "paused"
-					} else {
-						updated.Status = "failed"
-						r.stampFailedDiscoveryFingerprint(updated, queueItem)
-					}
+					updated.Status = "paused"
+					r.stampFailedDiscoveryFingerprint(updated, queueItem)
 					updated.NextRunAt = nil
 				}
 			}); err != nil {
@@ -1509,15 +1501,15 @@ func (r *Runner) wakeSchedulerAfterEnqueue() {
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
 	nextAttempts := queueItem.Attempts + 1
 	nowISO := r.nowISO()
-	if isRetryableFailure(kind) && nextAttempts < queueItem.MaxAttempts {
-		retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, nextAttempts)))
-		if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
-			return nil, err
-		}
-	} else {
+	if !shouldRetryQueueFailure(kind, nextAttempts, queueItem.MaxAttempts) {
 		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 			return nil, err
 		}
+		return r.repos.Queue.GetByID(ctx, queueItem.ID)
+	}
+	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, cappedRetryDelayAttempt(nextAttempts, queueItem.MaxAttempts))))
+	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		return nil, err
 	}
 	updated, err := r.repos.Queue.GetByID(ctx, queueItem.ID)
 	if err != nil {
@@ -2122,6 +2114,23 @@ func backoffDelay(base time.Duration, attempts int64) time.Duration {
 
 func isRetryableFailure(kind QueueFailureKind) bool {
 	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume
+}
+
+func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
+	if !isRetryableFailure(kind) {
+		return false
+	}
+	return maxAttempts <= 0 || nextAttempts < maxAttempts
+}
+
+func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
+	if attempts <= 0 {
+		return 1
+	}
+	if maxAttempts > 0 && attempts > maxAttempts {
+		return maxAttempts
+	}
+	return attempts
 }
 
 func wrapRetryableAfterResume(err error) error {

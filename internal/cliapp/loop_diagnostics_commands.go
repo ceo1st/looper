@@ -169,7 +169,7 @@ func (r *commandRuntime) queueFailed(cmd *cobra.Command, args []string) error {
 		}
 		output := queueFailedOutput{NowISO: eventlog.FormatJavaScriptISOString(time.Now().UTC()), Type: typeFilter, ProjectID: projectFilter, Limit: limit}
 		for _, item := range items {
-			if item.Status != "failed" {
+			if item.Status != "failed" && item.Status != "manual_intervention" {
 				continue
 			}
 			if typeFilter != "" && item.Type != typeFilter {
@@ -225,13 +225,17 @@ func (r *commandRuntime) loopFailures(cmd *cobra.Command, args []string) error {
 		now := time.Now().UTC()
 		output := loopFailuresOutput{NowISO: eventlog.FormatJavaScriptISOString(now), Type: typeFilter, ProjectID: projectFilter, Limit: limit}
 		for _, loop := range loops {
-			if loop.Status != "failed" {
-				continue
-			}
 			if typeFilter != "" && loop.Type != typeFilter {
 				continue
 			}
 			if projectFilter != "" && loop.ProjectID != projectFilter {
+				continue
+			}
+			queueItem, err := repos.Queue.GetLatestByLoopID(cmd.Context(), loop.ID)
+			if err != nil {
+				return err
+			}
+			if !includeLoopInFailures(loop, queueItem) {
 				continue
 			}
 			run, err := repos.Runs.GetLatestByLoopID(cmd.Context(), loop.ID)
@@ -378,6 +382,16 @@ func buildLoopInspectOutput(ctx context.Context, repos *storage.Repositories, se
 		output.Agent = &agentOutput
 	}
 	return output, nil
+}
+
+func includeLoopInFailures(loop storage.LoopRecord, queueItem *storage.QueueItemRecord) bool {
+	if loop.Status == "failed" {
+		return true
+	}
+	if loop.Status != "paused" || queueItem == nil {
+		return false
+	}
+	return queueItem.Status == "manual_intervention"
 }
 
 func parseLoopDiagnosticMetadata(raw *string) loopDiagnosticMetadata {
