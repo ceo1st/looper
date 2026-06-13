@@ -645,7 +645,7 @@ func New(options Options) *Runner {
 		retryBaseDelay = defaultRetryDelay
 	}
 	retryMax := options.RetryMaxAttempts
-	if retryMax <= 0 {
+	if retryMax == 0 {
 		retryMax = defaultRetryMax
 	}
 	retryPolicy := config.NormalizeReviewerRetryConfig(options.RetryPolicy)
@@ -5925,6 +5925,9 @@ func backoffDelay(base time.Duration, attempts int64, maxDelay time.Duration) ti
 	}
 	delay := base
 	for i := int64(1); i < attempts; i++ {
+		if delay >= maxDelay || delay > maxDelay/2 {
+			return maxDelay
+		}
 		delay *= 2
 	}
 	if delay > maxDelay {
@@ -6063,7 +6066,13 @@ func isRetryableFailure(kind QueueFailureKind) bool {
 }
 
 func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
-	return isRetryableFailure(kind)
+	if !isRetryableFailure(kind) {
+		return false
+	}
+	if maxAttempts < 0 {
+		return true
+	}
+	return maxAttempts > 0 && nextAttempts < maxAttempts
 }
 
 func cloneStrings(values []string) []string {

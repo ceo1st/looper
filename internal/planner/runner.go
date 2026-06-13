@@ -39,6 +39,7 @@ const (
 	defaultAgentTimeout = 30 * time.Minute
 	defaultClaimTTL     = 10 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
+	maxRetryDelay       = 60 * time.Second
 	defaultRetryMax     = 3
 	defaultIssueLimit   = 30
 )
@@ -468,7 +469,7 @@ func New(options Options) *Runner {
 		retryBaseDelay = defaultRetryDelay
 	}
 	retryMax := options.RetryMaxAttempts
-	if retryMax <= 0 {
+	if retryMax == 0 {
 		retryMax = defaultRetryMax
 	}
 	allowAutoPush := true
@@ -2113,7 +2114,13 @@ func firstNonEmpty(values ...string) string {
 func backoffDelay(base time.Duration, attempts int64) time.Duration {
 	delay := base
 	for i := int64(1); i < attempts; i++ {
+		if delay >= maxRetryDelay || delay > maxRetryDelay/2 {
+			return maxRetryDelay
+		}
 		delay *= 2
+	}
+	if delay > maxRetryDelay {
+		return maxRetryDelay
 	}
 	return delay
 }
@@ -2123,7 +2130,13 @@ func isRetryableFailure(kind QueueFailureKind) bool {
 }
 
 func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
-	return isRetryableFailure(kind)
+	if !isRetryableFailure(kind) {
+		return false
+	}
+	if maxAttempts < 0 {
+		return true
+	}
+	return maxAttempts > 0 && nextAttempts < maxAttempts
 }
 
 func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
