@@ -574,6 +574,30 @@ func classifyDiagnosticMessage(message string, errorKind string) loopDiagnosis {
 		retryable := true
 		return loopDiagnosis{FailureClass: "review_marker_missing", Retryable: &retryable, Message: msg, RecommendedAction: "rerun publish verification or re-review after checking GitHub state"}
 	}
+	if kind == "non_retryable" && isTerminalGitHubDenial(lower) {
+		retryable := false
+		return loopDiagnosis{FailureClass: kind, Retryable: &retryable, Message: msg, RecommendedAction: "inspect before manual recovery"}
+	}
+	if strings.Contains(lower, "bad credentials") || strings.Contains(lower, "authentication failed") || strings.Contains(lower, "not authorized") || strings.Contains(lower, "permission denied") || strings.Contains(lower, "http 401") || strings.Contains(lower, "http 403") {
+		retryable := true
+		return loopDiagnosis{FailureClass: "github_auth_or_scope", Retryable: &retryable, Message: msg, RecommendedAction: "fix GitHub auth or token scopes, then allow the queued retry to continue"}
+	}
+	if strings.Contains(lower, "could not resolve to a repository") || strings.Contains(lower, "repository not found") {
+		retryable := true
+		return loopDiagnosis{FailureClass: "github_repository_access", Retryable: &retryable, Message: msg, RecommendedAction: "check the configured repo slug and GitHub access, then allow the queued retry to continue"}
+	}
+	if strings.Contains(lower, "start command: chdir") || strings.Contains(lower, "not a git repository") || strings.Contains(lower, "not in a git directory") {
+		retryable := true
+		return loopDiagnosis{FailureClass: "project_repo_path", Retryable: &retryable, Message: msg, RecommendedAction: "fix the project repoPath or restore the local checkout, then allow the queued retry to continue"}
+	}
+	if strings.Contains(lower, "invalid model") || strings.Contains(lower, "unsupported model") || strings.Contains(lower, "config validation") {
+		if kind == "non_retryable" {
+			retryable := false
+			return loopDiagnosis{FailureClass: kind, Retryable: &retryable, Message: msg, RecommendedAction: "fix the Looper configuration value before manual recovery"}
+		}
+		retryable := true
+		return loopDiagnosis{FailureClass: "configuration", Retryable: &retryable, Message: msg, RecommendedAction: "fix the Looper configuration value, then allow the queued retry to continue"}
+	}
 	if strings.Contains(lower, "timed out (idle)") || strings.Contains(lower, "idle timed out") {
 		retryable := true
 		return loopDiagnosis{FailureClass: "agent_idle_timeout", Retryable: &retryable, Message: msg, RecommendedAction: "retry the loop; inspect agent output if the timeout repeats"}
@@ -595,6 +619,25 @@ func classifyDiagnosticMessage(message string, errorKind string) loopDiagnosis {
 		return loopDiagnosis{FailureClass: kind, Retryable: &retryable, Message: msg, RecommendedAction: "inspect before manual recovery"}
 	}
 	return loopDiagnosis{FailureClass: "unknown", Message: msg, RecommendedAction: "inspect the loop, run, and queue item details"}
+}
+
+func isTerminalGitHubDenial(message string) bool {
+	for _, fragment := range []string{
+		"http 400",
+		"http 403",
+		"http 422",
+		"400 bad request",
+		"403 forbidden",
+		"422 unprocessable",
+		"protected branch",
+		"branch protection",
+		"policy denied",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func recommendedActionForState(state string) string {

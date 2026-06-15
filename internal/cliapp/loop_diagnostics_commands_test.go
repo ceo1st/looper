@@ -59,6 +59,57 @@ func TestLoopInspectAcceptsRunIDAndClassifiesFailure(t *testing.T) {
 	}
 }
 
+func TestClassifyDiagnosticMessageSuggestsRepairForRetryableConfigFailures(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		message   string
+		wantClass string
+		wantHint  string
+	}{
+		{name: "github auth", message: "GitHub API failed: HTTP 403 Forbidden", wantClass: "github_auth_or_scope", wantHint: "GitHub auth"},
+		{name: "repository access", message: "GraphQL: Could not resolve to a Repository", wantClass: "github_repository_access", wantHint: "repo slug"},
+		{name: "repo path", message: "start command: chdir /tmp/missing-repo: no such file or directory", wantClass: "project_repo_path", wantHint: "repoPath"},
+		{name: "config", message: "invalid model", wantClass: "configuration", wantHint: "configuration"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyDiagnosticMessage(tt.message, "retryable_transient")
+			if got.FailureClass != tt.wantClass || got.Retryable == nil || !*got.Retryable {
+				t.Fatalf("diagnosis = %#v, want retryable %s", got, tt.wantClass)
+			}
+			if !strings.Contains(got.RecommendedAction, tt.wantHint) {
+				t.Fatalf("RecommendedAction = %q, want hint %q", got.RecommendedAction, tt.wantHint)
+			}
+		})
+	}
+}
+
+func TestClassifyDiagnosticMessagePreservesTerminalGitHubDenials(t *testing.T) {
+	t.Parallel()
+
+	got := classifyDiagnosticMessage("GitHub API failed: HTTP 403 Forbidden: policy denied by ruleset", "non_retryable")
+	if got.FailureClass != "non_retryable" || got.Retryable == nil || *got.Retryable {
+		t.Fatalf("diagnosis = %#v, want non_retryable terminal denial", got)
+	}
+	if got.RecommendedAction != "inspect before manual recovery" {
+		t.Fatalf("RecommendedAction = %q, want manual recovery hint", got.RecommendedAction)
+	}
+}
+
+func TestClassifyDiagnosticMessagePreservesTerminalConfigValidationFailures(t *testing.T) {
+	t.Parallel()
+
+	got := classifyDiagnosticMessage("config validation failed: notifications.osascript.enabled requires osascript", "non_retryable")
+	if got.FailureClass != "non_retryable" || got.Retryable == nil || *got.Retryable {
+		t.Fatalf("diagnosis = %#v, want non_retryable terminal config failure", got)
+	}
+	if got.RecommendedAction != "fix the Looper configuration value before manual recovery" {
+		t.Fatalf("RecommendedAction = %q, want config manual recovery hint", got.RecommendedAction)
+	}
+}
+
 func TestLoopFailuresListsFailedLoops(t *testing.T) {
 	t.Parallel()
 
