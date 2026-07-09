@@ -36,16 +36,17 @@ import (
 )
 
 const (
-	stepDiscoverPR       FixerStep = "discover-pr"
-	stepClaimPR          FixerStep = "claim-pr"
-	stepCollectFixes     FixerStep = "collect-fixes"
-	stepPrepareWorktree  FixerStep = "prepare-worktree"
-	stepRepair           FixerStep = "repair"
-	stepReconcileCommits FixerStep = "reconcile-commits"
-	stepValidate         FixerStep = "validate"
-	stepPush             FixerStep = "push"
-	stepResolveComments  FixerStep = "resolve-comments"
-	stepRecheck          FixerStep = "recheck"
+	stepDiscoverPR            FixerStep = "discover-pr"
+	stepClaimPR               FixerStep = "claim-pr"
+	stepCollectFixes          FixerStep = "collect-fixes"
+	stepPrepareWorktree       FixerStep = "prepare-worktree"
+	stepRepair                FixerStep = "repair"
+	stepReconcileCommits      FixerStep = "reconcile-commits"
+	stepValidate              FixerStep = "validate"
+	stepPush                  FixerStep = "push"
+	stepResolveComments       FixerStep = "resolve-comments"
+	stepRecheck               FixerStep = "recheck"
+	NativeReviewCommentSource           = "forgejo_review_comment"
 )
 
 var fixerStepSequence = []FixerStep{
@@ -126,17 +127,23 @@ func (s *fixerDiscoveryLockSet) With(key string, fn func() error) error {
 }
 
 type FixItem struct {
-	Type              string   `json:"type"`
-	ID                string   `json:"id,omitempty"`
-	ThreadID          string   `json:"threadId,omitempty"`
-	ThreadFingerprint string   `json:"threadFingerprint,omitempty"`
-	Name              string   `json:"name,omitempty"`
-	Summary           string   `json:"summary,omitempty"`
-	Files             []string `json:"files,omitempty"`
-	Author            string   `json:"author,omitempty"`
-	URL               string   `json:"url,omitempty"`
-	Path              string   `json:"path,omitempty"`
-	Line              int64    `json:"line,omitempty"`
+	Type                string   `json:"type"`
+	Source              string   `json:"source,omitempty"`
+	ID                  string   `json:"id,omitempty"`
+	ThreadID            string   `json:"threadId,omitempty"`
+	ThreadFingerprint   string   `json:"threadFingerprint,omitempty"`
+	ProviderCommentID   int64    `json:"providerCommentId,omitempty"`
+	ObservedFingerprint string   `json:"observedFingerprint,omitempty"`
+	ResolverPresent     bool     `json:"resolverPresent,omitempty"`
+	Name                string   `json:"name,omitempty"`
+	Summary             string   `json:"summary,omitempty"`
+	Body                string   `json:"body,omitempty"`
+	DiffHunk            string   `json:"diffHunk,omitempty"`
+	Files               []string `json:"files,omitempty"`
+	Author              string   `json:"author,omitempty"`
+	URL                 string   `json:"url,omitempty"`
+	Path                string   `json:"path,omitempty"`
+	Line                int64    `json:"line,omitempty"`
 }
 
 type PullRequestSummary struct {
@@ -237,6 +244,44 @@ type AddReviewThreadReplyInput struct {
 	CWD      string
 }
 
+type ListNativeReviewCommentsInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
+}
+
+type NativeReviewComment struct {
+	ProviderCommentID   int64
+	Body                string
+	URL                 string
+	Path                string
+	DiffHunk            string
+	ObservedFingerprint string
+	ResolverPresent     bool
+	IsResolved          bool
+	Author              string
+	UpdatedAt           string
+}
+
+func NativeReviewCommentFingerprint(commentID int64, updatedAt string) string {
+	return fmt.Sprintf("%s:%d:%s", NativeReviewCommentSource, commentID, strings.TrimSpace(updatedAt))
+}
+
+func NativeReviewCommentFixItemID(commentID int64) string {
+	return fmt.Sprintf("%s:%d", NativeReviewCommentSource, commentID)
+}
+
+func NativeReviewCommentThreadID(commentID int64) string {
+	return NativeReviewCommentFixItemID(commentID)
+}
+
+type ResolveNativeReviewCommentInput struct {
+	Repo              string
+	PRNumber          int64
+	ProviderCommentID int64
+	CWD               string
+}
+
 // CompareCommitsInput asks the gateway to compare two commits on a remote
 // repository (e.g. via the GitHub compare API). Used by the fixer to detect
 // whether a previously-pushed fix commit is still reachable from the live PR
@@ -290,6 +335,8 @@ type GitHubGateway interface {
 	ViewReviewThread(context.Context, ViewReviewThreadInput) (ReviewThread, error)
 	ResolveReviewThread(context.Context, ResolveReviewThreadInput) error
 	AddReviewThreadReply(context.Context, AddReviewThreadReplyInput) error
+	ListNativeReviewComments(context.Context, ListNativeReviewCommentsInput) ([]NativeReviewComment, error)
+	ResolveNativeReviewComment(context.Context, ResolveNativeReviewCommentInput) error
 	CompareCommits(context.Context, CompareCommitsInput) (CompareCommitsResult, error)
 	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
 	UpdateIssueComment(context.Context, UpdateIssueCommentInput) error
@@ -734,6 +781,15 @@ type replyExplanationEntry struct {
 	ThreadCommentsObserved string `json:"threadCommentsObserved,omitempty"`
 }
 
+type nativeRepairResultEntry struct {
+	Source              string `json:"source,omitempty"`
+	FixItemID           string `json:"fixItemId,omitempty"`
+	ProviderCommentID   int64  `json:"providerCommentId,omitempty"`
+	Action              string `json:"action,omitempty"`
+	Explanation         string `json:"explanation,omitempty"`
+	ObservedFingerprint string `json:"observedFingerprint,omitempty"`
+}
+
 type checkpointReconcileCommits struct {
 	BaseHeadSHA      string   `json:"baseHeadSha,omitempty"`
 	FinalHeadSHA     string   `json:"finalHeadSha,omitempty"`
@@ -899,6 +955,9 @@ func parseReplyExplanations(stdout, stderr string, fixItems []FixItem) []replyEx
 		if item.Type != "comment" {
 			continue
 		}
+		if item.Source == NativeReviewCommentSource {
+			continue
+		}
 		if item.ID == "" {
 			continue
 		}
@@ -992,6 +1051,89 @@ func canonicalizeReplyAction(raw string) string {
 		return action
 	}
 	return strings.TrimSpace(raw)
+}
+
+func normalizeNativeRepairAction(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "fixed":
+		return "fixed"
+	case "declined":
+		return "declined"
+	case "deferred":
+		return "deferred"
+	default:
+		return ""
+	}
+}
+
+func parseNativeRepairResults(stdout, stderr string, fixItems []FixItem) []replyExplanationEntry {
+	itemsByProviderID := make(map[int64]FixItem)
+	for _, item := range fixItems {
+		if item.Type == "comment" && item.Source == NativeReviewCommentSource && item.ProviderCommentID > 0 {
+			itemsByProviderID[item.ProviderCommentID] = item
+		}
+	}
+	if len(itemsByProviderID) == 0 {
+		return nil
+	}
+	combined := stdout + "\n" + stderr
+	payload := extractCompletionMarkerPayload(combined)
+	if payload == "" {
+		return nil
+	}
+	var parsed struct {
+		RepairResults []struct {
+			Source              string `json:"source"`
+			ProviderCommentID   int64  `json:"providerCommentId"`
+			Action              string `json:"action"`
+			Explanation         string `json:"explanation"`
+			ObservedFingerprint string `json:"observedFingerprint"`
+		} `json:"repair_results"`
+	}
+	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+		return nil
+	}
+	results := make([]nativeRepairResultEntry, 0, len(parsed.RepairResults))
+	seen := map[int64]struct{}{}
+	for _, raw := range parsed.RepairResults {
+		if strings.TrimSpace(raw.Source) != NativeReviewCommentSource || raw.ProviderCommentID <= 0 {
+			continue
+		}
+		item, ok := itemsByProviderID[raw.ProviderCommentID]
+		if !ok {
+			continue
+		}
+		action := normalizeNativeRepairAction(raw.Action)
+		if action == "" {
+			continue
+		}
+		explanation := sanitizeReplyExplanation(raw.Explanation)
+		if explanation == "" {
+			continue
+		}
+		observedFingerprint := strings.TrimSpace(raw.ObservedFingerprint)
+		if observedFingerprint == "" || observedFingerprint != item.ObservedFingerprint {
+			continue
+		}
+		if _, dup := seen[raw.ProviderCommentID]; dup {
+			continue
+		}
+		seen[raw.ProviderCommentID] = struct{}{}
+		results = append(results, nativeRepairResultEntry{
+			Source:              NativeReviewCommentSource,
+			FixItemID:           item.ID,
+			ProviderCommentID:   item.ProviderCommentID,
+			Action:              action,
+			Explanation:         explanation,
+			ObservedFingerprint: observedFingerprint,
+		})
+	}
+	out := make([]replyExplanationEntry, 0, len(results))
+	for _, result := range results {
+		item := itemsByProviderID[result.ProviderCommentID]
+		out = append(out, replyExplanationEntry{FixItemID: item.ID, ThreadID: item.ThreadID, Action: result.Action, Explanation: result.Explanation})
+	}
+	return out
 }
 
 // extractCompletionMarkerPayload mirrors the agent core's last-line scan but
@@ -2001,7 +2143,7 @@ func (r *Runner) executeStep(ctx context.Context, step FixerStep, input stepInpu
 	case stepClaimPR:
 		return r.runClaimPRStep(ctx, input)
 	case stepCollectFixes:
-		return r.runCollectFixesStep(input)
+		return r.runCollectFixesStep(ctx, input)
 	case stepPrepareWorktree:
 		return r.runPrepareWorktreeStep(ctx, input)
 	case stepRepair:
@@ -2102,7 +2244,7 @@ func (r *Runner) runClaimPRStep(ctx context.Context, input stepInput) (fixerChec
 	return checkpoint, nil
 }
 
-func (r *Runner) runCollectFixesStep(input stepInput) (fixerCheckpoint, error) {
+func (r *Runner) runCollectFixesStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
 	checkpoint := input.Checkpoint
 	if checkpoint.Detail == nil {
 		return checkpoint, &loopError{message: "Missing PR detail checkpoint for collect-fixes step", kind: FailureRetryableTransient}
@@ -2112,12 +2254,22 @@ func (r *Runner) runCollectFixesStep(input stepInput) (fixerCheckpoint, error) {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because it is not eligible", input.Repo, input.PRNumber)
 		return checkpoint, nil
 	}
+	if isManualFixerLoop(input.Loop) {
+		if err := r.attachManualForgejoNativeComments(ctx, input, &checkpoint); err != nil {
+			return checkpoint, err
+		}
+	}
 	fixItems, err := collectFixItemsFromCheckpointForStep(checkpoint)
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
 	}
 	checkpoint.FixItems = fixItems
 	checkpoint.FixItemsHash = hashFixItems(fixItems)
+	for _, item := range fixItems {
+		if item.Type == "comment" && item.Source == NativeReviewCommentSource && !item.ResolverPresent {
+			return checkpoint, &loopError{message: fmt.Sprintf("Forgejo native review comment resolution is unsupported for comment %d; manual intervention required", item.ProviderCommentID), kind: FailureManualIntervention}
+		}
+	}
 	if len(fixItems) == 0 {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped %s#%d because no fix items remain", input.Repo, input.PRNumber)
 		return checkpoint, nil
@@ -2125,6 +2277,35 @@ func (r *Runner) runCollectFixesStep(input stepInput) (fixerCheckpoint, error) {
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	checkpoint.SkipReason = ""
 	return checkpoint, nil
+}
+
+func (r *Runner) attachManualForgejoNativeComments(ctx context.Context, input stepInput, checkpoint *fixerCheckpoint) error {
+	if checkpoint == nil || checkpoint.Detail == nil {
+		return nil
+	}
+	nativeComments, err := r.github.ListNativeReviewComments(ctx, ListNativeReviewCommentsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+	if err != nil {
+		return classifyForgejoNativeDiscoveryError(err)
+	}
+	if len(nativeComments) == 0 {
+		return nil
+	}
+	currentUser, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	if err != nil {
+		return err
+	}
+	nativeComments = actionableNativeReviewComments(nativeComments, currentUser)
+	comments := make([]map[string]any, 0, len(nativeComments)+len(checkpoint.Detail.Comments))
+	comments = append(comments, nativeReviewCommentsToMaps(nativeComments)...)
+	for _, comment := range checkpoint.Detail.Comments {
+		source, _ := stringFromAny(comment["source"])
+		if source == NativeReviewCommentSource {
+			continue
+		}
+		comments = append(comments, comment)
+	}
+	checkpoint.Detail.Comments = comments
+	return nil
 }
 
 func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
@@ -2281,6 +2462,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	r.applyReviewDismissals(ctx, input, worktree.Path)
 	checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 	checkpoint.Repair.ReplyExplanations = normalizeReplyExplanationActions(parseReplyExplanations(result.Stdout, result.Stderr, checkpoint.FixItems))
+	checkpoint.Repair.ReplyExplanations = append(checkpoint.Repair.ReplyExplanations, parseNativeRepairResults(result.Stdout, result.Stderr, checkpoint.FixItems)...)
 	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
 	if result.Lifecycle != nil {
 		checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
@@ -2563,10 +2745,11 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
+	hasReviewerSummary := false
 	if _, ok, err := reviewerSummaryFromCheckpointDetail(checkpoint.Detail); err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
-	} else if ok {
-		return r.runForgejoFixerSummaryStep(ctx, input)
+	} else {
+		hasReviewerSummary = ok
 	}
 	if checkpoint.Validation == nil || !checkpoint.Validation.Passed {
 		return checkpoint, &loopError{message: "resolve-comments requires successful validation", kind: FailureRetryableAfterResume}
@@ -2604,6 +2787,31 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			return checkpoint, &loopError{message: fmt.Sprintf("PR head %s no longer descends from fix commit %s (compare status %q); will rediscover", liveDetail.HeadSHA, expectedHead, cmp.Status), kind: FailureRetryableAfterResume}
 		}
 	}
+	priorNativeCommentItems := make([]FixItem, 0)
+	priorNativeCommentItemsByProviderID := map[int64]FixItem{}
+	hasNativeForgejoItems := false
+	for _, item := range checkpoint.FixItems {
+		if item.Type == "comment" && item.Source == NativeReviewCommentSource && item.ProviderCommentID > 0 {
+			hasNativeForgejoItems = true
+			priorNativeCommentItems = append(priorNativeCommentItems, item)
+			priorNativeCommentItemsByProviderID[item.ProviderCommentID] = item
+		}
+	}
+	var liveNativeComments []NativeReviewComment
+	if hasNativeForgejoItems || isManualFixerLoop(input.Loop) {
+		liveNativeComments, err = r.github.ListNativeReviewComments(ctx, ListNativeReviewCommentsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
+		if err != nil {
+			return checkpoint, classifyForgejoNativeResolveError(err)
+		}
+		if len(liveNativeComments) > 0 {
+			currentUser, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+			if err != nil {
+				return checkpoint, err
+			}
+			liveNativeComments = nonSelfNativeReviewComments(liveNativeComments, currentUser)
+			liveDetail.Comments = append(nativeReviewCommentsToMaps(liveNativeComments), nonNativeComments(liveDetail.Comments)...)
+		}
+	}
 	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
 	fixItems := collectFixItems(liveDetail)
 	checkpoint.FixItems = fixItems
@@ -2615,9 +2823,29 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	contractViolationCount := 0
 	declinedUpdates := map[string]declinedThreadRecord{}
 	commentItems := make([]FixItem, 0, len(fixItems))
+	nativeCommentItems := make([]FixItem, 0, len(fixItems))
 	for _, item := range fixItems {
 		if item.Type == "comment" {
+			if item.Source == "forgejo-reviewer-summary" {
+				continue
+			}
+			if item.Source == NativeReviewCommentSource && item.ProviderCommentID > 0 {
+				nativeCommentItems = append(nativeCommentItems, item)
+				continue
+			}
 			commentItems = append(commentItems, item)
+		}
+	}
+	for _, item := range priorNativeCommentItems {
+		seen := false
+		for _, current := range nativeCommentItems {
+			if current.ProviderCommentID == item.ProviderCommentID {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			nativeCommentItems = append(nativeCommentItems, item)
 		}
 	}
 	repliesByItemID := agentResolveRepliesByFixItemID(checkpoint)
@@ -2628,6 +2856,8 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	}
 	driftCount := 0
 	mutationFailureCount := 0
+	nativeMutationFailureCount := 0
+	var nativeMutationErr error
 	// Drift detection must be anchored to when the agent recorded the
 	// reply explanations, not when the current (possibly retried) run
 	// started. Otherwise a reviewer comment posted between the original
@@ -2740,6 +2970,64 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionFixed), Status: "resolved", UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 		}
 	}
+	if len(nativeCommentItems) > 0 {
+		repliesByFixItemID := agentResolveRepliesByFixItemID(checkpoint)
+		liveByProviderID := map[int64]NativeReviewComment{}
+		for _, live := range liveNativeComments {
+			liveByProviderID[live.ProviderCommentID] = live
+		}
+		for _, item := range nativeCommentItems {
+			if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
+				continue
+			}
+			decision, hasDecision := repliesByFixItemID[item.ID]
+			live, liveOK := liveByProviderID[item.ProviderCommentID]
+			if !liveOK {
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "deleted", UpdatedAt: r.nowISO()})
+				continue
+			}
+			if live.IsResolved {
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "already_resolved", UpdatedAt: r.nowISO()})
+				continue
+			}
+			if !hasDecision {
+				contractViolationCount++
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "skipped_missing_agent_decision", Message: agentMissingThreadDecisionExplanation, UpdatedAt: r.nowISO()})
+				continue
+			}
+			if strings.TrimSpace(decision.Action) != "fixed" {
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "skipped_noop", UpdatedAt: r.nowISO()})
+				continue
+			}
+			if !checkpoint.Push.Pushed {
+				return checkpoint, &loopError{message: "resolve-comments requires an actual push before resolving fixed Forgejo native review comments", kind: FailureManualIntervention}
+			}
+			priorItem := priorNativeCommentItemsByProviderID[item.ProviderCommentID]
+			if strings.TrimSpace(priorItem.ObservedFingerprint) == "" || priorItem.ObservedFingerprint != strings.TrimSpace(live.ObservedFingerprint) {
+				driftCount++
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "skipped_thread_drift", Message: "Forgejo native review comment changed since the fixer inspected it", UpdatedAt: r.nowISO()})
+				continue
+			}
+			if err := r.github.ResolveNativeReviewComment(ctx, ResolveNativeReviewCommentInput{Repo: input.Repo, PRNumber: input.PRNumber, ProviderCommentID: item.ProviderCommentID, CWD: input.Project.RepoPath}); err != nil {
+				if isForgejoNativeResolveUnsupported(err) {
+					nativeMutationFailureCount++
+					if nativeMutationErr == nil {
+						nativeMutationErr = err
+					}
+					upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "unsupported_remote_resolution", Message: err.Error(), UpdatedAt: r.nowISO()})
+					continue
+				}
+				nativeMutationFailureCount++
+				if nativeMutationErr == nil {
+					nativeMutationErr = err
+				}
+				upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "failed_mutation_retry", Message: err.Error(), UpdatedAt: r.nowISO()})
+				continue
+			}
+			resolvedCount++
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: decision.Action, Status: "resolved", UpdatedAt: r.nowISO()})
+		}
+	}
 	if contractViolationCount > 0 {
 		if _, err := r.incrementContractViolationCount(ctx, input.Loop, contractViolationCount); err != nil {
 			return checkpoint, err
@@ -2766,11 +3054,63 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
 		return checkpoint, &loopError{message: fmt.Sprintf("Failed to resolve %d review thread(s); will retry on next run", mutationFailureCount), kind: FailureRetryableAfterResume}
 	}
+	if nativeMutationFailureCount > 0 {
+		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
+		return checkpoint, classifyForgejoNativeResolveError(nativeMutationErr)
+	}
 	if _, err := r.clearFixerFollowupMetadata(ctx, input.Loop); err != nil {
 		return checkpoint, err
 	}
+	if hasReviewerSummary {
+		return r.runForgejoFixerSummaryStep(ctx, stepInput{Project: input.Project, Loop: input.Loop, Run: input.Run, QueueItem: input.QueueItem, Repo: input.Repo, PRNumber: input.PRNumber, Checkpoint: checkpoint})
+	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func classifyForgejoNativeResolveError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var httpErr *forge.ForgejoHTTPError
+	if errors.As(err, &httpErr) {
+		switch httpErr.StatusCode {
+		case 404, 405:
+			return &loopError{message: fmt.Sprintf("Forgejo native review comment resolution is unsupported and requires manual intervention: %v", err), kind: FailureManualIntervention}
+		case 500, 502, 503, 504:
+			return &loopError{message: fmt.Sprintf("Forgejo provider did not acknowledge native review comment resolution; will retry: %v", err), kind: FailureRetryableAfterResume}
+		}
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "timeout") || strings.Contains(message, "timed out") {
+		return &loopError{message: fmt.Sprintf("Forgejo provider did not acknowledge native review comment resolution; will retry: %v", err), kind: FailureRetryableAfterResume}
+	}
+	return &loopError{message: fmt.Sprintf("Failed to resolve Forgejo native review comment; will retry: %v", err), kind: FailureRetryableAfterResume}
+}
+
+func classifyForgejoNativeDiscoveryError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var httpErr *forge.ForgejoHTTPError
+	if errors.As(err, &httpErr) {
+		switch httpErr.StatusCode {
+		case 404, 405:
+			return &loopError{message: fmt.Sprintf("Forgejo native review comment discovery is unsupported and requires manual intervention: %v", err), kind: FailureManualIntervention}
+		case 500, 502, 503, 504:
+			return &loopError{message: fmt.Sprintf("Forgejo provider did not acknowledge native review comment discovery; will retry: %v", err), kind: FailureRetryableAfterResume}
+		}
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "timeout") || strings.Contains(message, "timed out") {
+		return &loopError{message: fmt.Sprintf("Forgejo provider did not acknowledge native review comment discovery; will retry: %v", err), kind: FailureRetryableAfterResume}
+	}
+	return err
+}
+
+func isForgejoNativeResolveUnsupported(err error) bool {
+	var httpErr *forge.ForgejoHTTPError
+	return errors.As(err, &httpErr) && (httpErr.StatusCode == 404 || httpErr.StatusCode == 405)
 }
 
 func (r *Runner) runForgejoFixerSummaryStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
@@ -5498,30 +5838,101 @@ func collectFixItemsFromCheckpoint(checkpoint fixerCheckpoint) []FixItem {
 	if checkpoint.Detail == nil {
 		return nil
 	}
+	items := normalizeFixItems(checkpoint.Detail.Comments, checkpoint.Detail.Checks, checkpoint.Detail.HasConflicts)
 	if summary, ok, err := reviewerSummaryFromCheckpointDetail(checkpoint.Detail); err == nil && ok {
-		return forgejoReviewerSummaryFixItems(summary)
+		summaryItems := forgejoReviewerSummaryFixItems(summary)
+		if len(items) == 0 {
+			return summaryItems
+		}
+		return append(items, summaryItems...)
 	}
-	return normalizeFixItems(checkpoint.Detail.Comments, checkpoint.Detail.Checks, checkpoint.Detail.HasConflicts)
+	return items
 }
 
 func collectFixItemsFromCheckpointForStep(checkpoint fixerCheckpoint) ([]FixItem, error) {
 	if checkpoint.Detail == nil {
 		return nil, nil
 	}
+	items := normalizeFixItems(checkpoint.Detail.Comments, checkpoint.Detail.Checks, checkpoint.Detail.HasConflicts)
 	if summary, ok, err := reviewerSummaryFromCheckpointDetail(checkpoint.Detail); err != nil {
 		return nil, err
 	} else if ok {
-		return forgejoReviewerSummaryFixItems(summary), nil
+		summaryItems := forgejoReviewerSummaryFixItems(summary)
+		if len(items) == 0 {
+			return summaryItems, nil
+		}
+		return append(items, summaryItems...), nil
 	}
-	return normalizeFixItems(checkpoint.Detail.Comments, checkpoint.Detail.Checks, checkpoint.Detail.HasConflicts), nil
+	return items, nil
 }
 
 func collectFixItems(detail PullRequestDetail) []FixItem {
 	checkpoint := checkpointDetail{IssueComments: cloneObjectSlice(detail.IssueComments)}
+	items := normalizeFixItems(detail.Comments, detail.Checks, detail.HasConflicts)
 	if summary, ok, err := reviewerSummaryFromCheckpointDetail(&checkpoint); err == nil && ok {
-		return forgejoReviewerSummaryFixItems(summary)
+		summaryItems := forgejoReviewerSummaryFixItems(summary)
+		if len(items) == 0 {
+			return summaryItems
+		}
+		return append(items, summaryItems...)
 	}
-	return normalizeFixItems(detail.Comments, detail.Checks, detail.HasConflicts)
+	return items
+}
+
+func nonNativeComments(comments []map[string]any) []map[string]any {
+	filtered := make([]map[string]any, 0, len(comments))
+	for _, comment := range comments {
+		source, _ := stringFromAny(comment["source"])
+		if source == NativeReviewCommentSource {
+			continue
+		}
+		filtered = append(filtered, comment)
+	}
+	return filtered
+}
+
+func actionableNativeReviewComments(comments []NativeReviewComment, currentUser string) []NativeReviewComment {
+	filtered := make([]NativeReviewComment, 0, len(comments))
+	for _, comment := range comments {
+		if comment.IsResolved || sameGitHubLogin(comment.Author, currentUser) {
+			continue
+		}
+		filtered = append(filtered, comment)
+	}
+	return filtered
+}
+
+func nonSelfNativeReviewComments(comments []NativeReviewComment, currentUser string) []NativeReviewComment {
+	filtered := make([]NativeReviewComment, 0, len(comments))
+	for _, comment := range comments {
+		if sameGitHubLogin(comment.Author, currentUser) {
+			continue
+		}
+		filtered = append(filtered, comment)
+	}
+	return filtered
+}
+
+func nativeReviewCommentsToMaps(comments []NativeReviewComment) []map[string]any {
+	out := make([]map[string]any, 0, len(comments))
+	for _, comment := range comments {
+		out = append(out, map[string]any{
+			"id":                  NativeReviewCommentFixItemID(comment.ProviderCommentID),
+			"databaseId":          comment.ProviderCommentID,
+			"threadId":            NativeReviewCommentThreadID(comment.ProviderCommentID),
+			"threadFingerprint":   comment.ObservedFingerprint,
+			"observedFingerprint": comment.ObservedFingerprint,
+			"source":              NativeReviewCommentSource,
+			"body":                comment.Body,
+			"url":                 comment.URL,
+			"path":                comment.Path,
+			"diffHunk":            comment.DiffHunk,
+			"author":              comment.Author,
+			"resolverPresent":     comment.ResolverPresent,
+			"isResolved":          comment.IsResolved,
+		})
+	}
+	return out
 }
 
 func reviewerSummaryFromCheckpointDetail(detail *checkpointDetail) (forge.ReviewerSummary, bool, error) {
@@ -5576,6 +5987,7 @@ func forgejoReviewerSummaryFixItems(summary forge.ReviewerSummary) []FixItem {
 		}
 		items = append(items, FixItem{
 			Type:              "comment",
+			Source:            "forgejo-reviewer-summary",
 			ID:                strings.TrimSpace(item.ReviewItemID),
 			ThreadID:          strings.TrimSpace(item.ReviewItemID),
 			ThreadFingerprint: normalizeThreadFingerprint("forgejo-reviewer-summary", strings.TrimSpace(item.ReviewItemID), strings.TrimSpace(item.ReviewItemID)),
@@ -5630,8 +6042,29 @@ func normalizeFixItems(comments []map[string]any, checks []map[string]any, hasCo
 		author, _ := stringFromAny(comment["author"])
 		url, _ := stringFromAny(comment["url"])
 		path, _ := stringFromAny(comment["path"])
+		body, _ := stringFromAny(comment["body"])
+		diffHunk, _ := stringFromAny(comment["diffHunk"])
+		source, _ := stringFromAny(comment["source"])
 		threadFingerprint, _ := stringFromAny(comment["threadFingerprint"])
+		observedFingerprint := ""
+		providerCommentID := int64(0)
+		resolverPresent := false
+		if strings.TrimSpace(source) != "" {
+			observedFingerprint, _ = stringFromAny(comment["observedFingerprint"])
+			providerCommentID = issueCommentDatabaseID(comment)
+			resolverPresent, _ = comment["resolverPresent"].(bool)
+			if source == NativeReviewCommentSource && providerCommentID > 0 {
+				id = NativeReviewCommentFixItemID(providerCommentID)
+				threadID = NativeReviewCommentThreadID(providerCommentID)
+			}
+		} else {
+			body = ""
+			diffHunk = ""
+		}
 		threadFingerprint = normalizeThreadFingerprint(threadFingerprint, threadID, id)
+		if strings.TrimSpace(source) != "" && strings.TrimSpace(observedFingerprint) == "" {
+			observedFingerprint = threadFingerprint
+		}
 		var line int64
 		switch v := comment["line"].(type) {
 		case float64:
@@ -5641,7 +6074,7 @@ func normalizeFixItems(comments []map[string]any, checks []map[string]any, hasCo
 		case int:
 			line = int64(v)
 		}
-		result = append(result, FixItem{Type: "comment", ID: id, ThreadID: threadID, ThreadFingerprint: threadFingerprint, Summary: summary, Author: author, URL: url, Path: path, Line: line})
+		result = append(result, FixItem{Type: "comment", Source: source, ID: id, ThreadID: threadID, ThreadFingerprint: threadFingerprint, ProviderCommentID: providerCommentID, ObservedFingerprint: observedFingerprint, ResolverPresent: resolverPresent, Summary: summary, Body: body, DiffHunk: diffHunk, Author: author, URL: url, Path: path, Line: line})
 	}
 	for _, check := range checks {
 		if !isFailingCheck(check) {
@@ -5757,10 +6190,11 @@ func suppressDeclinedFixItems(loopMetadataJSON *string, headSHA string, fixItems
 }
 
 func buildFixerMinimalPRSeed(repo string, prNumber int64, detail *checkpointDetail, fixItems []FixItem) string {
+	prURL := seededPullRequestURL(repo, prNumber, detail, fixItems)
 	seed := map[string]any{
 		"repo":           repo,
 		"pr_number":      prNumber,
-		"url":            seededPullRequestURL(repo, prNumber),
+		"url":            prURL,
 		"base_ref":       "",
 		"head_ref":       "",
 		"head_sha":       detailHeadSHA(detail),
@@ -5781,9 +6215,59 @@ func buildFixerMinimalPRSeed(repo string, prNumber int64, detail *checkpointDeta
 	return "Minimal PR seed (authoritative handoff fields; fetch all mutable PR details yourself):\n" + string(encoded)
 }
 
-func seededPullRequestURL(repo string, prNumber int64) string {
+func seededPullRequestURL(repo string, prNumber int64, detail *checkpointDetail, fixItems []FixItem) string {
+	if inferred := inferSeededPullRequestURL(prNumber, detail, fixItems); inferred != "" {
+		return inferred
+	}
 	host, path := seededPullRequestRepoParts(repo)
 	return fmt.Sprintf("https://%s/%s/pull/%d", host, path, prNumber)
+}
+
+func inferSeededPullRequestURL(prNumber int64, detail *checkpointDetail, fixItems []FixItem) string {
+	if prNumber <= 0 {
+		return ""
+	}
+	candidates := make([]string, 0, len(fixItems)+2)
+	if detail != nil {
+		for _, comment := range detail.Comments {
+			if urlValue, _ := comment["url"].(string); strings.TrimSpace(urlValue) != "" {
+				candidates = append(candidates, urlValue)
+			}
+		}
+		for _, comment := range detail.IssueComments {
+			if urlValue, _ := comment["url"].(string); strings.TrimSpace(urlValue) != "" {
+				candidates = append(candidates, urlValue)
+			}
+		}
+	}
+	for _, item := range fixItems {
+		if strings.TrimSpace(item.URL) != "" {
+			candidates = append(candidates, item.URL)
+		}
+	}
+	for _, candidate := range candidates {
+		if inferred := pullRequestURLFromCommentURL(candidate, prNumber); inferred != "" {
+			return inferred
+		}
+	}
+	return ""
+}
+
+func pullRequestURLFromCommentURL(raw string, prNumber int64) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	for _, token := range []string{fmt.Sprintf("/pull/%d", prNumber), fmt.Sprintf("/pulls/%d", prNumber)} {
+		if idx := strings.Index(parsed.Path, token); idx >= 0 {
+			parsed.Path = parsed.Path[:idx+len(token)]
+			parsed.RawPath = ""
+			return parsed.String()
+		}
+	}
+	return ""
 }
 
 func seededPullRequestRepoParts(repo string) (host string, path string) {
@@ -5820,7 +6304,17 @@ func fixItemIDs(items []FixItem) []string {
 	return ids
 }
 
-func fixerAgentSideGitHubFetchContract() string {
+func fixerAgentSideFetchContract(repo string, prNumber int64, detail *checkpointDetail, fixItems []FixItem) string {
+	prURL := seededPullRequestURL(repo, prNumber, detail, fixItems)
+	if strings.Contains(prURL, "/pulls/") {
+		return strings.Join([]string{
+			"Agent-side Forgejo fetch contract: use the minimal PR seed above as the stable handoff. Do not assume full PR diffs, full comment dumps, reviews, checks, or thread state from this prompt are complete or fresh.",
+			"Before editing and again before final conclusions or pushing, fetch the live PR from Forgejo using `GET /api/v1/repos/{owner}/{repo}/pulls/{number}` and validate `head.sha` equals the seeded `head_sha`, `base.ref` equals the seeded `base_ref` when present, and state/draft status match the seed. Fail fast on drift.",
+			"Fetch scoped data on demand with `GET /api/v1/repos/{owner}/{repo}/pulls/{number}.diff` before selecting files. For relevant file diffs, filter locally or fetch refs and run `git diff <base>...<head> -- <path>`. Check CI state only when it matters and only from the live provider state.",
+			"When review feedback context matters, collect issue comments with `GET /api/v1/repos/{owner}/{repo}/issues/{number}/comments`, collect reviews with `GET /api/v1/repos/{owner}/{repo}/pulls/{number}/reviews`, and then collect per-review comments with `GET /api/v1/repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/comments`.",
+			"If provider access fails for authentication, network, rate-limit, or PR drift reasons, stop and return a structured error with `type` set to one of `auth`, `network`, `rate_limit`, or `pr_drift`, plus a short `message` and any observed PR metadata. Do not proceed on stale PR data.",
+		}, "\n")
+	}
 	return strings.Join([]string{
 		"Agent-side GitHub fetch contract: use the minimal PR seed above as the stable handoff. Do not assume full PR diffs, full comment dumps, reviews, checks, or thread state from this prompt are complete or fresh.",
 		"Before editing and again before final conclusions or pushing, run `gh pr view <pr-url> -R <repo> --json number,title,body,state,isDraft,baseRefName,headRefName,headRefOid,url,labels` using the seeded PR URL or number plus repository, and validate `headRefOid` equals the seeded `head_sha`, `baseRefName` equals the seeded `base_ref` when present, and state/draft status match the seed. Fail fast on drift.",
@@ -5831,13 +6325,17 @@ func fixerAgentSideGitHubFetchContract() string {
 }
 
 func buildFixerPrompt(projectID string, instructionConfig config.Config, repo string, prNumber int64, detail *checkpointDetail, fixItems []FixItem, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
-	parts := []string{fmt.Sprintf("Fix pull request %s#%d.", repo, prNumber), buildFixerMinimalPRSeed(repo, prNumber, detail, fixItems), fixerAgentSideGitHubFetchContract()}
+	parts := []string{fmt.Sprintf("Fix pull request %s#%d.", repo, prNumber), buildFixerMinimalPRSeed(repo, prNumber, detail, fixItems), fixerAgentSideFetchContract(repo, prNumber, detail, fixItems)}
 	if headSHA := detailHeadSHA(detail); headSHA != "" {
 		parts = append(parts, "Head SHA: "+headSHA)
 	}
 	encodedItems := make([]string, 0, len(fixItems))
 	for _, item := range fixItems {
-		encoded, _ := json.Marshal(item)
+		promptItem := item
+		if promptItem.Type == "comment" && promptItem.Source == NativeReviewCommentSource && promptItem.ProviderCommentID > 0 {
+			promptItem.ThreadID = ""
+		}
+		encoded, _ := json.Marshal(promptItem)
 		encodedItems = append(encodedItems, "- "+string(encoded))
 	}
 	parts = append(parts,
@@ -5878,29 +6376,44 @@ func customInstructionConfig(value *config.Config) config.Config {
 // only the explanation; Looper owns the @mention, commit reference, and
 // disclosure stamping.
 func buildFixerReplyExplanationInstruction(fixItems []FixItem) string {
-	hasComment := false
+	hasNonNativeComment := false
+	hasNativeForgejoComment := false
 	for _, item := range fixItems {
+		if item.Type == "comment" && item.Source == NativeReviewCommentSource && item.ProviderCommentID > 0 {
+			hasNativeForgejoComment = true
+			continue
+		}
 		if item.Type == "comment" && item.ID != "" && item.ThreadID != "" {
-			hasComment = true
-			break
+			hasNonNativeComment = true
 		}
 	}
-	if !hasComment {
+	if !hasNonNativeComment && !hasNativeForgejoComment {
 		return ""
 	}
-	return strings.Join([]string{
-		"For EVERY comment-type fix item, you MUST include exactly one entry in a top-level `review_thread_replies` array on the final " + agent.CompletionMarker + " JSON line.",
-		"Each entry must be an object with these fields:",
-		`  - "fixItemId": the exact "id" of the fix item`,
-		`  - "threadId": the exact "threadId" of the same fix item`,
-		`  - "action": "fixed" or "declined"`,
-		`  - "explanation": one or two sentences (max ~500 chars). If action is "fixed", say what you changed and where. If action is "declined", give a concrete reason why you are not acting. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
-		`  - "threadCommentsObserved": sha256 of the JSON array of review-thread comments you observed in thread order, where each element is {"id","updatedAt"}. The "id" MUST be the GraphQL PullRequestReviewComment node ID. If you fetched comments with REST pulls/{number}/comments, map REST "node_id" to "id" and REST "updated_at" to "updatedAt"; do not use the REST numeric "id". Include target reviewer comments even when they contain a Looper stamp. Exclude only prior Looper fixer replies/round comments.`,
-		"Before including an entry, re-read the relevant review thread/comment context.",
-		"Use \"fixed\" only when you can confidently confirm the current branch state actually addresses the thread; in other words, only include items you can confidently confirm are actually addressed by the current branch state. Use \"declined\" if you deliberately are not acting, including cases such as: already implemented on this branch, out of scope for this PR, reviewer request is incorrect, or you cannot safely complete it.",
-		"Do not omit any comment-type fix item. Do not use vague explanations like \"looks fine\" or \"no change needed\".",
-		"Read-only GitHub fetches are allowed for that verification. Do not post replies, resolve threads, submit reviews, edit PR metadata, or perform any other mutating GitHub API action; Looper owns those remote review-state changes after validation and push. Do not invent URLs.",
-	}, "\n")
+	parts := make([]string, 0, 12)
+	if hasNonNativeComment {
+		parts = append(parts,
+			"For EVERY non-native comment-type fix item, you MUST include exactly one entry in a top-level `review_thread_replies` array on the final "+agent.CompletionMarker+" JSON line.",
+			"Each entry must be an object with these fields:",
+			`  - "fixItemId": the exact "id" of the fix item`,
+			`  - "threadId": the exact "threadId" of the same fix item`,
+			`  - "action": "fixed" or "declined"`,
+			`  - "explanation": one or two sentences (max ~500 chars). If action is "fixed", say what you changed and where. If action is "declined", give a concrete reason why you are not acting. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
+			`  - "threadCommentsObserved": sha256 of the JSON array of review-thread comments you observed in thread order, where each element is {"id","updatedAt"}. The "id" MUST be the GraphQL PullRequestReviewComment node ID. If you fetched comments with REST pulls/{number}/comments, map REST "node_id" to "id" and REST "updated_at" to "updatedAt"; do not use the REST numeric "id". Include target reviewer comments even when they contain a Looper stamp. Exclude only prior Looper fixer replies/round comments.`,
+			"Before including an entry, re-read the relevant review thread/comment context.",
+			"Use \"fixed\" only when you can confidently confirm the current branch state actually addresses the thread; in other words, only include items you can confidently confirm are actually addressed by the current branch state. Use \"declined\" if you deliberately are not acting, including cases such as: already implemented on this branch, out of scope for this PR, reviewer request is incorrect, or you cannot safely complete it.",
+			"Do not omit any non-native comment-type fix item. Do not use vague explanations like \"looks fine\" or \"no change needed\".",
+			"Read-only GitHub fetches are allowed for that verification. Do not post replies, resolve threads, submit reviews, edit PR metadata, or perform any other mutating GitHub API action; Looper owns those remote review-state changes after validation and push. Do not invent URLs.",
+		)
+	}
+	if hasNativeForgejoComment {
+		parts = append(parts,
+			"For EVERY Forgejo native review comment fix item (`source: \"forgejo_review_comment\"`), also include exactly one entry in a top-level `repair_results` array on the final "+agent.CompletionMarker+" JSON line.",
+			"Each `repair_results` entry for a Forgejo native review comment must include: `source` = `forgejo_review_comment`, the exact `providerCommentId`, `action` = `fixed`, `declined`, or `deferred`, a concrete `explanation`, and the exact `observedFingerprint` from the fix item.",
+			"Use Forgejo comment terminology for those entries: decide whether the individual review comment is fixed, declined, or deferred. Do not refer to Forgejo native review comments as threads in `repair_results`.",
+		)
+	}
+	return strings.Join(parts, "\n")
 }
 
 func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) string {

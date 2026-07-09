@@ -1256,6 +1256,14 @@ func (r *Runner) commentOnlyPublishForProject(projectID string) bool {
 	if r.commentOnlyPublish {
 		return true
 	}
+	return r.forgejoCommentOnlyPublishForProject(projectID)
+}
+
+func (r *Runner) commentOnlyCompletionForProject(projectID string, reviewEvents config.ReviewerReviewEventsConfig) bool {
+	return r.forgejoCommentOnlyPublishForProject(projectID) || (r.commentOnlyPublishForProject(projectID) && reviewEvents.Clean != config.ReviewerReviewEventApprove)
+}
+
+func (r *Runner) forgejoCommentOnlyPublishForProject(projectID string) bool {
 	if r.projectRoleConfig == nil {
 		return false
 	}
@@ -2644,7 +2652,9 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	if !requireReviewRequest && policy.RequireReviewRequest && reviewerFollowUpHasNewHead(input.Loop, checkpoint.Snapshot.HeadSHA) {
 		reviewRequestBypassReason = "follow_up_new_head"
 	}
-	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, r.effectiveReviewEvents(input.Loop.MetadataJSON), isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, r.commentOnlyPublishForProject(input.Project.ID))
+	reviewEvents := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+	commentOnlyCompletion := r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents)
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, r.agentRuntime, r.agentModel, r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion)
 	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey)
 	metadata := map[string]any{"loopType": "reviewer", "repo": input.Repo, "prNumber": input.PRNumber}
 	for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
@@ -2732,7 +2742,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureRetryableAfterResume}
 	}
 	if cleanReviewNoopSummary(result.Summary) {
-		if r.commentOnlyPublishForProject(input.Project.ID) {
+		if commentOnlyCompletion {
 			completion, err := parseReviewerCommentOnlyCompletion(result)
 			if err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -2745,13 +2755,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
-		policy := r.effectiveReviewEvents(input.Loop.MetadataJSON)
-		if policy.Clean == config.ReviewerReviewEventApprove && r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled && resolvePullRequestPhase(detailLabels(checkpoint.Detail)) != "spec" {
+		if reviewEvents.Clean == config.ReviewerReviewEventApprove && r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled && resolvePullRequestPhase(detailLabels(checkpoint.Detail)) != "spec" {
 			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", CleanNoop: true}
 			checkpoint.ResumePolicy = "advance_from_checkpoint"
 			return checkpoint, nil
 		}
-		if policy.Clean == config.ReviewerReviewEventApprove {
+		if reviewEvents.Clean == config.ReviewerReviewEventApprove {
 			if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			} else if cleanReviewMarkerSatisfiesCleanPolicy(found, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})) {
@@ -2768,7 +2777,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		return checkpoint, nil
 	}
-	if r.commentOnlyPublishForProject(input.Project.ID) {
+	if commentOnlyCompletion {
 		completion, err := parseReviewerCommentOnlyCompletion(result)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -2834,7 +2843,17 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			}
 			return checkpoint, nil
 		}
-		if r.effectiveReviewEvents(input.Loop.MetadataJSON).Clean == config.ReviewerReviewEventApprove {
+		reviewEvents := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+		if r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents) {
+			if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
+				return checkpoint, err
+			}
+			if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment); err != nil {
+				return checkpoint, err
+			}
+			return checkpoint, nil
+		}
+		if reviewEvents.Clean == config.ReviewerReviewEventApprove {
 			found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(checkpoint, detail))
 			if err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -2855,15 +2874,6 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 				return checkpoint, err
 			}
 			if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
-				return checkpoint, err
-			}
-			return checkpoint, nil
-		}
-		if r.commentOnlyPublishForProject(input.Project.ID) {
-			if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
-				return checkpoint, err
-			}
-			if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment); err != nil {
 				return checkpoint, err
 			}
 			return checkpoint, nil
@@ -2895,7 +2905,8 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if skipped, next, err := r.skipThreadResolutionFollowUpReview(ctx, input, checkpoint); skipped || err != nil {
 		return next, err
 	}
-	if r.commentOnlyPublishForProject(input.Project.ID) {
+	reviewEvents := r.effectiveReviewEvents(input.Loop.MetadataJSON)
+	if r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents) {
 		if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
 			return checkpoint, err
 		}
