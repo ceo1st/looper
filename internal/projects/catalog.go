@@ -92,6 +92,7 @@ func cloneCatalogConfig(source config.Config) config.Config {
 func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) ([]config.ProjectRefConfig, error) {
 	projects := make([]config.ProjectRefConfig, 0, len(records))
 	seen := make(map[string]struct{}, len(records))
+	seenRepos := make(map[string]string, len(records))
 	for _, record := range records {
 		if record.Archived {
 			continue
@@ -113,6 +114,13 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 		if project.Provider != "" && !configuredProviderExists(global, project.Provider) {
 			return nil, fmt.Errorf("project %q references unknown provider %q", project.ID, project.Provider)
 		}
+		if project.Repo != "" {
+			repoKey := strings.ToLower(project.Repo)
+			if existingID, ok := seenRepos[repoKey]; ok {
+				return nil, fmt.Errorf("project %q repo %q duplicates active project %q", project.ID, project.Repo, existingID)
+			}
+			seenRepos[repoKey] = project.ID
+		}
 		if worktreeRoot := metadataString(metadata, "worktreeRoot"); worktreeRoot != "" {
 			project.WorktreeRoot = &worktreeRoot
 		}
@@ -125,6 +133,14 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 		}
 		if err := decodeMetadataValue(metadata, "roles", &project.Roles); err != nil {
 			return nil, fmt.Errorf("decode project %q role policy: %w", project.ID, err)
+		}
+		if config.ResolvedProjectProviderKind(global, project) == config.ProviderKindForgejo {
+			config.ApplyForgejoProjectProfile(&project)
+			effectiveConfig := global
+			effectiveConfig.Projects = append(append([]config.ProjectRefConfig(nil), projects...), project)
+			if err := config.ValidateForgejoRoleCapabilities(config.ProjectRoleConfigs(effectiveConfig, project.ID), fmt.Sprintf("projects[%q]", project.ID)); err != nil {
+				return nil, err
+			}
 		}
 		projects = append(projects, project)
 	}

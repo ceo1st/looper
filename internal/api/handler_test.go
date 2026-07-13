@@ -1491,12 +1491,37 @@ func TestHandlerProjectsListRouteSuccess(t *testing.T) {
 	assertEqual(t, project["repoPath"], "/tmp/looper")
 	assertEqual(t, project["baseBranch"], "main")
 	assertEqual(t, project["archived"], false)
+	assertEqual(t, project["provider"], "github")
 	assertEqual(t, project["repo"], "acme/looper")
 	if project["worktreeRoot"] != nil {
 		t.Fatalf("worktreeRoot = %#v, want nil", project["worktreeRoot"])
 	}
 	assertEqual(t, project["createdAt"], nowISO)
 	assertEqual(t, project["updatedAt"], nowISO)
+}
+
+func TestResolveProjectProviderKind(t *testing.T) {
+	t.Parallel()
+
+	tokenEnv := "FORGEJO_TOKEN"
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{
+			{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv},
+		},
+		Projects: []config.ProjectRefConfig{
+			{ID: "configured-forgejo", Name: "Configured", Provider: "forgejo-main", Repo: "acme/fj", RepoPath: "/tmp/fj"},
+		},
+	}
+
+	if got := resolveProjectProviderKind(cfg, "configured-forgejo", map[string]any{}); got != "forgejo" {
+		t.Fatalf("configured forgejo = %q, want forgejo", got)
+	}
+	if got := resolveProjectProviderKind(cfg, "api-forgejo", map[string]any{"provider": "forgejo-main", "repo": "core/odcrew"}); got != "forgejo" {
+		t.Fatalf("metadata forgejo = %q, want forgejo", got)
+	}
+	if got := resolveProjectProviderKind(cfg, "legacy-github", map[string]any{"repo": "acme/looper"}); got != "github" {
+		t.Fatalf("legacy github = %q, want github", got)
+	}
 }
 
 func TestHandlerProjectsCreateRouteSuccessDerivesDefaults(t *testing.T) {
@@ -1580,7 +1605,7 @@ func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 	}
 }
 
-func TestHandlerProjectsCreateRouteReconcilesWebhookForwarders(t *testing.T) {
+func TestHandlerProjectsCreateRouteLeavesCatalogPublicationToService(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
 	reconciled := 0
@@ -1600,8 +1625,8 @@ func TestHandlerProjectsCreateRouteReconcilesWebhookForwarders(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", recorder.Code)
 	}
-	if reconciled != 1 {
-		t.Fatalf("ReconcileWebhookForwarders() calls = %d, want 1", reconciled)
+	if reconciled != 0 {
+		t.Fatalf("ReconcileWebhookForwarders() calls = %d, want 0", reconciled)
 	}
 }
 
@@ -1675,7 +1700,7 @@ func TestHandlerProjectsRemoveRouteArchivesProject(t *testing.T) {
 	}
 }
 
-func TestHandlerProjectsRemoveRouteReconcilesWebhookForwarders(t *testing.T) {
+func TestHandlerProjectsRemoveRouteLeavesCatalogPublicationToService(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
 	reconciled := 0
@@ -1691,8 +1716,8 @@ func TestHandlerProjectsRemoveRouteReconcilesWebhookForwarders(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
-	if reconciled != 1 {
-		t.Fatalf("ReconcileWebhookForwarders() calls = %d, want 1", reconciled)
+	if reconciled != 0 {
+		t.Fatalf("ReconcileWebhookForwarders() calls = %d, want 0", reconciled)
 	}
 }
 

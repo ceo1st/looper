@@ -505,14 +505,14 @@ func (w *webhookRuntime) updateTunnelDegradedReasons(states []WebhookTunnelState
 	}
 }
 
-func (w *webhookRuntime) configuredWebhookReposForMode(projects []storage.ProjectRecord, mode config.WebhookMode) []string {
+func configuredWebhookReposForMode(cfg config.Config, mode config.WebhookMode) []string {
 	seen := map[string]struct{}{}
-	repos := make([]string, 0, len(projects))
-	for _, project := range projects {
-		if project.Archived || w.webhookModeForProject(project.ID) != mode {
+	repos := make([]string, 0, len(cfg.Projects))
+	for _, project := range cfg.Projects {
+		if config.ResolvedProjectProviderKind(cfg, project) == config.ProviderKindForgejo || webhookModeForProject(cfg, project.ID) != mode {
 			continue
 		}
-		repo := repoFromProjectMetadata(project.MetadataJSON)
+		repo := strings.TrimSpace(project.Repo)
 		if repo == "" {
 			continue
 		}
@@ -526,8 +526,7 @@ func (w *webhookRuntime) configuredWebhookReposForMode(projects []storage.Projec
 	return repos
 }
 
-func (w *webhookRuntime) webhookModeForProject(projectID string) config.WebhookMode {
-	cfg := w.configSnapshot()
+func webhookModeForProject(cfg config.Config, projectID string) config.WebhookMode {
 	mode := cfg.Webhook.Mode
 	for _, project := range cfg.Projects {
 		if project.ID == projectID && project.Webhook.Mode != "" {

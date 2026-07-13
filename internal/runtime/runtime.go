@@ -559,8 +559,8 @@ func (r *Runtime) start(ctx context.Context) error {
 		Config:       r.config,
 		ConfigSource: r.projectCatalog,
 		Now:          r.now,
-		DetectRepo: func(ctx context.Context, repoPath string) (string, error) {
-			return gitGateway.DetectGitHubRepo(ctx, repoPath)
+		DetectRepo: func(ctx context.Context, repoPath string) (projects.DetectedRepo, error) {
+			return detectProjectRepo(ctx, gitGateway, r.projectCatalog.Snapshot(), repoPath)
 		},
 		GetRepositorySettings: func(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
 			if githubGateway == nil {
@@ -844,12 +844,40 @@ func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
 }
 
 func runtimeProjectProviderKind(cfg config.Config, projectID string) config.ProviderKind {
-	for _, project := range cfg.Projects {
-		if project.ID == projectID {
-			return config.ResolvedProjectProviderKind(cfg, project)
-		}
+	project, ok := runtimeProjectBinding(cfg, projectID)
+	if ok {
+		return config.ResolvedProjectProviderKind(cfg, project)
 	}
 	return config.ProviderKindGitHub
+}
+
+func runtimeProjectBinding(cfg config.Config, projectID string) (config.ProjectRefConfig, bool) {
+	for _, project := range cfg.Projects {
+		if project.ID == projectID {
+			return project, true
+		}
+	}
+	return config.ProjectRefConfig{}, false
+}
+
+func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, cfg config.Config, repoPath string) (projects.DetectedRepo, error) {
+	if gitGateway == nil {
+		return projects.DetectedRepo{}, fmt.Errorf("git gateway is not configured")
+	}
+	remote, err := gitGateway.DetectOriginRemote(ctx, repoPath)
+	if err != nil {
+		return projects.DetectedRepo{}, err
+	}
+	if strings.TrimSpace(remote.Repo) == "" {
+		return projects.DetectedRepo{}, nil
+	}
+	if provider, ok := config.MatchForgejoProviderByRemoteHost(cfg, remote.Host); ok {
+		return projects.DetectedRepo{Repo: remote.Repo, Provider: provider.ID}, nil
+	}
+	if remote.Host == "github.com" || strings.HasSuffix(remote.Host, ".github.com") {
+		return projects.DetectedRepo{Repo: remote.Repo}, nil
+	}
+	return projects.DetectedRepo{}, nil
 }
 
 func (r *Runtime) reloadProjectCatalog(ctx context.Context, repos *storage.Repositories) error {

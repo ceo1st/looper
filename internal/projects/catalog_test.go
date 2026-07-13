@@ -171,6 +171,54 @@ func TestMaterializeCatalogRejectsUnknownProvider(t *testing.T) {
 	}
 }
 
+func TestMaterializeCatalogRejectsDuplicateActiveRepoBindings(t *testing.T) {
+	t.Parallel()
+
+	githubMetadata := `{"repo":"nexu-io/looper","source":"config"}`
+	forgejoMetadata := `{"provider":"forgejo-main","repo":"NEXU-IO/LOOPER","source":"api"}`
+	global := config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}}
+
+	_, err := MaterializeCatalog(global, []storage.ProjectRecord{
+		{ID: "github", MetadataJSON: &githubMetadata},
+		{ID: "forgejo", MetadataJSON: &forgejoMetadata},
+	})
+	if err == nil || !strings.Contains(err.Error(), `repo "NEXU-IO/LOOPER" duplicates active project "github"`) {
+		t.Fatalf("MaterializeCatalog() error = %v, want duplicate active repo binding", err)
+	}
+}
+
+func TestMaterializeCatalogAppliesAndValidatesForgejoRoleProfile(t *testing.T) {
+	t.Parallel()
+
+	global, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	global.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}
+	global.Roles.Coordinator.Enabled = true
+	global.Roles.Coordinator.Dependencies.Enabled = true
+	metadata := `{"provider":"forgejo-main","repo":"core/odcrew","source":"api"}`
+	got, err := MaterializeCatalog(global, []storage.ProjectRecord{{ID: "odcrew", MetadataJSON: &metadata}})
+	if err != nil {
+		t.Fatalf("MaterializeCatalog() error = %v", err)
+	}
+	global.Projects = got
+	triggers := config.ProjectRoleConfigs(global, "odcrew").Reviewer.Discovery.Triggers
+	if triggers.RequireReviewRequest || len(triggers.Labels) != 1 || triggers.Labels[0] != "looper:review" {
+		t.Fatalf("materialized reviewer triggers = %#v, want Forgejo label/comment-only profile", triggers)
+	}
+	coordinator := config.ProjectRoleConfigs(global, "odcrew").Coordinator
+	if coordinator.Enabled || coordinator.Dependencies.Enabled {
+		t.Fatalf("materialized coordinator = %#v, want Forgejo coordinator and dependency gates disabled", coordinator)
+	}
+
+	incompatibleMetadata := `{"provider":"forgejo-main","repo":"core/odcrew","roles":{"reviewer":{"discovery":{"triggers":{"requireReviewRequest":true}}}},"source":"api"}`
+	_, err = MaterializeCatalog(global, []storage.ProjectRecord{{ID: "odcrew", MetadataJSON: &incompatibleMetadata}})
+	if err == nil || !strings.Contains(err.Error(), "requireReviewRequest") {
+		t.Fatalf("MaterializeCatalog() error = %v, want incompatible Forgejo role rejection", err)
+	}
+}
+
 func TestConfiguredProjectMetadataRoundTripsRuntimePolicy(t *testing.T) {
 	t.Parallel()
 

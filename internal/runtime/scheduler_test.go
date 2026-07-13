@@ -124,6 +124,71 @@ func TestRunDefaultSchedulerTickDiscoversStoredProjectsAndProcessesQueue(t *test
 	}
 }
 
+func TestRunDefaultSchedulerTickDefersStaleCatalogBeforeClaimAndDiscovery(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-catalog-binding.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 13, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	baseBranch := "main"
+	forgejoMetadata := `{"provider":"forgejo-main","repo":"forgejo/new"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "rebound", Name: "Rebound", RepoPath: filepath.Join(workingDir, "rebound"), BaseBranch: &baseBranch, MetadataJSON: &forgejoMetadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	projectTarget := "project:rebound"
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_rebound", Seq: 1, ProjectID: "rebound", Type: "worker", TargetType: "project", TargetID: &projectTarget, Repo: stringPtr("forgejo/new"), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "rebound"
+	loopID := "loop_rebound"
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_rebound", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectTarget, Repo: stringPtr("forgejo/new"), DedupeKey: "worker:loop_rebound", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	captured := config.Config{
+		Projects:  []config.ProjectRefConfig{{ID: "rebound", Repo: "github/old"}},
+		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}},
+	}
+	plannerRunner := &stubPlannerScheduler{}
+	coordinatorRunner := &stubCoordinatorScheduler{}
+	workerRunner := &stubWorkerScheduler{}
+	input := defaultSchedulerTickInput{
+		Repos:                   repos,
+		Now:                     func() time.Time { return now },
+		MaxConcurrentRuns:       1,
+		Config:                  &captured,
+		Planner:                 plannerRunner,
+		Coordinator:             coordinatorRunner,
+		Worker:                  workerRunner,
+		CoordinatorEnabled:      func(string) bool { return true },
+		PlannerDiscoveryEnabled: boolPtr(true),
+	}
+	if err := runDefaultSchedulerTick(context.Background(), input); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if err := runIndependentClaimPass(context.Background(), input); err != nil {
+		t.Fatalf("runIndependentClaimPass() error = %v", err)
+	}
+
+	if len(plannerRunner.discoverCalls) != 0 {
+		t.Fatalf("planner discover calls = %#v, want stale catalog pass deferred", plannerRunner.discoverCalls)
+	}
+	if len(coordinatorRunner.discoverCalls) != 0 || workerRunner.processItemCount() != 0 {
+		t.Fatalf("coordinator calls = %#v, worker processed items = %#v; want no stale dispatch", coordinatorRunner.discoverCalls, workerRunner.processedItems)
+	}
+	queued, err := repos.Queue.GetByID(context.Background(), "queue_rebound")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queued == nil || queued.Status != "queued" {
+		t.Fatalf("queue item = %#v, want unclaimed until catalog publication", queued)
+	}
+}
+
 func TestRunDefaultSchedulerTickClaimsQueuedWorkBeforeDiscovery(t *testing.T) {
 	t.Parallel()
 
@@ -487,6 +552,7 @@ func TestRunDefaultSchedulerTickLogsClaimPhasesAndSlowLanes(t *testing.T) {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
 	cfg.Scheduler.SlowLaneWarnThresholdMS = 1
+	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Repo: "nexu-io/looper"}}
 
 	plannerRunner := &sleepingPlannerScheduler{delay: 5 * time.Millisecond}
 	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{

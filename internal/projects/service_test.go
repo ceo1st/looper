@@ -43,6 +43,60 @@ func TestServiceAddProjectCreatesAPIProject(t *testing.T) {
 	}
 }
 
+func TestServiceAddForgejoProjectActivatesProviderBinding(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	tokenEnv := "LOOPER_FORGEJO_TOKEN"
+	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv}}
+	catalog := NewCatalog(cfg)
+	service := &Service{
+		DB:           coordinator.DB(),
+		Repos:        repos,
+		Config:       cfg,
+		ConfigSource: catalog,
+		Now:          time.Now,
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
+			return DetectedRepo{Repo: "core/odcrew", Provider: "forgejo-main"}, nil
+		},
+		ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
+			t.Fatal("ListOpenPullRequests should not run for a Forgejo project")
+			return nil, nil
+		},
+		PublishProjects: catalog.Publish,
+	}
+
+	result, err := service.AddProject(context.Background(), AddInput{
+		ID: "odcrew", Name: "odcrew", RepoPath: "/tmp/odcrew", BaseBranch: "main", Provider: stringPointer("forgejo-main"),
+	})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if result.Provider == nil || *result.Provider != "forgejo-main" {
+		t.Fatalf("AddProject().Provider = %v, want forgejo-main", result.Provider)
+	}
+	metadata := parseMetadata(result.Project.MetadataJSON)
+	if metadataString(metadata, "provider") != "forgejo-main" || metadataString(metadata, "repo") != "core/odcrew" {
+		t.Fatalf("metadata = %v, want persisted provider binding", result.Project.MetadataJSON)
+	}
+	if _, ok := metadata["roles"]; !ok {
+		t.Fatalf("metadata = %v, want persisted Forgejo role profile", result.Project.MetadataJSON)
+	}
+	snapshot := catalog.Snapshot()
+	if len(snapshot.Projects) != 1 || snapshot.Projects[0].Provider != "forgejo-main" || snapshot.Projects[0].Repo != "core/odcrew" {
+		t.Fatalf("catalog projects = %#v, want published Forgejo binding", snapshot.Projects)
+	}
+	triggers := snapshot.Projects[0].Roles.Reviewer.Discovery.Triggers
+	if triggers.RequireReviewRequest == nil || *triggers.RequireReviewRequest || triggers.Labels == nil || len(*triggers.Labels) != 1 || (*triggers.Labels)[0] != "looper:review" {
+		t.Fatalf("catalog reviewer triggers = %#v, want Forgejo label profile", triggers)
+	}
+}
+
 func TestServiceConcurrentAddsPublishCommittedCatalog(t *testing.T) {
 	t.Parallel()
 
@@ -145,7 +199,7 @@ func TestServiceAddProjectDiscoversPullRequestsAndWorktrees(t *testing.T) {
 		DB:         coordinator.DB(),
 		Repos:      repos,
 		Now:        func() time.Time { return now },
-		DetectRepo: func(context.Context, string) (string, error) { return "nexu-io/looper", nil },
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) { return DetectedRepo{Repo: "nexu-io/looper"}, nil },
 		ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) {
 			return []WorktreeListEntry{{Path: "/tmp/looper", Branch: "main", HeadSHA: "abc123"}, {Path: "/tmp/looper-pr-1", Branch: "pr-1", HeadSHA: "def456"}}, nil
 		},
@@ -552,8 +606,8 @@ func TestServiceSyncConfiguredRefreshesTransferredRepoMetadata(t *testing.T) {
 	service := &Service{
 		Repos: repos,
 		Now:   func() time.Time { return now },
-		DetectRepo: func(context.Context, string) (string, error) {
-			return "nexu-io/looper", nil
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
+			return DetectedRepo{Repo: "nexu-io/looper"}, nil
 		},
 	}
 	cfg, err := config.DefaultConfig(t.TempDir())
@@ -591,8 +645,8 @@ func TestServiceSyncConfiguredPreservesRepoMetadataWhenDetectionReturnsEmpty(t *
 	service := &Service{
 		Repos: repos,
 		Now:   func() time.Time { return now },
-		DetectRepo: func(context.Context, string) (string, error) {
-			return "", nil
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
+			return DetectedRepo{}, nil
 		},
 	}
 	cfg, err := config.DefaultConfig(t.TempDir())
@@ -630,8 +684,8 @@ func TestServiceSyncConfiguredLeavesRepoMetadataNilWhenDetectionReturnsEmptyWith
 	service := &Service{
 		Repos: repos,
 		Now:   func() time.Time { return now },
-		DetectRepo: func(context.Context, string) (string, error) {
-			return "", nil
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
+			return DetectedRepo{}, nil
 		},
 	}
 	cfg, err := config.DefaultConfig(t.TempDir())
@@ -669,8 +723,8 @@ func TestServiceSyncConfiguredPreservesRepoMetadataWhenDetectionFails(t *testing
 	service := &Service{
 		Repos: repos,
 		Now:   func() time.Time { return now },
-		DetectRepo: func(context.Context, string) (string, error) {
-			return "", errors.New("git unavailable")
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
+			return DetectedRepo{}, errors.New("git unavailable")
 		},
 	}
 	cfg, err := config.DefaultConfig(t.TempDir())

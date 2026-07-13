@@ -26,7 +26,12 @@ const legacyProjectIDPrefix = "legacy-id-"
 
 var nonProjectIDPattern = regexp.MustCompile(`[^a-z0-9]+`)
 
-type DetectRepoFunc func(context.Context, string) (string, error)
+type DetectedRepo struct {
+	Repo     string
+	Provider string
+}
+
+type DetectRepoFunc func(context.Context, string) (DetectedRepo, error)
 
 type ListWorktreesFunc func(context.Context, string) ([]WorktreeListEntry, error)
 
@@ -97,12 +102,14 @@ type AddInput struct {
 	IDSource     string
 	WorktreeRoot *string
 	Repo         *string
+	Provider     *string
 	SnapshotMode SnapshotMode
 }
 
 type AddResult struct {
 	Project                storage.ProjectRecord
 	Repo                   *string
+	Provider               *string
 	DiscoveredPullRequests int
 	DiscoveredWorktrees    int
 	PendingSnapshots       int
@@ -173,19 +180,42 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 		}
 	}
 
+	cfg := s.currentConfig()
 	repo := input.Repo
+	provider := normalizeOptionalProvider(input.Provider)
 	warnings := []string{}
-	if repo == nil && s.DetectRepo != nil {
+	if (repo == nil || provider == nil) && s.DetectRepo != nil {
 		detected, detectErr := s.DetectRepo(ctx, input.RepoPath)
 		if detectErr != nil {
-			warnings = append(warnings, fmt.Sprintf("Could not detect GitHub repo: %s", detectErr.Error()))
-		} else if detected != "" {
-			repo = &detected
+			warnings = append(warnings, fmt.Sprintf("Could not detect repository from git remote: %s", detectErr.Error()))
+		} else {
+			if repo == nil && strings.TrimSpace(detected.Repo) != "" {
+				if provider != nil && strings.TrimSpace(detected.Provider) != strings.TrimSpace(*provider) {
+					detectedProvider := strings.TrimSpace(detected.Provider)
+					if detectedProvider == "" {
+						detectedProvider = "the GitHub default"
+					}
+					return AddResult{}, ProjectValidationError{Message: fmt.Sprintf("detected origin belongs to %s, not provider %q; pass --repo owner/name explicitly or use a checkout whose origin matches the provider", detectedProvider, strings.TrimSpace(*provider))}
+				}
+				value := strings.TrimSpace(detected.Repo)
+				repo = &value
+				if provider == nil && strings.TrimSpace(detected.Provider) != "" {
+					return AddResult{}, ProjectValidationError{Message: fmt.Sprintf("non-GitHub origin matches provider %q; rerun with --provider %s to confirm the binding", strings.TrimSpace(detected.Provider), strings.TrimSpace(detected.Provider))}
+				}
+			}
 		}
 	}
-
-	if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, s.currentConfig()); err != nil {
+	if err := validateExplicitProvider(cfg, provider); err != nil {
 		return AddResult{}, err
+	}
+	if provider != nil && (repo == nil || strings.TrimSpace(*repo) == "") {
+		return AddResult{}, ProjectValidationError{Message: "provider is set but repo is missing; pass --repo owner/name or use a checkout with a detectable origin remote"}
+	}
+
+	if !isForgejoProvider(cfg, provider) {
+		if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, cfg); err != nil {
+			return AddResult{}, err
+		}
 	}
 
 	nowISO := currentISO(s.Now)
@@ -204,6 +234,18 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	metadata["repo"] = nil
 	if repo != nil {
 		metadata["repo"] = *repo
+	}
+	if provider != nil {
+		metadata["provider"] = *provider
+	} else {
+		delete(metadata, "provider")
+	}
+	if isForgejoProvider(cfg, provider) {
+		profile := config.ProjectRefConfig{}
+		config.ApplyForgejoProjectProfile(&profile)
+		metadata["roles"] = profile.Roles
+	} else {
+		delete(metadata, "roles")
 	}
 	if input.WorktreeRoot != nil {
 		metadata["worktreeRoot"] = *input.WorktreeRoot
@@ -253,13 +295,17 @@ func (s *Service) AddProject(ctx context.Context, input AddInput) (AddResult, er
 	if err != nil {
 		return AddResult{}, err
 	}
-	discoveredPullRequests, pendingSnapshots, capturedSnapshots, err := s.discoverPullRequests(ctx, record, repo, snapshotModeOrDefault(input.SnapshotMode), &warnings)
-	if err != nil {
-		return AddResult{}, err
+	var discoveredPullRequests, pendingSnapshots, capturedSnapshots int
+	if !isForgejoProvider(cfg, provider) {
+		discoveredPullRequests, pendingSnapshots, capturedSnapshots, err = s.discoverPullRequests(ctx, record, repo, snapshotModeOrDefault(input.SnapshotMode), &warnings)
+		if err != nil {
+			return AddResult{}, err
+		}
 	}
 	return AddResult{
 		Project:                record,
 		Repo:                   repo,
+		Provider:               provider,
 		DiscoveredPullRequests: discoveredPullRequests,
 		DiscoveredWorktrees:    discoveredWorktrees,
 		PendingSnapshots:       pendingSnapshots,
@@ -517,8 +563,11 @@ func (s *Service) detectConfiguredProjectRepo(ctx context.Context, existing *sto
 			}
 			return nil, nil
 		}
-		detected = strings.TrimSpace(detected)
-		if detected == "" {
+		if strings.TrimSpace(detected.Provider) != "" {
+			return nil, nil
+		}
+		detectedRepo := strings.TrimSpace(detected.Repo)
+		if detectedRepo == "" {
 			if existing != nil && existing.RepoPath == project.RepoPath {
 				if repo := stringMetadataPtr(existing.MetadataJSON, "repo"); repo != nil {
 					return repo, nil
@@ -526,7 +575,7 @@ func (s *Service) detectConfiguredProjectRepo(ctx context.Context, existing *sto
 			}
 			return nil, nil
 		}
-		return &detected, nil
+		return &detectedRepo, nil
 	}
 
 	if existing != nil && existing.RepoPath == project.RepoPath {
@@ -689,7 +738,7 @@ func buildAddProjectMetadataJSON(metadata map[string]any) (string, error) {
 	extraKeys := make([]string, 0, len(metadata))
 	for key := range metadata {
 		switch key {
-		case "normalizedDerivedId", "repo", "worktreeRoot", "source":
+		case "normalizedDerivedId", "provider", "repo", "worktreeRoot", "source":
 			continue
 		default:
 			extraKeys = append(extraKeys, key)
@@ -710,6 +759,13 @@ func buildAddProjectMetadataJSON(metadata map[string]any) (string, error) {
 		}
 		entries = append(entries, orderedJSONEntry{Key: "normalizedDerivedId", Raw: encoded})
 	}
+	if value, ok := metadata["provider"]; ok {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return "", err
+		}
+		entries = append(entries, orderedJSONEntry{Key: "provider", Raw: encoded})
+	}
 	repoEncoded, err := json.Marshal(metadata["repo"])
 	if err != nil {
 		return "", err
@@ -726,6 +782,46 @@ func buildAddProjectMetadataJSON(metadata map[string]any) (string, error) {
 	}
 	entries = append(entries, orderedJSONEntry{Key: "source", Raw: sourceEncoded})
 	return marshalOrderedJSONObject(entries)
+}
+
+func normalizeOptionalProvider(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
+}
+
+func validateExplicitProvider(cfg config.Config, provider *string) error {
+	if provider == nil {
+		return nil
+	}
+	providerID := strings.TrimSpace(*provider)
+	for _, configured := range cfg.Providers {
+		if configured.ID == providerID {
+			if configured.Kind != config.ProviderKindForgejo {
+				return ProjectValidationError{Message: fmt.Sprintf("provider %q has kind %q; project add currently supports provider bindings only for Forgejo", providerID, configured.Kind)}
+			}
+			return nil
+		}
+	}
+	return ProjectValidationError{Message: fmt.Sprintf("unknown provider id %q; configure it under [[providers]] first", providerID)}
+}
+
+func isForgejoProvider(cfg config.Config, provider *string) bool {
+	if provider == nil {
+		return false
+	}
+	providerID := strings.TrimSpace(*provider)
+	for _, configured := range cfg.Providers {
+		if configured.ID == providerID {
+			return configured.Kind == config.ProviderKindForgejo
+		}
+	}
+	return false
 }
 
 type orderedJSONEntry struct {

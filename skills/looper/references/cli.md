@@ -213,7 +213,13 @@ looper status
 
 After a project is registered, Looper can often infer it from commands run inside that repo. If no project matches the current directory, or multiple projects match, pass `--project <id>` explicitly.
 
-Forgejo projects are config-driven in the MVP. Do not use GitHub autodetection for them; add a `[[providers]]` entry with `kind = "forgejo"`, `baseUrl`, and `tokenEnv`, then add a project with `provider` and explicit `repo = "owner/name"`.
+For Forgejo, configure the provider first, then confirm it explicitly:
+
+```bash
+looper project add /absolute/path/to/repo --provider forgejo-main
+```
+
+The repository slug is detected from an origin matching the selected provider when possible; otherwise pass `--repo owner/name`. The binding is saved and activated immediately through the runtime Project Catalog, so background automation may begin as soon as the command succeeds.
 
 Daemon lifecycle commands:
 
