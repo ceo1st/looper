@@ -402,6 +402,7 @@ func (r *commandRuntime) reviewCreate(cmd *cobra.Command, args []string) error {
 			"prNumber":   prNumber,
 			"status":     "running",
 			"metadata":   metadata,
+			"force":      getBoolFlag(cmd, "force"),
 		}
 
 		return r.postJSON(ctx, "/api/v1/loops", body)
@@ -451,6 +452,7 @@ func (r *commandRuntime) fixCreate(cmd *cobra.Command, args []string) error {
 			"repo":       repo,
 			"prNumber":   prNumber,
 			"status":     "running",
+			"force":      getBoolFlag(cmd, "force"),
 			"metadata": map[string]any{
 				"manual":        true,
 				"followUpdates": loopEnabled,
@@ -664,6 +666,7 @@ func (r *commandRuntime) workCreate(cmd *cobra.Command, args []string) error {
 		}
 
 		setString(body, "projectId", resolvedProjectID)
+		body["force"] = getBoolFlag(cmd, "force")
 
 		if issueNumberValue != "" && strings.TrimSpace(getStringFlag(cmd, "title")) != "" {
 			setString(body, "title", getStringFlag(cmd, "title"))
@@ -698,6 +701,7 @@ func (r *commandRuntime) planCreate(cmd *cobra.Command, args []string) error {
 		}
 
 		setString(body, "projectId", resolvedProjectID)
+		body["force"] = getBoolFlag(cmd, "force")
 
 		return r.postJSON(ctx, "/api/v1/planners", body)
 	}, writeHumanPlannerCreate)
