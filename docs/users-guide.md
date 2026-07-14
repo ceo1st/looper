@@ -35,7 +35,7 @@ Also make sure:
 - Forgejo projects: the configured provider `tokenEnv` is exported in the daemon environment
 - `config.agent.vendor` is set (for example via `looper bootstrap --agent-vendor opencode`)
 
-Forgejo projects need a configured `[[providers]]` entry (`kind = "forgejo"`, `baseUrl`, `tokenEnv`) first. `looper project add` detects a matching Forgejo origin as a hint, but requires `--provider` to confirm the binding; `--repo` may be omitted only when it can be read from an origin matching that provider. The binding is persisted and activated immediately through the runtime Project Catalog. See [configuration](configuration.md#provider-support).
+Forgejo projects can be onboarded with `looper bootstrap --provider forgejo`, managed with `looper provider add|list|test|remove`, or added to a running installation with `looper project add --forgejo-url ... --forgejo-token-env ...`. For configured providers, pass the provider id explicitly; `--provider forgejo` selects it only when the origin has one unambiguous match. The binding is persisted and activated immediately through the runtime Project Catalog. See [configuration](configuration.md#provider-support).
 
 `looper status` probes each configured Forgejo provider with bounded, read-only requests. Human and JSON output distinguish endpoint reachability, token authentication, current identity, server version, per-project read/write access, and configured versus observed capabilities. An unavailable OpenAPI contract is reported as `unknown`, never as supported. Status output omits provider URLs, token environment names, tokens, and raw network errors.
 
