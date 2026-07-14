@@ -1725,7 +1725,7 @@ func TestLoopEnabledTreatsLegacyMissingMetadataAsDisabled(t *testing.T) {
 		t.Fatalf("loopEnabled(empty metadata) = true, want false for legacy persisted loop")
 	}
 
-	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "acme/looper", 42)
+	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "", "acme/looper", 42)
 	if err != nil {
 		t.Fatalf("ensureLoopMetadataJSON() error = %v", err)
 	}
@@ -1741,7 +1741,7 @@ func TestLoopEnabledTreatsLegacyMissingMetadataAsDisabled(t *testing.T) {
 		t.Fatalf("reviewEvents = %#v, want snapshotted decision policy", reviewEvents)
 	}
 	current := `{"loop":{"enabled":true,"status":"terminated","terminationReason":"max_wall_clock","maxIterationsPerPR":2,"maxIterationsPerHead":1,"maxWallClockSeconds":60,"maxConsecutiveFailures":3,"maxAgentExecutionsPerPR":25}}`
-	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "acme/looper", 42)
+	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "", "acme/looper", 42)
 	if err != nil {
 		t.Fatalf("ensureLoopMetadataJSON(legacy budget metadata) error = %v", err)
 	}
@@ -1758,15 +1758,64 @@ func TestLoopEnabledTreatsLegacyMissingMetadataAsDisabled(t *testing.T) {
 		t.Fatalf("loop metadata status = %#v, want active after removing budget termination", loopMeta["status"])
 	}
 	current = `{"reviewEvents":{"clean":"BOGUS","blocking":"APPROVE"}}`
-	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "acme/looper", 42)
+	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "", "acme/looper", 42)
 	if err == nil || !strings.Contains(err.Error(), "reviewEvents.clean") {
 		t.Fatalf("ensureLoopMetadataJSON(invalid reviewEvents) error = %v, want validation error", err)
 	}
 	current = `{"reviewEvents":{"clean":123}}`
-	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "acme/looper", 42)
+	metadataJSON, err = runner.ensureLoopMetadataJSON(&current, "", "acme/looper", 42)
 	if err == nil || !strings.Contains(err.Error(), "reviewEvents.clean") {
 		t.Fatalf("ensureLoopMetadataJSON(malformed reviewEvents) error = %v, want validation error", err)
 	}
+}
+
+func TestEnsureLoopMetadataJSONUsesProjectReviewEvents(t *testing.T) {
+	t.Parallel()
+	// Global runner default is COMMENT/COMMENT; the project overrides to APPROVE/REQUEST_CHANGES.
+	projectCfg := config.Config{
+		Roles: config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Behavior: config.ReviewerConfig{
+			ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment},
+		}}},
+		Projects: []config.ProjectRefConfig{{
+			ID: "forgejo-native", Name: "Forgejo", Repo: "owner/forgejo", RepoPath: "/tmp/forgejo",
+			Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{
+				Behavior: &config.PartialReviewerConfig{ReviewEvents: &config.PartialReviewerReviewEventsConfig{
+					Clean:    reviewEventPtr(config.ReviewerReviewEventApprove),
+					Blocking: reviewEventPtr(config.ReviewerReviewEventRequestChanges),
+				}},
+			}},
+		}},
+	}
+	runner := New(Options{
+		ReviewEvents:       config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment},
+		LoopConfig:         config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25},
+		CustomInstructions: &projectCfg,
+	})
+
+	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "forgejo-native", "owner/forgejo", 7)
+	if err != nil {
+		t.Fatalf("ensureLoopMetadataJSON() error = %v", err)
+	}
+	meta := parseJSONObject(&metadataJSON)
+	reviewEvents, _ := meta["reviewEvents"].(map[string]any)
+	if reviewEvents["clean"] != string(config.ReviewerReviewEventApprove) || reviewEvents["blocking"] != string(config.ReviewerReviewEventRequestChanges) {
+		t.Fatalf("reviewEvents = %#v, want project-level APPROVE/REQUEST_CHANGES", reviewEvents)
+	}
+	// effectiveReviewEvents without snapshotted metadata must also resolve project overrides
+	// so the trusted proxy policy is not stuck on the global COMMENT default.
+	effective := runner.effectiveReviewEvents("forgejo-native", nil)
+	if effective.Clean != config.ReviewerReviewEventApprove || effective.Blocking != config.ReviewerReviewEventRequestChanges {
+		t.Fatalf("effectiveReviewEvents() = %#v, want project-level APPROVE/REQUEST_CHANGES", effective)
+	}
+	// Other projects fall back to the runner/global COMMENT default.
+	global := runner.effectiveReviewEvents("missing", nil)
+	if global.Clean != config.ReviewerReviewEventComment || global.Blocking != config.ReviewerReviewEventComment {
+		t.Fatalf("effectiveReviewEvents(missing) = %#v, want global COMMENT defaults", global)
+	}
+}
+
+func reviewEventPtr(event config.ReviewerReviewEvent) *config.ReviewerReviewEvent {
+	return &event
 }
 
 func TestEnsureLoopForPullRequestBackfillsLegacyFollowUpdatesDisabled(t *testing.T) {
@@ -6750,7 +6799,7 @@ func TestProcessClaimedItemTerminatesMissingPullRequestDuringPublishResume(t *te
 	queueID := "queue_publish_pr_not_found"
 	nowISO := fixture.nowISO()
 	worktreePath := filepath.Join(t.TempDir(), "reviewer-worktree")
-	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, repo, prNumber)
+	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "project_1", repo, prNumber)
 	if err != nil {
 		t.Fatalf("ensureLoopMetadataJSON() error = %v", err)
 	}
@@ -7187,6 +7236,64 @@ func TestDiscoverPullRequestsUsesReviewRequestedQueryWhenReviewRequestRequired(t
 	}
 	if len(result.QueueItems) != 1 || result.QueueItems[0].PRNumber == nil || *result.QueueItems[0].PRNumber != 77 {
 		t.Fatalf("queue items = %#v, want PR 77 queued", result.QueueItems)
+	}
+}
+
+func TestListOpenPullRequestsForDiscoveryCombinesForgejoLabelsAndReviewRequests(t *testing.T) {
+	t.Parallel()
+	github := &fakeGitHubGateway{
+		currentLogin: "reviewer",
+		listOpenByLabel: map[string][]PullRequestSummary{
+			"needs-review": {
+				{Number: 42, State: "OPEN", Labels: []string{"needs-review"}},
+				{Number: 43, State: "OPEN", Labels: []string{"needs-review"}},
+			},
+		},
+		reviewRequestedPullRequests: []PullRequestSummary{
+			{Number: 43, State: "OPEN", ReviewRequests: []string{"reviewer"}},
+			{Number: 44, State: "OPEN", ReviewRequests: []string{"reviewer"}},
+		},
+	}
+	runner := New(Options{GitHub: github})
+	policy := DiscoveryPolicy{RequireReviewRequest: true, Labels: []string{"needs-review"}, LabelMode: config.LabelModeAll, MatchAnyTrigger: true}
+
+	pulls, err := runner.listOpenPullRequestsForDiscoveryWithPolicy(context.Background(), "acme/looper", "/tmp/repo", 30, policy, "reviewer")
+	if err != nil {
+		t.Fatalf("listOpenPullRequestsForDiscoveryWithPolicy() error = %v", err)
+	}
+	// Requested reviews are reserved first so label pages cannot starve them.
+	if len(pulls) != 3 || pulls[0].Number != 43 || pulls[1].Number != 44 || pulls[2].Number != 42 {
+		t.Fatalf("pulls = %#v, want requested-first union [43, 44, 42]", pulls)
+	}
+	if len(github.listCalls) != 1 || len(github.listReviewRequestedCalls) != 1 {
+		t.Fatalf("label calls = %#v, review-request calls = %#v, want one of each", github.listCalls, github.listReviewRequestedCalls)
+	}
+}
+
+func TestListOpenPullRequestsForDiscoveryDoesNotStarveRequestedReviewsWhenLabelsFillLimit(t *testing.T) {
+	t.Parallel()
+	github := &fakeGitHubGateway{
+		currentLogin: "reviewer",
+		listOpenByLabel: map[string][]PullRequestSummary{
+			"needs-review": {
+				{Number: 1, State: "OPEN", Labels: []string{"needs-review"}},
+				{Number: 2, State: "OPEN", Labels: []string{"needs-review"}},
+				{Number: 3, State: "OPEN", Labels: []string{"needs-review"}},
+			},
+		},
+		reviewRequestedPullRequests: []PullRequestSummary{
+			{Number: 99, State: "OPEN", ReviewRequests: []string{"reviewer"}},
+		},
+	}
+	runner := New(Options{GitHub: github})
+	policy := DiscoveryPolicy{RequireReviewRequest: true, Labels: []string{"needs-review"}, LabelMode: config.LabelModeAll, MatchAnyTrigger: true}
+
+	pulls, err := runner.listOpenPullRequestsForDiscoveryWithPolicy(context.Background(), "acme/looper", "/tmp/repo", 2, policy, "reviewer")
+	if err != nil {
+		t.Fatalf("listOpenPullRequestsForDiscoveryWithPolicy() error = %v", err)
+	}
+	if len(pulls) != 2 || pulls[0].Number != 99 || pulls[1].Number != 1 {
+		t.Fatalf("pulls = %#v, want requested PR 99 reserved before label filler", pulls)
 	}
 }
 
@@ -8844,6 +8951,7 @@ func TestProcessClaimedItemForgejoProjectInfersCommentOnlyForCleanNoop(t *testin
 	cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
 	cfg.Roles.Reviewer.Behavior.ReviewEvents.Blocking = config.ReviewerReviewEventComment
+	cfg.Roles.Reviewer.Behavior.PublishMode = config.ReviewerPublishModeSummaryComment
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig(), ReviewEvents: cfg.Roles.Reviewer.Behavior.ReviewEvents})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
@@ -8889,6 +8997,7 @@ func TestProcessClaimedItemCommentOnlyApprovePolicyPublishesCleanNoopWithoutMark
 	cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = false
 	cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventApprove
+	cfg.Roles.Reviewer.Behavior.PublishMode = config.ReviewerPublishModeSummaryComment
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig(), ReviewEvents: cfg.Roles.Reviewer.Behavior.ReviewEvents})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
@@ -9091,6 +9200,44 @@ func TestBuildReviewerSummaryFromCompletionRejectsSupersededUpdatedReviewItemID(
 	_, err := buildReviewerSummaryFromCompletion(existing, completion)
 	if err == nil || !strings.Contains(err.Error(), `supersedes updated review_item_id "R-001"`) {
 		t.Fatalf("buildReviewerSummaryFromCompletion() error = %v, want updated supersedes failure", err)
+	}
+}
+
+func TestProcessClaimedItemCommentOnlySkipsWhenReviewRequestRemovedBeforePublish(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		labels:                          []string{"looper:review"},
+		reviewRequests:                  []string{"reviewer"},
+		currentLogin:                    "reviewer",
+		removeReviewRequestOnSecondView: true,
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Blocking issue remains", Stdout: `__LOOPER_RESULT__={"summary":"Blocking issue remains","outcome":"blocking","findings":[{"title":"Blocking issue remains","body":"Must not publish summary when request was removed.","files":["internal/reviewer/runner.go"]}]}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" || !contains(result.Summary, "not requested for review") {
+		t.Fatalf("result = %#v, want skipped not requested", result)
+	}
+	if len(github.issueCommentCalls) != 0 {
+		t.Fatalf("issueCommentCalls = %#v, want no summary_comment publish after request removal", github.issueCommentCalls)
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), *claim.LoopID)
+	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop metadata", updatedLoop, err)
+	}
+	if contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
+		t.Fatalf("loop metadata = %s, want no comment-only publish progress", *updatedLoop.MetadataJSON)
 	}
 }
 

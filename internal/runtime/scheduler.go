@@ -182,6 +182,64 @@ type plannerGitHubAdapter struct {
 	config  *config.Config
 }
 
+// providerTrustedEnv collects configured provider tokenEnv values from the
+// daemon process environment so the trusted looper shim can inject them into
+// real `looper` child processes without exposing secrets to agent envs.
+func providerTrustedEnv(cfg config.Config) map[string]string {
+	env := map[string]string{}
+	for _, provider := range cfg.Providers {
+		if provider.TokenEnv == nil {
+			continue
+		}
+		key := strings.TrimSpace(*provider.TokenEnv)
+		if key == "" {
+			continue
+		}
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			env[key] = value
+		}
+	}
+	if len(env) == 0 {
+		return nil
+	}
+	return env
+}
+
+// resolveTrustedLooperCLIPath returns the agent-facing looper CLI path.
+// Agents always receive the real configured looper path — never a secret-bearing
+// wrapper path. Provider tokens for `looper review submit` are supplied through
+// a per-run daemon-side trusted review proxy socket bound to the selected PR.
+func resolveTrustedLooperCLIPath(cfg config.Config) string {
+	return strings.TrimSpace(derefString(cfg.Tools.LooperPath))
+}
+
+// mintTrustedReviewProxyForPR starts a daemon-side Unix socket that runs
+// `looper review submit` with optional provider tokens, bound exclusively to
+// allowedPRRef (owner/repo#N), allowedCwd (daemon-selected worktree), configPath
+// (daemon-loaded config file for LOOPER_CONFIG injection), and the
+// daemon-selected review-events policy. Agents only receive the socket path
+// (not tokens). trustedEnv may be empty for tea-backed Forgejo providers: the
+// proxy still binds PR/CWD/policy/config so the agent cannot retarget submit.
+// cleanup stops the listener and must run when the agent execution ends.
+func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd, configPath string, policy forge.TrustedReviewProxyPolicy, logger bootstrap.Logger) (sockPath string, cleanup func()) {
+	noop := func() {}
+	realLooper = strings.TrimSpace(realLooper)
+	allowedPRRef = strings.TrimSpace(allowedPRRef)
+	allowedCwd = strings.TrimSpace(allowedCwd)
+	configPath = strings.TrimSpace(configPath)
+	if realLooper == "" || allowedPRRef == "" || allowedCwd == "" {
+		return "", noop
+	}
+	path, stop, err := forge.StartTrustedReviewProxy(realLooper, trustedEnv, allowedPRRef, allowedCwd, configPath, policy)
+	if err != nil {
+		if logger != nil {
+			logger.Warn("trusted review proxy install failed; Forgejo review submit may lack provider tokens in agent runs", map[string]any{"error": err.Error(), "allowedPR": allowedPRRef})
+		}
+		return "", noop
+	}
+	return path, stop
+}
+
 func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient, bool, error) {
 	provider, ok, err := forgejoProviderForRepo(cfg, repo)
 	if !ok || err != nil {
@@ -194,47 +252,10 @@ func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient
 	return client, true, nil
 }
 
-func forgejoClientForCWD(cfg *config.Config, cwd string) (*forge.ForgejoClient, bool, error) {
-	project, provider, ok, err := forgejoProjectProviderForCWD(cfg, cwd)
-	if !ok || err != nil {
-		return nil, ok, err
-	}
-	client, err := forge.NewForgejoClientFromConfig(provider, strings.TrimSpace(project.Repo))
-	if err != nil {
-		return nil, true, err
-	}
-	return client, true, nil
-}
-
-func forgejoProviderForRepo(cfg *config.Config, repo string) (config.ProviderConfig, bool, error) {
-	if cfg == nil {
-		return config.ProviderConfig{}, false, nil
-	}
-	repo = strings.TrimSpace(repo)
-	var matched *config.ProjectRefConfig
-	for _, project := range cfg.Projects {
-		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
-			continue
-		}
-		if matched != nil {
-			return config.ProviderConfig{}, false, fmt.Errorf("repository %s is bound to multiple projects; project path or id is required", repo)
-		}
-		projectCopy := project
-		matched = &projectCopy
-	}
-	if matched != nil {
-		if config.ResolvedProjectProviderKind(*cfg, *matched) != config.ProviderKindForgejo {
-			return config.ProviderConfig{}, false, nil
-		}
-		provider, ok := forgejoProviderByID(*cfg, matched.Provider)
-		if !ok {
-			return config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for repo %s", matched.Provider, repo)
-		}
-		return provider, true, nil
-	}
-	return config.ProviderConfig{}, false, nil
-}
-
+// forgejoReviewerDiscoveryLabelsForRepo returns configured reviewer trigger
+// labels for a Forgejo project. Used as a discovery fallback when native
+// requested_reviewers alone is insufficient (label-triggered discovery or
+// instances without requested_reviewers support).
 func forgejoReviewerDiscoveryLabelsForRepo(cfg *config.Config, repo, cwd string) []string {
 	if cfg == nil {
 		return nil
@@ -277,6 +298,119 @@ func forgejoReviewerDiscoveryLabelsForProject(cfg config.Config, project config.
 		}
 	}
 	return result
+}
+
+// addForgejoPullRequestReviewers requests native reviewers and, when the project
+// is label-triggered, also applies discovery trigger labels so reviewer
+// auto-discovery still matches. If native request fails but labels are
+// configured, labels alone keep compatibility instances working.
+// When native request succeeds on a native-request-triggered project
+// (requireReviewRequest=true), label application is best-effort because
+// requested_reviewers already makes the PR discoverable. Label failure remains
+// fatal for label-triggered projects (requireReviewRequest=false with trigger
+// labels): discovery still filters by labels, so a missing label would leave
+// the handoff permanently undiscoverable if publish marked it done.
+func addForgejoPullRequestReviewers(ctx context.Context, client *forge.ForgejoClient, cfg *config.Config, repo string, prNumber int64, reviewers []string, cwd string) error {
+	labels := forgejoReviewerDiscoveryLabelsForRepo(cfg, repo, cwd)
+	nativeErr := client.AddPullRequestReviewers(ctx, prNumber, reviewers)
+	if nativeErr != nil && len(labels) == 0 {
+		return nativeErr
+	}
+	if len(labels) > 0 {
+		if _, err := client.AddIssueLabels(ctx, prNumber, labels); err != nil {
+			if nativeErr != nil {
+				return fmt.Errorf("forgejo native review request failed (%v); label fallback also failed: %w", nativeErr, err)
+			}
+			// Native request already succeeded. Only native-request-triggered
+			// discovery can treat labels as best-effort; label-triggered
+			// projects must keep the handoff retryable until labels land.
+			if forgejoReviewerRequireReviewRequestForRepo(cfg, repo, cwd) {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// forgejoReviewerRequireReviewRequestForRepo reports whether reviewer discovery
+// for the matched Forgejo project requires a native review request. Defaults to
+// true when no unique project match exists (labels are also empty in that case).
+func forgejoReviewerRequireReviewRequestForRepo(cfg *config.Config, repo, cwd string) bool {
+	if cfg == nil {
+		return true
+	}
+	repo = strings.TrimSpace(repo)
+	if strings.TrimSpace(cwd) != "" {
+		for _, project := range cfg.Projects {
+			if cwdBelongsToProject(project, cwd) {
+				return forgejoReviewerRequireReviewRequestForProject(*cfg, project)
+			}
+		}
+	}
+	var matched *config.ProjectRefConfig
+	for _, project := range cfg.Projects {
+		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
+			continue
+		}
+		if matched != nil {
+			return true
+		}
+		projectCopy := project
+		matched = &projectCopy
+	}
+	if matched != nil {
+		return forgejoReviewerRequireReviewRequestForProject(*cfg, *matched)
+	}
+	return true
+}
+
+func forgejoReviewerRequireReviewRequestForProject(cfg config.Config, project config.ProjectRefConfig) bool {
+	if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
+		return true
+	}
+	return config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.RequireReviewRequest
+}
+
+func forgejoClientForCWD(cfg *config.Config, cwd string) (*forge.ForgejoClient, bool, error) {
+	project, provider, ok, err := forgejoProjectProviderForCWD(cfg, cwd)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+	client, err := forge.NewForgejoClientFromConfig(provider, strings.TrimSpace(project.Repo))
+	if err != nil {
+		return nil, true, err
+	}
+	return client, true, nil
+}
+
+func forgejoProviderForRepo(cfg *config.Config, repo string) (config.ProviderConfig, bool, error) {
+	if cfg == nil {
+		return config.ProviderConfig{}, false, nil
+	}
+	repo = strings.TrimSpace(repo)
+	var matched *config.ProjectRefConfig
+	for _, project := range cfg.Projects {
+		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
+			continue
+		}
+		if matched != nil {
+			return config.ProviderConfig{}, false, fmt.Errorf("repository %s is bound to multiple projects; project path or id is required", repo)
+		}
+		projectCopy := project
+		matched = &projectCopy
+	}
+	if matched != nil {
+		if config.ResolvedProjectProviderKind(*cfg, *matched) != config.ProviderKindForgejo {
+			return config.ProviderConfig{}, false, nil
+		}
+		provider, ok := forgejoProviderByID(*cfg, matched.Provider)
+		if !ok {
+			return config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for repo %s", matched.Provider, repo)
+		}
+		return provider, true, nil
+	}
+	return config.ProviderConfig{}, false, nil
 }
 
 func forgejoProjectProviderForCWD(cfg *config.Config, cwd string) (config.ProjectRefConfig, config.ProviderConfig, bool, error) {
@@ -460,6 +594,67 @@ func forgeLabelNames(labels []forge.Label) []string {
 		}
 	}
 	return names
+}
+
+func forgeReviewContext(ctx context.Context, client *forge.ForgejoClient, pr forge.PullRequest, compatibilityFallback bool) ([]string, []networkpolicy.GitHubUser, []map[string]any, string, error) {
+	requested := pr.Reviewers
+	reviews, err := client.ListPullRequestReviews(ctx, pr.Number)
+	if err != nil {
+		var capabilityErr *forge.UnsupportedCapabilityError
+		if !compatibilityFallback || !errors.As(err, &capabilityErr) {
+			return nil, nil, nil, "", err
+		}
+	}
+	objects := make([]map[string]any, 0, len(reviews))
+	latestStates := map[string]string{}
+	for _, review := range reviews {
+		objects = append(objects, map[string]any{
+			"id":     review.ID,
+			"author": map[string]any{"login": review.User.Login},
+			"body":   review.Body,
+			"state":  review.State,
+			"commit": map[string]any{"oid": review.CommitID},
+			"url":    review.HTMLURL,
+		})
+		if login := strings.ToLower(strings.TrimSpace(review.User.Login)); login != "" {
+			latestStates[login] = review.State
+		}
+	}
+	decision := ""
+	for _, state := range latestStates {
+		if state == "CHANGES_REQUESTED" {
+			decision = "CHANGES_REQUESTED"
+			break
+		}
+		if state == "APPROVED" {
+			decision = "APPROVED"
+		}
+	}
+	return forgeIdentityLogins(requested), forgeNetworkPolicyUsers(requested), objects, decision, nil
+}
+
+func forgejoSummaryCommentMode(cfg *config.Config, repo, cwd string) bool {
+	if cfg == nil {
+		return false
+	}
+	project, matched, err := projectForCWD(*cfg, cwd)
+	if err != nil {
+		return false
+	}
+	if !matched {
+		repo = strings.TrimSpace(repo)
+		for _, candidate := range cfg.Projects {
+			if strings.EqualFold(strings.TrimSpace(candidate.Repo), repo) {
+				project = candidate
+				matched = true
+				break
+			}
+		}
+	}
+	if !matched || config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
+		return false
+	}
+	return config.ProjectRoleConfigs(*cfg, project.ID).Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment
 }
 
 func appendLabels(label string, labels []string) []string {
@@ -741,11 +936,11 @@ func (a plannerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input pl
 }
 
 func (a plannerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input planner.PullRequestReviewersInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
-		return nil
+		return addForgejoPullRequestReviewers(ctx, client, a.config, input.Repo, input.PRNumber, input.Reviewers, input.CWD)
 	}
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")
@@ -832,7 +1027,11 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 		}
 		result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
 		for _, pr := range pullRequests {
-			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login})
+			requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD))
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
 		}
 		return result, nil
 	}
@@ -851,11 +1050,23 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 }
 
 func (a reviewerGitHubAdapter) ListReviewRequestedPullRequests(ctx context.Context, input reviewer.ListReviewRequestedPullRequestsInput) ([]reviewer.PullRequestSummary, error) {
-	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("forgejo reviewer does not support review-request discovery")
+		pullRequests, err := client.ListReviewRequestedPullRequests(ctx, input.Reviewer, input.Limit)
+		if err != nil {
+			return nil, err
+		}
+		result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
+		for _, pr := range pullRequests {
+			requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD))
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
+		}
+		return result, nil
 	}
 	if a.gateway == nil {
 		return nil, fmt.Errorf("github gateway is not configured")
@@ -902,7 +1113,11 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
-		return reviewer.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, Diff: diff, IssueComments: forgeCommentsToObjects(comments)}, nil
+		requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD))
+		if err != nil {
+			return reviewer.PullRequestDetail{}, err
+		}
+		return reviewer.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Diff: diff, IssueComments: forgeCommentsToObjects(comments), Reviews: reviews}, nil
 	}
 	if a.gateway == nil {
 		return reviewer.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
@@ -915,6 +1130,19 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 }
 
 func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return githubinfra.IssueDetail{}, err
+		}
+		issue, err := client.ViewIssue(ctx, input.IssueNumber)
+		if err != nil {
+			return githubinfra.IssueDetail{}, err
+		}
+		return githubinfra.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, Labels: forgeLabelNames(issue.Labels), Assignees: forgeIdentityLogins(issue.Assignees), Author: issue.User.Login}, nil
+	}
+	if a.gateway == nil {
+		return githubinfra.IssueDetail{}, fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.ViewIssue(ctx, input)
 }
 
@@ -984,11 +1212,18 @@ func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input revie
 		if err != nil {
 			return reviewer.ReviewMarkerResult{}, err
 		}
-		comments, err := client.ListIssueComments(ctx, input.PRNumber)
+		if forgejoSummaryCommentMode(a.config, input.Repo, input.CWD) {
+			comments, err := client.ListIssueComments(ctx, input.PRNumber)
+			if err != nil {
+				return reviewer.ReviewMarkerResult{}, err
+			}
+			return findForgejoReviewMarker(comments, input), nil
+		}
+		reviews, err := client.ListPullRequestReviews(ctx, input.PRNumber)
 		if err != nil {
 			return reviewer.ReviewMarkerResult{}, err
 		}
-		return findForgejoReviewMarker(comments, input), nil
+		return findForgejoNativeReviewMarker(reviews, input), nil
 	}
 	if a.gateway == nil {
 		return reviewer.ReviewMarkerResult{}, fmt.Errorf("github gateway is not configured")
@@ -1028,6 +1263,90 @@ func findForgejoReviewMarker(comments []forge.Comment, input reviewer.VerifyRevi
 		newest = reviewer.ReviewMarkerResult{Found: true, Outcome: parsedMarker.Outcome, Event: reviewer.ReviewEventComment, AuthorLogin: author, Body: comment.Body}
 	}
 	return newest
+}
+
+func findForgejoNativeReviewMarker(reviews []forge.PullRequestReview, input reviewer.VerifyReviewMarkerInput) reviewer.ReviewMarkerResult {
+	expectedAuthor := strings.ToLower(strings.TrimSpace(input.AuthorLogin))
+	var newest reviewer.ReviewMarkerResult
+	for _, review := range reviews {
+		marker, ok := findRuntimeReviewIdempotencyMarker(review.Body, input.Marker)
+		if !ok {
+			continue
+		}
+		author := strings.TrimSpace(review.User.Login)
+		if expectedAuthor != "" && strings.ToLower(author) != expectedAuthor {
+			continue
+		}
+		event := forgejoReviewEventFromState(review.State)
+		if !forgejoNativeReviewMarkerEventAllowed(marker.Outcome, event, input.AllowedReviewEvents, input.AllowCleanComment) {
+			continue
+		}
+		inlineBodies := make([]string, 0, len(review.Comments))
+		for _, comment := range review.Comments {
+			inlineBodies = append(inlineBodies, comment.Body)
+		}
+		newest = reviewer.ReviewMarkerResult{Found: true, Outcome: marker.Outcome, Event: event, AuthorLogin: author, Body: review.Body, InlineCommentBodies: inlineBodies}
+	}
+	return newest
+}
+
+// forgejoReviewEventFromState maps Forgejo review states onto Looper review events.
+// States are expected after forge.normalizeForgejoReviewState (APPROVED/COMMENTED/CHANGES_REQUESTED).
+func forgejoReviewEventFromState(state string) reviewer.ReviewEvent {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "APPROVED":
+		return reviewer.ReviewEventApprove
+	case "CHANGES_REQUESTED", "REQUEST_CHANGES":
+		return reviewer.ReviewEventRequestChanges
+	case "COMMENTED", "COMMENT":
+		return reviewer.ReviewEventComment
+	default:
+		return ""
+	}
+}
+
+// forgejoNativeReviewMarkerEventAllowed mirrors github.reviewMarkerEventAllowedForOutcome so
+// outcome=clean requires APPROVE when that event is allowed, outcome=blocking requires
+// REQUEST_CHANGES when allowed, and COMMENT only matches non-blocking/actionable (or the
+// explicit clean-comment self-approval fallback).
+func forgejoNativeReviewMarkerEventAllowed(outcome string, event reviewer.ReviewEvent, allowed []reviewer.ReviewEvent, allowCleanComment bool) bool {
+	if event == "" {
+		return false
+	}
+	if len(allowed) == 0 {
+		return true
+	}
+	if !forgejoReviewEventAllowed(event, allowed) {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "clean":
+		if allowCleanComment && event == reviewer.ReviewEventComment {
+			return true
+		}
+		if forgejoReviewEventAllowed(reviewer.ReviewEventApprove, allowed) {
+			return event == reviewer.ReviewEventApprove
+		}
+		return event == reviewer.ReviewEventComment
+	case "blocking":
+		if forgejoReviewEventAllowed(reviewer.ReviewEventRequestChanges, allowed) {
+			return event == reviewer.ReviewEventRequestChanges
+		}
+		return event == reviewer.ReviewEventComment
+	case "non_blocking", "actionable":
+		return event == reviewer.ReviewEventComment
+	default:
+		return false
+	}
+}
+
+func forgejoReviewEventAllowed(event reviewer.ReviewEvent, allowed []reviewer.ReviewEvent) bool {
+	for _, candidate := range allowed {
+		if candidate == event {
+			return true
+		}
+	}
+	return false
 }
 
 type runtimeReviewIdempotencyMarker struct {
@@ -1190,22 +1509,56 @@ func (a reviewerGitHubAdapter) UpdateIssueComment(ctx context.Context, input rev
 }
 
 func (a reviewerGitHubAdapter) SubmitReview(ctx context.Context, input githubinfra.SubmitReviewInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		comments := make([]forge.PullRequestReviewCommentInput, 0, len(input.Comments))
+		for _, comment := range input.Comments {
+			comments = append(comments, forge.PullRequestReviewCommentInput{Body: a.stamper.ReviewComment(comment.Body, "reviewer"), Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
+		}
+		body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelReviewComment)
+		_, err = client.CreatePullRequestReview(ctx, forge.CreatePullRequestReviewInput{Number: input.PRNumber, Body: body, Event: input.Event, CommitID: input.CommitID, Comments: comments})
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.SubmitReview(ctx, input)
 }
 
 func (a reviewerGitHubAdapter) EnableAutoMerge(ctx context.Context, input githubinfra.EnableAutoMergeInput) error {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("forgejo provider capability autoMerge is unsupported")
+	}
 	return a.gateway.EnableAutoMerge(ctx, input)
 }
 
 func (a reviewerGitHubAdapter) AddPullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		return err
+	}
 	return a.gateway.AddPullRequestReaction(ctx, githubinfra.PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: input.Content, CWD: input.CWD})
 }
 
 func (a reviewerGitHubAdapter) RemovePullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		return err
+	}
 	return a.gateway.RemovePullRequestReaction(ctx, githubinfra.PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: input.Content, CWD: input.CWD})
 }
 
 func (a reviewerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input reviewer.PullRequestLabelsInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err = client.AddIssueLabels(ctx, input.PRNumber, input.Labels)
+		return err
+	}
 	return a.gateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
 }
 
@@ -1228,6 +1581,17 @@ func (a reviewerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, inpu
 }
 
 func (a reviewerGitHubAdapter) RemoveIssueLabels(ctx context.Context, input githubinfra.IssueLabelsInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		for _, label := range input.Labels {
+			if err := client.RemoveIssueLabel(ctx, input.IssueNumber, label); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	return a.gateway.RemoveIssueLabels(ctx, input)
 }
 
@@ -1277,8 +1641,34 @@ func (a reviewerGitHubAdapter) ResolveReviewThread(ctx context.Context, input re
 	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
 }
 
-type reviewerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
-type reviewerAgentExecutionAdapter struct{ execution agent.Execution }
+type reviewerAgentExecutorAdapter struct {
+	executor   *agent.ConfiguredExecutor
+	realLooper string
+	trustedEnv map[string]string
+	// configPath is the daemon-loaded config file path injected as LOOPER_CONFIG
+	// into proxy children so review submit matches looperd's --config selection.
+	configPath string
+	logger     bootstrap.Logger
+	// config is used to gate trusted review-submit sockets on per-project
+	// publish mode (summary_comment must not mint a native review socket).
+	config *config.Config
+}
+type reviewerAgentExecutionAdapter struct {
+	execution agent.Execution
+	cleanup   func()
+	once      sync.Once
+}
+
+func (a *reviewerAgentExecutionAdapter) closeProxy() {
+	if a == nil {
+		return
+	}
+	a.once.Do(func() {
+		if a.cleanup != nil {
+			a.cleanup()
+		}
+	})
+}
 
 type reviewerGitAdapter struct{ gateway *gitinfra.Gateway }
 
@@ -1302,15 +1692,161 @@ func (a reviewerGitAdapter) CleanupWorktree(ctx context.Context, input reviewer.
 	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
 }
 
-func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.AgentRunInput) (reviewer.AgentExecution, error) {
-	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
-	if err != nil {
-		return nil, err
+// reviewerTrustedReviewEnv injects the trusted review-submit socket only for
+// reviewer agent runs. Planner/worker/fixer share the executor but must not
+// receive review publication capability via LOOPER_TRUSTED_REVIEW_SOCK.
+func reviewerTrustedReviewEnv(sock string) map[string]string {
+	sock = strings.TrimSpace(sock)
+	if sock == "" {
+		return nil
 	}
-	return reviewerAgentExecutionAdapter{execution: execution}, nil
+	return map[string]string{forge.TrustedReviewSockEnv: sock}
 }
 
-func (a reviewerAgentExecutionAdapter) Wait(ctx context.Context) (reviewer.AgentResult, error) {
+// reviewerAllowsTrustedReviewProxy reports whether this reviewer agent start is
+// authorized to receive a live review-submit socket. Thread-resolution
+// classifiers share the reviewer adapter but must not receive publish capability.
+// Only native Forgejo review/publish runs need the socket: GitHub projects keep
+// the normal review-submit path (agent env credentials such as GH_TOKEN from
+// agent.env), and Forgejo summary_comment mode must not mint a socket because
+// Looper posts one top-level summary comment without native review submit.
+func reviewerAllowsTrustedReviewProxy(cfg *config.Config, projectID string, metadata map[string]any) bool {
+	if metadata == nil {
+		return false
+	}
+	phase, _ := metadata["phase"].(string)
+	switch strings.ToLower(strings.TrimSpace(phase)) {
+	case "review", "publish":
+		// continue
+	default:
+		return false
+	}
+	return reviewerNativeForgejoNeedsTrustedProxy(cfg, projectID)
+}
+
+// reviewerNativeForgejoNeedsTrustedProxy reports whether the selected project is
+// a Forgejo project that publishes native reviews (not summary_comment). Only
+// those runs should receive LOOPER_TRUSTED_REVIEW_SOCK.
+func reviewerNativeForgejoNeedsTrustedProxy(cfg *config.Config, projectID string) bool {
+	if cfg == nil {
+		return false
+	}
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return false
+	}
+	for _, project := range cfg.Projects {
+		if strings.TrimSpace(project.ID) != projectID {
+			continue
+		}
+		if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
+			return false
+		}
+		return config.ProjectRoleConfigs(*cfg, project.ID).Reviewer.Behavior.PublishMode != config.ReviewerPublishModeSummaryComment
+	}
+	return false
+}
+
+// reviewerAllowedPRRef extracts the daemon-selected owner/repo#N from reviewer
+// agent metadata so the trusted review proxy can be bound to that PR only.
+func reviewerAllowedPRRef(metadata map[string]any) string {
+	if metadata == nil {
+		return ""
+	}
+	repo, _ := metadata["repo"].(string)
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return ""
+	}
+	prNumber, ok := metadataInt64(metadata["prNumber"])
+	if !ok || prNumber <= 0 {
+		return ""
+	}
+	return forge.FormatTrustedReviewPRRef(repo, prNumber)
+}
+
+// reviewerAllowedReviewPolicy extracts the daemon-selected clean/blocking
+// review-events policy from reviewer agent metadata so the trusted proxy can
+// inject those flags outside agent control.
+func reviewerAllowedReviewPolicy(metadata map[string]any) forge.TrustedReviewProxyPolicy {
+	if metadata == nil {
+		return forge.TrustedReviewProxyPolicy{}
+	}
+	clean, _ := metadata["cleanReviewEvent"].(string)
+	blocking, _ := metadata["blockingReviewEvent"].(string)
+	return forge.TrustedReviewProxyPolicy{
+		Clean:    strings.TrimSpace(clean),
+		Blocking: strings.TrimSpace(blocking),
+	}
+}
+
+func metadataInt64(value any) (int64, bool) {
+	switch n := value.(type) {
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case float64:
+		if n != float64(int64(n)) {
+			return 0, false
+		}
+		return int64(n), true
+	case float32:
+		if n != float32(int64(n)) {
+			return 0, false
+		}
+		return int64(n), true
+	case json.Number:
+		parsed, err := n.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
+}
+
+func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.AgentRunInput) (reviewer.AgentExecution, error) {
+	// Mint a per-run proxy only for review/publish phases on projects that
+	// publish native reviews, bound to the daemon-selected PR, worktree CWD,
+	// and review-events policy. Thread-resolution classifiers and summary_comment
+	// (comment-only) runs reuse this adapter but must not receive review-publish
+	// capability via LOOPER_TRUSTED_REVIEW_SOCK.
+	allowedPR := ""
+	allowedCwd := ""
+	policy := forge.TrustedReviewProxyPolicy{}
+	if reviewerAllowsTrustedReviewProxy(a.config, input.ProjectID, input.Metadata) {
+		allowedPR = reviewerAllowedPRRef(input.Metadata)
+		allowedCwd = strings.TrimSpace(input.WorkingDirectory)
+		policy = reviewerAllowedReviewPolicy(input.Metadata)
+	}
+	sock, proxyCleanup := mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, a.configPath, policy, a.logger)
+	execution, err := a.executor.Start(ctx, agent.RunInput{
+		ExecutionID:        input.ExecutionID,
+		ProjectID:          input.ProjectID,
+		LoopID:             input.LoopID,
+		RunID:              input.RunID,
+		Prompt:             input.Prompt,
+		NativeResumePrompt: input.NativeResumePrompt,
+		WorkingDirectory:   input.WorkingDirectory,
+		Timeout:            input.Timeout,
+		HeartbeatTimeout:   input.HeartbeatTimeout,
+		Metadata:           input.Metadata,
+		IdempotencyKey:     input.IdempotencyKey,
+		Env:                reviewerTrustedReviewEnv(sock),
+	})
+	if err != nil {
+		proxyCleanup()
+		return nil, err
+	}
+	return &reviewerAgentExecutionAdapter{execution: execution, cleanup: proxyCleanup}, nil
+}
+
+func (a *reviewerAgentExecutionAdapter) Wait(ctx context.Context) (reviewer.AgentResult, error) {
+	defer a.closeProxy()
 	result, err := a.execution.Wait(ctx)
 	if err != nil {
 		return reviewer.AgentResult{}, err
@@ -1318,7 +1854,8 @@ func (a reviewerAgentExecutionAdapter) Wait(ctx context.Context) (reviewer.Agent
 	return reviewer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
 }
 
-func (a reviewerAgentExecutionAdapter) Kill(reason string) error {
+func (a *reviewerAgentExecutionAdapter) Kill(reason string) error {
+	defer a.closeProxy()
 	return a.execution.Kill(reason)
 }
 
@@ -2123,13 +2660,7 @@ func (a workerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input 
 		if err != nil {
 			return err
 		}
-		labels := forgejoReviewerDiscoveryLabelsForRepo(a.config, input.Repo, input.CWD)
-		if len(labels) > 0 {
-			if _, err := client.AddIssueLabels(ctx, input.PRNumber, labels); err != nil {
-				return err
-			}
-		}
-		return nil
+		return addForgejoPullRequestReviewers(ctx, client, a.config, input.Repo, input.PRNumber, input.Reviewers, input.CWD)
 	}
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")
@@ -2223,15 +2754,18 @@ func (a workerAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
-func buildCatalogSchedulerHandlers(source projects.ConfigSource, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
+func buildCatalogSchedulerHandlers(source projects.ConfigSource, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
 	if source == nil {
 		fail := func(context.Context, Services) error { return fmt.Errorf("project catalog is not configured") }
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
 	}
 	claimMu := &sync.Mutex{}
-	initial := buildDefaultSchedulerHandlersWithOptions(source.Snapshot(), logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, claimMu, source)
+	// Trusted review proxies are minted per reviewer agent run (bound to that
+	// run's PR). Catalog snapshots only need claim mutex + config source reuse.
+	initial := buildDefaultSchedulerHandlersWithOptions(source.Snapshot(), configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, claimMu, source)
 	buildSnapshot := func() defaultSchedulerHandlers {
-		return buildDefaultSchedulerHandlersWithOptions(source.Snapshot(), logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil)
+		cfg := source.Snapshot()
+		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil)
 	}
 	handlers := defaultSchedulerHandlers{
 		tick: func(ctx context.Context, services Services) error {
@@ -2246,10 +2780,10 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, logger bootstra
 }
 
 func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
-	return buildDefaultSchedulerHandlersWithOptions(cfg, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, nil, nil)
+	return buildDefaultSchedulerHandlersWithOptions(cfg, "", logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, nil, nil)
 }
 
-func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource) defaultSchedulerHandlers {
+func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
 	}
@@ -2367,6 +2901,10 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstra
 	var fixerRunner fixerScheduler
 	var workerRunner workerScheduler
 
+	looperCLIPath := resolveTrustedLooperCLIPath(cfg)
+	// Keep LOOPER_TRUSTED_REVIEW_SOCK out of the shared agent executor env so
+	// planner/worker/fixer cannot publish reviews. Inject only via the
+	// reviewer adapter, which mints a per-run proxy bound to the selected PR.
 	agentExecutor := agent.New(agent.ExecutorOptions{
 		Config: agent.ExecutorConfig{
 			Vendor:              *cfg.Agent.Vendor,
@@ -2440,11 +2978,18 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstra
 		),
 	})
 	reviewerRunner = reviewer.New(reviewer.Options{
-		DB:               coordinator.DB(),
-		Repos:            repos,
-		GitHub:           reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
-		Git:              reviewerGitAdapter{gateway: gitGateway},
-		AgentExecutor:    reviewerAgentExecutorAdapter{executor: agentExecutor},
+		DB:     coordinator.DB(),
+		Repos:  repos,
+		GitHub: reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
+		Git:    reviewerGitAdapter{gateway: gitGateway},
+		AgentExecutor: reviewerAgentExecutorAdapter{
+			executor:   agentExecutor,
+			realLooper: looperCLIPath,
+			trustedEnv: providerTrustedEnv(cfg),
+			configPath: strings.TrimSpace(configPath),
+			logger:     logger,
+			config:     &cfg,
+		},
 		Logger:           logger,
 		Now:              now,
 		AllowAutoApprove: cfg.Defaults.AllowAutoApprove,
@@ -2467,7 +3012,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, logger bootstra
 		Disclosure:              &cfg.Disclosure,
 		AgentRuntime:            agentRuntime,
 		CustomInstructions:      &cfg,
-		LooperCLIPath:           derefString(cfg.Tools.LooperPath),
+		LooperCLIPath:           looperCLIPath,
 		AgentModel:              cfg.Agent.Model,
 		AgentTimeout:            time.Duration(cfg.Agent.Timeouts.ReviewerMaxRuntimeSeconds) * time.Second,
 		AgentIdleTimeout:        time.Duration(cfg.Agent.Timeouts.ReviewerIdleTimeoutSeconds) * time.Second,

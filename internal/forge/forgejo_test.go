@@ -9,6 +9,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -194,8 +197,8 @@ func TestForgejoClientContract(t *testing.T) {
 	if got := client.Repository().BaseURL; got != server.URL+"/forge" {
 		t.Fatalf("Repository().BaseURL = %q, want %q", got, server.URL+"/forge")
 	}
-	if got := client.Capabilities().ReviewPublish; got != ReviewPublishCommentOnly {
-		t.Fatalf("Capabilities().ReviewPublish = %q, want %q", got, ReviewPublishCommentOnly)
+	if got := client.Capabilities().ReviewPublish; got != ReviewPublishNative {
+		t.Fatalf("Capabilities().ReviewPublish = %q, want %q", got, ReviewPublishNative)
 	}
 	if len(requests) == 0 || requests[0].Auth != "token super-secret" {
 		t.Fatalf("Authorization header = %#v, want token auth", requests)
@@ -216,6 +219,62 @@ func TestNewForgejoClientFromConfigReadsTokenEnv(t *testing.T) {
 	}
 	if client.Repository().ProviderID != "fj" || client.Repository().Repo != "acme/looper" {
 		t.Fatalf("Repository() = %#v", client.Repository())
+	}
+}
+
+func TestNewForgejoClientFromConfigReadsTrustedEnvFile(t *testing.T) {
+	// Clear ambient token so only the trusted file can supply auth.
+	t.Setenv("FORGEJO_TOKEN", "")
+	path, err := WriteTrustedEnvFile(map[string]string{"FORGEJO_TOKEN": "file-token"})
+	if err != nil {
+		t.Fatalf("WriteTrustedEnvFile() error = %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	t.Setenv(TrustedEnvFileEnv, path)
+
+	client, err := NewForgejoClientFromConfig(config.ProviderConfig{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}, "acme/looper")
+	if err != nil {
+		t.Fatalf("NewForgejoClientFromConfig() error = %v", err)
+	}
+	if client.token != "file-token" {
+		t.Fatalf("client.token = %q, want file-token from trusted env file", client.token)
+	}
+}
+
+func TestWriteTrustedLooperWrapperInjectsEnvOnlyIntoChild(t *testing.T) {
+	realLooper := filepath.Join(t.TempDir(), "real-looper")
+	// Print whether LOOPER_TRUSTED_ENV_FILE is set and whether the token is readable.
+	script := "#!/bin/sh\nif [ -n \"$LOOPER_TRUSTED_ENV_FILE\" ]; then printf 'path=%s\\n' \"$LOOPER_TRUSTED_ENV_FILE\"; fi\nif [ -n \"$LOOPER_TRUSTED_ENV_FILE\" ] && [ -f \"$LOOPER_TRUSTED_ENV_FILE\" ]; then grep '^FORGEJO_TOKEN=' \"$LOOPER_TRUSTED_ENV_FILE\"; fi\n"
+	if err := os.WriteFile(realLooper, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(realLooper) error = %v", err)
+	}
+
+	wrapperPath, cleanup, err := WriteTrustedLooperWrapper(realLooper, map[string]string{"FORGEJO_TOKEN": "secret-token"})
+	if err != nil {
+		t.Fatalf("WriteTrustedLooperWrapper() error = %v", err)
+	}
+	t.Cleanup(cleanup)
+	if wrapperPath == "" || wrapperPath == realLooper {
+		t.Fatalf("wrapperPath = %q, want distinct shim path", wrapperPath)
+	}
+
+	// Parent process must not see the trusted env file path.
+	if got := os.Getenv(TrustedEnvFileEnv); got != "" {
+		t.Fatalf("parent %s = %q, want empty", TrustedEnvFileEnv, got)
+	}
+
+	cmd := exec.Command(wrapperPath)
+	// Ensure the child does not inherit a leaked trusted-env path from the test process.
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wrapper exec error = %v, out=%s", err, out)
+	}
+	if !strings.Contains(string(out), "FORGEJO_TOKEN=secret-token") {
+		t.Fatalf("wrapper child output = %q, want trusted token via LOOPER_TRUSTED_ENV_FILE", string(out))
+	}
+	if !strings.Contains(string(out), "path=") {
+		t.Fatalf("wrapper child output = %q, want LOOPER_TRUSTED_ENV_FILE path set for child", string(out))
 	}
 }
 

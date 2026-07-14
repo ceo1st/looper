@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -191,6 +192,32 @@ func TestBuildCommandEnvAllowsOnlySafeInheritedValuesAndExplicitOverrides(t *tes
 	}
 	if got := env[completionMarkerEnv]; got != CompletionMarkerPrefix {
 		t.Fatalf("%s = %q, want %q", completionMarkerEnv, got, CompletionMarkerPrefix)
+	}
+}
+
+func TestBuildCommandEnvStripsTrustedEnvFilePath(t *testing.T) {
+	t.Setenv("PATH", "/safe/bin")
+	t.Setenv(forge.TrustedEnvFileEnv, "/tmp/must-not-leak-to-agent")
+
+	env := envSliceToMap(buildCommandEnv("/tmp/worktree", "hello", map[string]string{
+		forge.TrustedEnvFileEnv: "/tmp/also-must-not-leak",
+	}))
+	if _, ok := env[forge.TrustedEnvFileEnv]; ok {
+		t.Fatalf("%s present in agent env; trusted tokens must use the daemon review proxy, not an agent-readable env file", forge.TrustedEnvFileEnv)
+	}
+}
+
+func TestBuildCommandEnvAllowsTrustedReviewSock(t *testing.T) {
+	t.Setenv("PATH", "/safe/bin")
+	sock := "/tmp/looper-trusted-review.sock"
+	env := envSliceToMap(buildCommandEnv("/tmp/worktree", "hello", map[string]string{
+		forge.TrustedReviewSockEnv: sock,
+	}))
+	if got := env[forge.TrustedReviewSockEnv]; got != sock {
+		t.Fatalf("%s = %q, want capability socket path %q", forge.TrustedReviewSockEnv, got, sock)
+	}
+	if _, ok := env[forge.TrustedEnvFileEnv]; ok {
+		t.Fatalf("%s must not be present alongside the review proxy socket", forge.TrustedEnvFileEnv)
 	}
 }
 
@@ -863,9 +890,11 @@ func TestExecutorHeartbeatUpdatesWhileOutputArrives(t *testing.T) {
 
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "for i in 1 2 3; do printf \"beat$i\\n\"; sleep 0.05; done"}}}, Repos: repos})
+	// Emit several spaced lines so pipe-reader coalescing under parallel CI load
+	// still leaves enough distinct Write chunks for heartbeat progress updates.
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "for i in 1 2 3 4 5 6; do printf \"beat$i\\n\"; sleep 0.15; done"}}}, Repos: repos})
 
-	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_hb", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 2 * time.Second})
+	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_hb", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}

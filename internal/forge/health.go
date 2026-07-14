@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -144,7 +143,7 @@ func probeForgejoProviderTokenEnv(ctx context.Context, provider config.ProviderC
 
 	token := ""
 	if provider.TokenEnv != nil {
-		token = strings.TrimSpace(os.Getenv(strings.TrimSpace(*provider.TokenEnv)))
+		token = LookupProviderToken(*provider.TokenEnv)
 	}
 
 	versionResponse, versionErr := forgejoProbeGET(probeCtx, client, forgejoProbeURL(baseURL, "api/v1/version"), "", maxForgejoResponseBodyBytes)
@@ -463,8 +462,14 @@ func forgejoCapabilityReports(paths map[string]map[string]json.RawMessage) map[s
 		"dependencies":         static.Dependencies,
 	}
 	observed := map[string]ProbeState{
-		"reviewRequests":       forgejoOpenAPISupport(paths, http.MethodPost, "/repos/{owner}/{repo}/pulls/{index}/requested_reviewers"),
-		"nativeReviews":        forgejoOpenAPISupport(paths, http.MethodPost, "/repos/{owner}/{repo}/pulls/{index}/reviews"),
+		"reviewRequests": forgejoOpenAPISupport(paths, http.MethodPost, "/repos/{owner}/{repo}/pulls/{index}/requested_reviewers"),
+		// Native review runs require list (GET) for discovery/marker verification,
+		// create (POST) for publication, and per-review comments (GET) because
+		// ListPullRequestReviews eagerly loads that endpoint for marker checks.
+		"nativeReviews": forgejoOpenAPISupportAnd(
+			forgejoOpenAPISupportAll(paths, "/repos/{owner}/{repo}/pulls/{index}/reviews", http.MethodGet, http.MethodPost),
+			forgejoOpenAPISupport(paths, http.MethodGet, "/repos/{owner}/{repo}/pulls/{index}/reviews/{id}/comments"),
+		),
 		"reviewCommentResolve": forgejoOpenAPISupport(paths, http.MethodPost, "/repos/{owner}/{repo}/pulls/comments/{id}/resolve"),
 		"merge":                forgejoOpenAPISupport(paths, http.MethodPost, "/repos/{owner}/{repo}/pulls/{index}/merge"),
 		"webhooks":             forgejoOpenAPISupport(paths, http.MethodPost, "/repos/{owner}/{repo}/hooks"),
@@ -504,6 +509,47 @@ func forgejoOpenAPISupport(paths map[string]map[string]json.RawMessage, method, 
 		return ProbeStateUnsupported
 	}
 	return ProbeStateSupported
+}
+
+// forgejoOpenAPISupportAll requires every listed method on path to be present.
+// Unknown (missing OpenAPI document) wins over unsupported so callers can
+// distinguish "could not probe" from "probed and missing".
+func forgejoOpenAPISupportAll(paths map[string]map[string]json.RawMessage, path string, methods ...string) ProbeState {
+	if paths == nil {
+		return ProbeStateUnknown
+	}
+	if len(methods) == 0 {
+		return ProbeStateUnsupported
+	}
+	state := ProbeStateSupported
+	for _, method := range methods {
+		next := forgejoOpenAPISupport(paths, method, path)
+		if next == ProbeStateUnknown {
+			return ProbeStateUnknown
+		}
+		if next != ProbeStateSupported {
+			state = ProbeStateUnsupported
+		}
+	}
+	return state
+}
+
+// forgejoOpenAPISupportAnd combines independent OpenAPI path probes. Unknown
+// wins; otherwise every input must be Supported for the result to be Supported.
+func forgejoOpenAPISupportAnd(states ...ProbeState) ProbeState {
+	if len(states) == 0 {
+		return ProbeStateUnsupported
+	}
+	state := ProbeStateSupported
+	for _, next := range states {
+		if next == ProbeStateUnknown {
+			return ProbeStateUnknown
+		}
+		if next != ProbeStateSupported {
+			state = ProbeStateUnsupported
+		}
+	}
+	return state
 }
 
 func probeForgejoProject(ctx context.Context, client *http.Client, baseURL *url.URL, token string, project ForgejoProbeProject, capabilities map[string]CapabilityReport) ForgejoProjectHealth {
@@ -557,7 +603,7 @@ func rebuildForgejoProjectHealth(projects []ForgejoProbeProject, capabilities ma
 func restrictForgejoWriteCapabilities(capabilities map[string]CapabilityReport, state ProbeState, reason string) map[string]CapabilityReport {
 	result := make(map[string]CapabilityReport, len(capabilities))
 	for name, report := range capabilities {
-		if report.Configured == ProbeStateSupported && (name == "reviewCommentResolve" || name == "merge" || name == "webhooks") && report.Effective == ProbeStateSupported {
+		if report.Configured == ProbeStateSupported && (name == "reviewRequests" || name == "nativeReviews" || name == "reviewCommentResolve" || name == "merge" || name == "webhooks") && report.Effective == ProbeStateSupported {
 			report.Effective = state
 			report.Degraded = true
 			report.Reason = reason
