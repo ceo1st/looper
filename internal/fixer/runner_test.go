@@ -7303,7 +7303,7 @@ func TestRunForgejoFixerSummaryStepRefreshesLiveSummaryComment(t *testing.T) {
 		HeadSHA:       "head-sha",
 		HeadRefName:   "reviewer-fixer",
 		BaseRefName:   "main",
-		IssueComments: []map[string]any{{"id": int64(101), "body": reviewerMarker, "url": "https://example.test/comments/101"}},
+		IssueComments: []map[string]any{{"id": int64(101), "body": reviewerMarker, "url": "https://example.test/comments/101", "author": map[string]any{"login": "looper"}}},
 	}
 	liveDetail := PullRequestDetail{
 		Number:      42,
@@ -7312,12 +7312,14 @@ func TestRunForgejoFixerSummaryStepRefreshesLiveSummaryComment(t *testing.T) {
 		HeadRefName: "reviewer-fixer",
 		BaseRefName: "main",
 		IssueComments: []map[string]any{
-			{"id": int64(101), "body": reviewerMarker, "url": "https://example.test/comments/101"},
-			{"id": int64(202), "body": existingFixerBody, "url": "https://example.test/comments/202"},
+			{"id": int64(101), "body": reviewerMarker, "url": "https://example.test/comments/101", "author": map[string]any{"login": "looper"}},
+			{"id": int64(201), "body": existingFixerBody, "url": "https://example.test/comments/201", "author": map[string]any{"login": "mallory"}},
+			{"id": int64(202), "body": existingFixerBody, "url": "https://example.test/comments/202", "author": map[string]any{"login": "looper"}},
 		},
 	}
-	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{liveDetail}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Now: fixture.now, Logger: fixture.logger})
+	github := &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{liveDetail}}
+	cfg := forgejoFixerDiscoveryConfig(t, fixture)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Now: fixture.now, Logger: fixture.logger, CustomInstructions: cfg})
 	checkpoint := fixerCheckpoint{
 		Detail:       staleDetail,
 		FixItemsHash: "fix-items-hash",
@@ -7379,13 +7381,20 @@ func TestRunResolveCommentsStepForgejoSummaryOnlySkipsNativeThreadLogicAndPostsS
 		HeadRefName: "reviewer-fixer",
 		BaseRefName: "main",
 		IssueComments: []map[string]any{{
-			"id":   int64(101),
-			"body": reviewerMarker,
-			"url":  "https://example.test/comments/101",
+			"id":     int64(101),
+			"body":   reviewerMarker,
+			"url":    "https://example.test/comments/101",
+			"author": map[string]any{"login": "looper"},
+		}, {
+			"id":     int64(102),
+			"body":   reviewerMarker,
+			"url":    "https://example.test/comments/102",
+			"author": map[string]any{"login": "mallory"},
 		}},
 	}
-	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{liveDetail, liveDetail}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Now: fixture.now, Logger: fixture.logger})
+	github := &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{liveDetail, liveDetail}}
+	cfg := forgejoFixerDiscoveryConfig(t, fixture)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Now: fixture.now, Logger: fixture.logger, CustomInstructions: cfg})
 	fixItems := []FixItem{{ID: "R-001", Type: "comment", Source: "forgejo-reviewer-summary", ThreadID: "R-001", Summary: "Fix parsing"}}
 
 	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{
@@ -7393,7 +7402,7 @@ func TestRunResolveCommentsStepForgejoSummaryOnlySkipsNativeThreadLogicAndPostsS
 		Repo:     "acme/looper",
 		PRNumber: 42,
 		Checkpoint: fixerCheckpoint{
-			Detail:       &checkpointDetail{HeadSHA: "head-sha", HeadRefName: "reviewer-fixer", BaseRefName: "main", IssueComments: liveDetail.IssueComments},
+			Detail:       &checkpointDetail{HeadSHA: "head-sha", HeadRefName: "reviewer-fixer", BaseRefName: "main", IssueComments: cloneObjectSlice(liveDetail.IssueComments)},
 			FixItems:     fixItems,
 			FixItemsHash: hashFixItems(fixItems),
 			Validation:   &ValidationResult{Passed: true, HeadSHA: "head-sha"},
