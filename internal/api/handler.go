@@ -96,6 +96,10 @@ type Handler struct {
 	now              func() time.Time
 	recoverySummary  func() any
 	webhookForwarder webhookforward.Forwarder
+	// discardBeforeGitHook is test-only: invoked after discard preflight recheck
+	// and immediately before git reset/clean so tests can inject a requeue race
+	// that bypasses LockLoopRequeue (defense-in-depth for the pre-git recheck).
+	discardBeforeGitHook func(loopID string)
 }
 
 func NewHandler(context Context) *Handler {
@@ -133,6 +137,38 @@ func NewHandler(context Context) *Handler {
 		recoverySummary:  recoverySummary,
 		webhookForwarder: forwarder,
 	}
+}
+
+// lockLoopRetry acquires the process-wide per-loop requeue mutex shared by
+// retryLoop, start/requeue (mutateLoopStatus → Running), issue-worker reuse
+// (POST /workers), and runtime HITL free-text / answer requeues
+// (looperdruntime.LockLoopRequeue). Without this shared exclusion, runtime
+// inbox delivery can requeue after discard preflight and before git reset,
+// wiping the worktree for the message-driven continuation when the retry TX
+// then conflicts.
+func (h *Handler) lockLoopRetry(loopID string) func() {
+	return looperdruntime.LockLoopRequeue(loopID)
+}
+
+// lockLoopTarget acquires the process-wide same-target mutex so discard retry,
+// same-target requeue (regular retry / start), active loop creation, and runtime
+// HITL requeues cannot race. Concurrent project-scoped workers are exempt
+// (assertUniqueActiveLoopCompat allows them). Pull-request targets omit loop
+// type so fixer/reviewer/worker share one key for the shared PR worktree.
+// Call order with lockLoopRetry: take the per-loop lock first, then the target
+// lock, so retry/start/reuse paths share a consistent order with discard.
+func (h *Handler) lockLoopTarget(projectID string, loopType domain.LoopType, target domain.LoopTarget) func() {
+	key := looperdruntime.LoopTargetGuardKey(projectID, string(loopType), string(target.TargetType), loopTargetKeyCompat(target))
+	return looperdruntime.LockLoopTarget(key)
+}
+
+// lockLoopTargetForStatus is a no-op when the candidate status is not a
+// uniqueness-conflicting active status (create of failed/completed/etc.).
+func (h *Handler) lockLoopTargetForStatus(projectID string, loopType domain.LoopType, target domain.LoopTarget, status domain.LoopStatus) func() {
+	if !domain.IsConflictingActiveLoopStatus(status) {
+		return func() {}
+	}
+	return h.lockLoopTarget(projectID, loopType, target)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -1485,15 +1521,18 @@ type activeRunView struct {
 }
 
 type retryLoopRequest struct {
-	Mode          string `json:"mode"`
-	ResetAttempts *bool  `json:"resetAttempts"`
+	Mode                   string `json:"mode"`
+	ResetAttempts          *bool  `json:"resetAttempts"`
+	DiscardWorktreeChanges *bool  `json:"discardWorktreeChanges"`
 }
 
 type retryLoopResponse struct {
-	Loop          loopResponse `json:"loop"`
-	QueueItemID   *string      `json:"queueItemId,omitempty"`
-	Mode          string       `json:"mode"`
-	ResetAttempts bool         `json:"resetAttempts"`
+	Loop                   loopResponse           `json:"loop"`
+	QueueItemID            *string                `json:"queueItemId,omitempty"`
+	Mode                   string                 `json:"mode"`
+	ResetAttempts          bool                   `json:"resetAttempts"`
+	DiscardWorktreeChanges bool                   `json:"discardWorktreeChanges"`
+	WorktreeDiscard        *worktreeDiscardResult `json:"worktreeDiscard,omitempty"`
 }
 
 type activeRunTarget struct {
@@ -3180,7 +3219,7 @@ func (h *Handler) buildLoopRouteResponse(r *http.Request, path string) (any, err
 		if r.Method != http.MethodPost {
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
 		}
-		return h.retryLoop(r.Context(), r, loop.ID)
+		return h.retryLoop(r.Context(), r, loop.ID, false)
 	case "respond":
 		if r.Method != http.MethodPost {
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
@@ -3522,6 +3561,15 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 		return loopResponse{}, err
 	}
 
+	// Share the same-target lock with discard+retry so create cannot enqueue a
+	// new active loop for this target between discard preflight and requeue.
+	candidateStatusForLock := domain.LoopStatus(status)
+	if (domain.LoopType(loopType) == domain.LoopTypeReviewer || domain.LoopType(loopType) == domain.LoopTypeFixer || domain.LoopType(loopType) == domain.LoopTypeWorker) && candidateStatusForLock == domain.LoopStatusRunning {
+		candidateStatusForLock = domain.LoopStatusQueued
+	}
+	unlockTarget := h.lockLoopTargetForStatus(projectID, domain.LoopType(loopType), target, candidateStatusForLock)
+	defer unlockTarget()
+
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		transactionRepos := storage.NewRepositories(tx)
 		_, err := requireActiveProjectRecord(r.Context(), transactionRepos.Projects, projectID)
@@ -3770,6 +3818,28 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	}
 	metadataJSON := string(payloadJSONBytes)
 	reusedWorkerLoop := false
+
+	// Issue-worker reuse enqueues the existing loop (same as start requeue).
+	// Take the shared per-loop retry lock before the TX so discard+retry cannot
+	// wipe the managed worktree after reuse preflight/enqueue races in.
+	// Pre-scan is best-effort identity for the lock; the TX re-evaluates reuse.
+	if issueNumber != nil && requestedIssueTarget != nil {
+		existing, listErr := services.Repositories.Loops.List(r.Context())
+		if listErr != nil {
+			return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: listErr.Error()}
+		}
+		if existingLoop, _, ok, reuseErr := reusableWorkerLoopForIssueRequestCompat(existing, projectID, *requestedIssueTarget, target); reuseErr != nil {
+			return workerCreateResponse{}, reuseErr
+		} else if ok {
+			unlock := h.lockLoopRetry(existingLoop.ID)
+			defer unlock()
+		}
+	}
+	// New worker create (and non-reuse paths) share the same-target lock with
+	// discard+retry so a concurrent create for this target cannot pass unique
+	// checks after discard preflight and leave a wiped worktree.
+	unlockWorkerTarget := h.lockLoopTargetForStatus(projectID, domain.LoopTypeWorker, target, domain.LoopStatusQueued)
+	defer unlockWorkerTarget()
 
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
@@ -4227,6 +4297,11 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 		return plannerCreateResponse{}, err
 	}
 
+	// Share same-target lock with discard+retry so planner uniqueness races
+	// cannot interleave with requeue while discard mutates the worktree.
+	unlockPlannerTarget := h.lockLoopTargetForStatus(projectID, domain.LoopTypePlanner, target, domain.LoopStatusRunning)
+	defer unlockPlannerTarget()
+
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	targetID := fmt.Sprintf("issue:%s:%d", *repo, *issueNumber)
 	metadataJSONPtr, err := manualPlannerMetadataJSON(nil, *issueNumber)
@@ -4550,7 +4625,37 @@ func (h *Handler) resolveLoop(ctx context.Context, selector string) (storage.Loo
 }
 
 func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status domain.LoopStatus) (loopResponse, error) {
+	// Running requeues from the latest failed/cancelled/manual_intervention item
+	// and can start replacement work. Share the per-loop retry lock and the
+	// same-target lock so this cannot race discard+retry between preflight and
+	// destructive git reset — including when the requeued loop is a *different*
+	// failed loop for the same PR/issue target.
+	if status == domain.LoopStatusRunning {
+		unlock := h.lockLoopRetry(loopID)
+		defer unlock()
+	}
+
 	services := h.context.Runtime.Services()
+	if status == domain.LoopStatusRunning {
+		if services.Repositories == nil || services.Coordinator == nil {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+		}
+		// Resolve target outside the TX so we can hold the target mutex for the
+		// whole requeue window (same key as discard+retry / loop create).
+		preflightLoop, err := services.Repositories.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		if preflightLoop != nil {
+			target, targetErr := loopTargetFromRecordCompat(*preflightLoop)
+			if targetErr != nil {
+				return loopResponse{}, targetErr
+			}
+			unlockTarget := h.lockLoopTarget(preflightLoop.ProjectID, domain.LoopType(preflightLoop.Type), target)
+			defer unlockTarget()
+		}
+	}
+
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	updated, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
@@ -4731,6 +4836,19 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 // THAT session and sees their turns), clears any queue item that survived the
 // takeover race, then re-arms via the shared retry path.
 func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID string) (any, error) {
+	// Reject discard before any handback mutation. retryLoop is shared with
+	// /retry, but handback must never wipe the human's interactive worktree edits
+	// even if an API client includes discardWorktreeChanges on the handback body.
+	if discardRequested, err := retryRequestRequestsDiscard(r); err != nil {
+		return nil, err
+	} else if discardRequested {
+		return nil, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "discardWorktreeChanges is not allowed on handback; human interactive worktree edits must be preserved (retry with --discard-worktree-changes after handback if needed)",
+		}
+	}
+
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (struct{}, error) {
@@ -4761,7 +4879,31 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 	if err != nil {
 		return nil, err
 	}
-	return h.retryLoop(ctx, r, loopID)
+	// Handback reuses retry re-arm; fromHandback also rejects discard if body is
+	// re-read after a client races another field in (defense in depth).
+	return h.retryLoop(ctx, r, loopID, true)
+}
+
+// retryRequestRequestsDiscard peeks at a retry/handback JSON body for
+// discardWorktreeChanges without consuming the request for a later retryLoop decode.
+func retryRequestRequestsDiscard(r *http.Request) (bool, error) {
+	if r == nil || r.Body == nil {
+		return false, nil
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	_ = r.Body.Close()
+	r.Body = io.NopCloser(strings.NewReader(string(raw)))
+	if err != nil {
+		return false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return false, nil
+	}
+	var body retryLoopRequest
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
+	}
+	return body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges, nil
 }
 
 type respondLoopRequest struct {
@@ -5031,7 +5173,10 @@ func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request
 	h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": true})
 }
 
-func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string) (retryLoopResponse, error) {
+// retryLoop re-arms a loop for another scheduler pass. fromHandback is true when
+// invoked via /loops/{id}/handback so discardWorktreeChanges is rejected: that
+// path preserves human interactive edits in the worktree for the resumed session.
+func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string, fromHandback bool) (retryLoopResponse, error) {
 	var body retryLoopRequest
 	if r.Body != nil {
 		defer r.Body.Close()
@@ -5057,9 +5202,127 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 	if !resetAttempts {
 		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "resetAttempts=false is not supported for explicit operator retry"}
 	}
+	discardWorktreeChanges := body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges
+	if discardWorktreeChanges && fromHandback {
+		return retryLoopResponse{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "discardWorktreeChanges is not allowed on handback; human interactive worktree edits must be preserved (retry with --discard-worktree-changes after handback if needed)",
+		}
+	}
+
+	// Serialize per-loop retry with start/requeue so discard cannot race another
+	// retry or /loops/{id}/start that enqueues replacement work between preflight
+	// and reset (or a scheduler-started run for that replacement).
+	unlock := h.lockLoopRetry(loopID)
+	defer unlock()
 
 	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Coordinator == nil {
+		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+
+	// Always resolve the loop target and hold the same-target lock for the whole
+	// retry window — not only when discarding. Regular retry and /start for a
+	// *different* failed loop on this target would otherwise create an active
+	// queue item after discard preflight and before git reset, then the discard
+	// TX would conflict after the worktree was already wiped.
+	preflightLoop, err := services.Repositories.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if preflightLoop == nil {
+		return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+	}
+	target, targetErr := loopTargetFromRecordCompat(*preflightLoop)
+	if targetErr != nil {
+		return retryLoopResponse{}, targetErr
+	}
+	unlockTarget := h.lockLoopTarget(preflightLoop.ProjectID, domain.LoopType(preflightLoop.Type), target)
+	defer unlockTarget()
+
+	// Opt-in discard runs before requeue so git mutation stays outside the
+	// queue transaction. Every non-mutating retry blocker must pass first so a
+	// later precondition failure never leaves discarded worktree changes
+	// without creating a replacement queue item.
+	var worktreeDiscard *worktreeDiscardResult
+	if discardWorktreeChanges {
+		// Runtime HITL poll requeues awaiting_human loops without the API lock
+		// (hitl_github_poll / Feishu helpers). Refuse discard so a poll-delivered
+		// answer cannot requeue between preflight and git reset, wiping the
+		// worktree for the answered continuation when the retry TX then conflicts.
+		// human_takeover pins the same worktree for interactive human edits;
+		// /handback already rejects discard, and direct /retry must match that.
+		if err := rejectDiscardWhileParkedForHuman(preflightLoop.Status, loopID); err != nil {
+			return retryLoopResponse{}, err
+		}
+
+		if err := h.assertLoopRetryPreconditions(ctx, services.Repositories, *preflightLoop, nowISO); err != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				return retryLoopResponse{}, typed
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		// Same-type uniqueness is not enough for discard: PR worktrees are shared
+		// across fixer/reviewer/worker. An already queued/running/waiting/
+		// human_takeover sibling is not held by the target mutex (that only
+		// serializes mutations), so refuse git reset/clean while any worktree-
+		// owning sibling holds the PR checkout.
+		if err := h.assertDiscardSharedPRWorktreeClear(ctx, services.Repositories, *preflightLoop); err != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				return retryLoopResponse{}, typed
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+
+		// Recheck immediately before git mutation as defense in depth. Runtime
+		// free-text enqueue now shares LockLoopRequeue with this path, so the
+		// common race is serialized; this snapshot still catches any unlocked
+		// requeue injected under discardBeforeGitHook in tests (or future
+		// callers that forget the shared guard).
+		if h.discardBeforeGitHook != nil {
+			h.discardBeforeGitHook(loopID)
+		}
+		freshLoop, freshErr := services.Repositories.Loops.GetByID(ctx, loopID)
+		if freshErr != nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: freshErr.Error()}
+		}
+		if freshLoop == nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+		}
+		if err := rejectDiscardWhileParkedForHuman(freshLoop.Status, loopID); err != nil {
+			return retryLoopResponse{}, err
+		}
+		if err := h.assertLoopRetryPreconditions(ctx, services.Repositories, *freshLoop, nowISO); err != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				return retryLoopResponse{}, typed
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		if err := h.assertDiscardSharedPRWorktreeClear(ctx, services.Repositories, *freshLoop); err != nil {
+			var typed apiError
+			if asAPIError(err, &typed) {
+				return retryLoopResponse{}, typed
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		preflightLoop = freshLoop
+
+		discardResult, discardErr := h.discardLoopWorktreeChanges(ctx, services, *preflightLoop)
+		if discardErr != nil {
+			var typed apiError
+			if asAPIError(discardErr, &typed) {
+				return retryLoopResponse{}, typed
+			}
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: discardErr.Error()}
+		}
+		worktreeDiscard = &discardResult
+	}
+
 	type retryResult struct {
 		loop        storage.LoopRecord
 		queueItemID *string
@@ -5073,49 +5336,21 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 		if loop == nil {
 			return retryResult{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 		}
-		if strings.TrimSpace(loop.ProjectID) != "" {
-			if _, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID); err != nil {
+		if err := h.assertLoopRetryPreconditions(ctx, repos, *loop, nowISO); err != nil {
+			return retryResult{}, err
+		}
+		// When discard already mutated the worktree, re-check shared-PR siblings
+		// inside the TX so a concurrent runtime requeue/create that raced past
+		// preflight cannot leave both an active sibling and a successful retry.
+		if discardWorktreeChanges {
+			if err := h.assertDiscardSharedPRWorktreeClear(ctx, repos, *loop); err != nil {
 				return retryResult{}, err
 			}
-		}
-		if loop.Status == string(domain.LoopStatusStopped) || loop.Status == string(domain.LoopStatusTerminated) || loop.Status == string(domain.LoopStatusCompleted) {
-			return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal %s loop: %s", loop.Status, loop.ID)}
-		}
-		if loop.Type == string(domain.LoopTypeReviewer) {
-			if terminalMetadataStatus := terminalReviewerRetryMetadataStatus(*loop); terminalMetadataStatus != "" {
-				return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal reviewer metadata %s loop: %s", terminalMetadataStatus, loop.ID)}
-			}
-		}
-		if (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
-			return retryResult{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry %s loop without config.agent.vendor", loop.Type)}
-		}
-		runningRuns, err := repos.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
-		if err != nil {
-			return retryResult{}, err
-		}
-		for _, run := range runningRuns {
-			if run.LoopID == loop.ID {
-				return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while a run is active", loop.ID)}
-			}
-		}
-		activeQueue, err := repos.Queue.FindActiveByLoopID(ctx, loop.ID)
-		if err != nil {
-			return retryResult{}, err
-		}
-		if activeQueue != nil {
-			return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while queue item %s is active", loop.ID, activeQueue.ID)}
 		}
 
 		target, targetErr := loopTargetFromRecordCompat(*loop)
 		if targetErr != nil {
 			return retryResult{}, targetErr
-		}
-		existing, err := repos.Loops.List(ctx)
-		if err != nil {
-			return retryResult{}, err
-		}
-		if uniqueErr := assertUniqueActiveLoopCompat(existing, loop.ID, loop.ProjectID, domain.LoopType(loop.Type), target, domain.LoopStatusQueued); uniqueErr != nil {
-			return retryResult{}, uniqueErr
 		}
 		latestQueue, err := repos.Queue.GetLatestByLoopID(ctx, loop.ID)
 		if err != nil {
@@ -5163,6 +5398,8 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 		if !ok {
 			return retryResult{loop: *loop}, nil
 		}
+		// Dedupe is already asserted by assertLoopRetryPreconditions; re-check
+		// inside the transaction for races between preflight and commit.
 		if queueRecord.DedupeKey != "" {
 			activeDedupe, err := repos.Queue.FindActiveByDedupe(ctx, queueRecord.DedupeKey)
 			if err != nil {
@@ -5193,7 +5430,14 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string)
 	if h.context.TriggerSchedulerTick != nil {
 		h.context.TriggerSchedulerTick()
 	}
-	return retryLoopResponse{Loop: serializeLoop(result.loop), QueueItemID: result.queueItemID, Mode: mode, ResetAttempts: resetAttempts}, nil
+	return retryLoopResponse{
+		Loop:                   serializeLoop(result.loop),
+		QueueItemID:            result.queueItemID,
+		Mode:                   mode,
+		ResetAttempts:          resetAttempts,
+		DiscardWorktreeChanges: discardWorktreeChanges,
+		WorktreeDiscard:        worktreeDiscard,
+	}, nil
 }
 
 func (h *Handler) buildLoopLogsResponse(ctx context.Context, loop storage.LoopRecord) (loopLogsResponse, error) {
@@ -5546,6 +5790,178 @@ func isTerminalReviewerLoopRecord(loop storage.LoopRecord) bool {
 	loopMeta, _ := metadata["loop"].(map[string]any)
 	status, _ := loopMeta["status"].(string)
 	return status == "terminated" || status == "stopped" || status == "failed"
+}
+
+// rejectDiscardWhileParkedForHuman refuses discard+retry when the loop is
+// parked for a human so interactive worktree edits stay intact. awaiting_human
+// is blocked against HITL poll requeue races; human_takeover matches /handback
+// which never honors discardWorktreeChanges.
+func rejectDiscardWhileParkedForHuman(status, loopID string) error {
+	switch status {
+	case string(domain.LoopStatusAwaitingHuman):
+		return apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusConflict,
+			message: fmt.Sprintf("Cannot discard worktree changes while loop %s is awaiting_human; answer or cancel the HITL ask first, or retry without --discard-worktree-changes", loopID),
+		}
+	case string(domain.LoopStatusHumanTakeover):
+		return apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusConflict,
+			message: fmt.Sprintf("Cannot discard worktree changes while loop %s is human_takeover; hand back without --discard-worktree-changes first, or retry without discard", loopID),
+		}
+	default:
+		return nil
+	}
+}
+
+// assertDiscardSharedPRWorktreeClear refuses discard when another loop of any
+// type already holds a worktree-owning status on the same pull-request target.
+// assertUniqueActiveLoopCompat only conflicts same-type loops; managed PR
+// worktrees (looper-fix-<project>-pr-N) are shared across fixer/reviewer/
+// worker, so a sibling that is queued, running, waiting, failed, interrupted,
+// or human_takeover would lose its checkout to git reset/clean. Non-PR targets
+// and non-discard retries are unaffected.
+func (h *Handler) assertDiscardSharedPRWorktreeClear(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord) error {
+	if loop.TargetType != string(domain.LoopTargetTypePullRequest) {
+		return nil
+	}
+	existing, err := repos.Loops.List(ctx)
+	if err != nil {
+		return err
+	}
+	return assertNoActiveSiblingPRWorktreeLoops(existing, loop)
+}
+
+// isDiscardBlockingSiblingPRStatus reports whether a sibling loop's status
+// still pins the shared PR managed worktree. Includes IsConflictingActiveLoopStatus
+// plus waiting/failed/interrupted: those are intentionally excluded from
+// uniqueness conflicts (reviewer debounce can sit waiting while another type
+// fails; failed/interrupted are retryable terminals), but worktree cleanup
+// (protectsLoopStatus) and ownership still treat them as active owners whose
+// checkpointed local state must not be wiped by a sibling discard retry.
+func isDiscardBlockingSiblingPRStatus(status domain.LoopStatus) bool {
+	if domain.IsConflictingActiveLoopStatus(status) || status == domain.LoopStatusWaiting {
+		return true
+	}
+	return status == domain.LoopStatusFailed || status == domain.LoopStatusInterrupted
+}
+
+// assertNoActiveSiblingPRWorktreeLoops reports a conflict when any other
+// worktree-owning loop on the same project+PR key exists, regardless of loop
+// type. Used only for destructive discard preflight.
+func assertNoActiveSiblingPRWorktreeLoops(existing []storage.LoopRecord, candidate storage.LoopRecord) error {
+	if candidate.TargetType != string(domain.LoopTargetTypePullRequest) {
+		return nil
+	}
+	candidateKey := loopTargetKeyFromRecordCompat(candidate)
+	if candidateKey == "pull_request:" {
+		return nil
+	}
+	for _, loop := range existing {
+		if loop.ID == candidate.ID || loop.ProjectID != candidate.ProjectID {
+			continue
+		}
+		if loop.TargetType != string(domain.LoopTargetTypePullRequest) {
+			continue
+		}
+		if !isDiscardBlockingSiblingPRStatus(domain.LoopStatus(loop.Status)) {
+			continue
+		}
+		if loopTargetKeyFromRecordCompat(loop) != candidateKey {
+			continue
+		}
+		return apiError{
+			code:   pkgapi.ErrorCodeLoopConflict,
+			status: http.StatusConflict,
+			message: fmt.Sprintf(
+				"Cannot discard worktree changes for loop %s while active %s loop %s shares the same PR worktree (%s)",
+				candidate.ID, loop.Type, loop.ID, candidateKey,
+			),
+		}
+	}
+	return nil
+}
+
+// assertLoopRetryPreconditions validates non-mutating retry blockers that must
+// pass before any destructive worktree discard or requeue. Callers that discard
+// dirty worktree state must invoke this first so a failed retry never deletes
+// local changes without creating a replacement queue item.
+func (h *Handler) assertLoopRetryPreconditions(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) error {
+	if strings.TrimSpace(loop.ProjectID) != "" {
+		if _, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID); err != nil {
+			return err
+		}
+	}
+	if loop.Status == string(domain.LoopStatusStopped) || loop.Status == string(domain.LoopStatusTerminated) || loop.Status == string(domain.LoopStatusCompleted) {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal %s loop: %s", loop.Status, loop.ID)}
+	}
+	if loop.Type == string(domain.LoopTypeReviewer) {
+		if terminalMetadataStatus := terminalReviewerRetryMetadataStatus(loop); terminalMetadataStatus != "" {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry terminal reviewer metadata %s loop: %s", terminalMetadataStatus, loop.ID)}
+		}
+	}
+	if (loop.Type == string(domain.LoopTypeReviewer) || loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeWorker) || loop.Type == string(domain.LoopTypePlanner)) && !isCodingAgentConfigured(h.context.Config) {
+		return apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot retry %s loop without config.agent.vendor", loop.Type)}
+	}
+	runningRuns, err := repos.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
+	if err != nil {
+		return err
+	}
+	for _, run := range runningRuns {
+		if run.LoopID == loop.ID {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while a run is active", loop.ID)}
+		}
+	}
+	activeQueue, err := repos.Queue.FindActiveByLoopID(ctx, loop.ID)
+	if err != nil {
+		return err
+	}
+	if activeQueue != nil {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while queue item %s is active", loop.ID, activeQueue.ID)}
+	}
+
+	target, targetErr := loopTargetFromRecordCompat(loop)
+	if targetErr != nil {
+		return targetErr
+	}
+	existing, err := repos.Loops.List(ctx)
+	if err != nil {
+		return err
+	}
+	if uniqueErr := assertUniqueActiveLoopCompat(existing, loop.ID, loop.ProjectID, domain.LoopType(loop.Type), target, domain.LoopStatusQueued); uniqueErr != nil {
+		return uniqueErr
+	}
+
+	latestQueue, err := repos.Queue.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil {
+		return err
+	}
+	dedupeKey := ""
+	if latestQueue != nil {
+		dedupeKey = latestQueue.DedupeKey
+	} else {
+		// Match requeue path: when there is no prior queue row, building the
+		// replacement record can fail on target/repo requirements and must
+		// block discard just as it blocks requeue.
+		built, ok, queueErr := buildQueuedLoopQueueRecordCompat(loop, target, nowISO, loop.MetadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+		if queueErr != nil {
+			return queueErr
+		}
+		if ok {
+			dedupeKey = built.DedupeKey
+		}
+	}
+	if dedupeKey != "" {
+		activeDedupe, err := repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
+		if err != nil {
+			return err
+		}
+		if activeDedupe != nil {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while dedupe queue item %s is active", loop.ID, activeDedupe.ID)}
+		}
+	}
+	return nil
 }
 
 func terminalReviewerRetryMetadataStatus(loop storage.LoopRecord) string {

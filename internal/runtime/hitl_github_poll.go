@@ -153,6 +153,13 @@ func pollGitHubHITLAnswersOnce(ctx contextType, loops []githubHITLAwaitingLoop, 
 // answer, a message does NOT resolve a pending ask — the agent reads it and
 // decides whether to proceed, answer, or ask again.
 func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, text string) error {
+	// Share process-wide requeue exclusion with API discard+retry so free-text
+	// inbox delivery cannot requeue paused/waiting/manual_intervention loops
+	// between discard preflight and git reset (see LockLoopRequeue).
+	// Call order: per-loop lock first, then same-target lock (matches API).
+	unlock := LockLoopRequeue(loopID)
+	defer unlock()
+
 	loop, err := repos.Loops.GetByID(ctx, loopID)
 	if err != nil || loop == nil {
 		return err
@@ -161,6 +168,12 @@ func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories,
 	case "completed", "failed", "stopped", "terminated", "human_takeover":
 		return nil
 	}
+	// Same-target exclusion: a different waiting loop on this PR/issue can
+	// otherwise requeue while discard+retry holds only that other loop's
+	// per-loop mutex and wipes the shared worktree before the retry TX.
+	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*loop))
+	defer unlockTarget()
+
 	meta, werr := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: nowISO, Text: text})
 	if werr != nil {
 		return werr
@@ -185,6 +198,10 @@ func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories,
 }
 
 func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer string) error {
+	// Same requeue + target exclusion as free-text enqueue / API discard+retry.
+	unlock := LockLoopRequeue(loopID)
+	defer unlock()
+
 	loop, err := repos.Loops.GetByID(ctx, loopID)
 	if err != nil || loop == nil {
 		return err
@@ -192,6 +209,8 @@ func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, n
 	if loop.Status != "awaiting_human" {
 		return nil
 	}
+	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*loop))
+	defer unlockTarget()
 	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
 	if !ok {
 		return nil

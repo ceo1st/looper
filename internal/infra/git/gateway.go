@@ -115,6 +115,21 @@ type CleanupWorktreeInput struct {
 	ProtectedBranches []string
 }
 
+// DiscardWorktreeChangesInput discards tracked and untracked local changes in a
+// managed worktree, leaving HEAD and the worktree directory itself intact.
+type DiscardWorktreeChangesInput struct {
+	RepoPath     string
+	WorktreeRoot string
+	WorktreePath string
+}
+
+// DiscardWorktreeChangesResult reports whether discard mutated the worktree.
+type DiscardWorktreeChangesResult struct {
+	WorktreePath string
+	WasDirty     bool
+	NoOp         bool
+}
+
 type PushInput struct {
 	RepoPath              string
 	WorktreeRoot          string
@@ -518,6 +533,63 @@ func (g *Gateway) WorktreeClean(ctx context.Context, worktreePath string) (bool,
 
 func (g *Gateway) IsWorktreeClean(ctx context.Context, worktreePath string) (bool, error) {
 	return g.WorktreeClean(ctx, worktreePath)
+}
+
+// DiscardWorktreeChanges hard-resets tracked files and removes untracked files
+// in a managed worktree. It never deletes the worktree directory, remote
+// branches, or force-pushes.
+func (g *Gateway) DiscardWorktreeChanges(ctx context.Context, input DiscardWorktreeChangesInput) (DiscardWorktreeChangesResult, error) {
+	worktreePath := strings.TrimSpace(input.WorktreePath)
+	if worktreePath == "" {
+		return DiscardWorktreeChangesResult{}, fmt.Errorf("worktree path is required")
+	}
+	if err := g.validateMutationWorktree(worktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+	if _, err := os.Stat(worktreePath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return DiscardWorktreeChangesResult{WorktreePath: worktreePath, NoOp: true}, nil
+		}
+		return DiscardWorktreeChangesResult{}, err
+	}
+
+	clean, err := g.WorktreeClean(ctx, worktreePath)
+	if err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+	if clean {
+		return DiscardWorktreeChangesResult{WorktreePath: worktreePath, WasDirty: false, NoOp: true}, nil
+	}
+
+	// Recurse into submodules so a dirty tracked submodule is reset with the
+	// superproject. Without --recurse-submodules, top-level tracked edits are
+	// discarded while submodule dirt remains, and the post-clean check fails
+	// after partial discard (not all-or-nothing for repos with submodules).
+	if err := g.runGit(ctx, worktreePath, nil, "reset", "--hard", "--recurse-submodules", "HEAD"); err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+	// Double -f is required so git clean also removes nested repositories
+	// (untracked checkouts with their own .git). Single -f leaves those
+	// behind, which fails the post-clean cleanliness check after tracked
+	// edits were already discarded via reset --hard.
+	if err := g.runGit(ctx, worktreePath, nil, "clean", "-ffd"); err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+	// Top-level clean does not enter tracked submodules. Reset+clean each
+	// submodule so untracked/modified files inside them are discarded too.
+	// No-op when the worktree has no submodules.
+	if err := g.runGit(ctx, worktreePath, nil, "submodule", "foreach", "--recursive", "git reset --hard && git clean -ffd"); err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+
+	clean, err = g.WorktreeClean(ctx, worktreePath)
+	if err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+	if !clean {
+		return DiscardWorktreeChangesResult{}, fmt.Errorf("worktree still dirty after discard at %s", worktreePath)
+	}
+	return DiscardWorktreeChangesResult{WorktreePath: worktreePath, WasDirty: true, NoOp: false}, nil
 }
 
 func (g *Gateway) Push(ctx context.Context, input PushInput) error {
