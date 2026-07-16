@@ -2243,6 +2243,167 @@ func TestHandlerProjectsCreateRouteMapsProjectIDConflict(t *testing.T) {
 	assertEqual(t, typed.message, "Derived project id collides with an existing explicit project: looper")
 }
 
+func TestHandlerLoopsListPaginationAndFilters(t *testing.T) {
+	fixture := newTestFixture(t)
+	ctx := context.Background()
+	repos := fixture.runtime.Services().Repositories
+
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{
+		ID: "project_a", Name: "A", RepoPath: "/tmp/a",
+		CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z",
+	}); err != nil {
+		t.Fatalf("Projects.Upsert(project_a) error = %v", err)
+	}
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{
+		ID: "project_b", Name: "B", RepoPath: "/tmp/b",
+		CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z",
+	}); err != nil {
+		t.Fatalf("Projects.Upsert(project_b) error = %v", err)
+	}
+	for _, loop := range []storage.LoopRecord{
+		{ID: "loop_1", Seq: 1, ProjectID: "project_a", Type: "worker", TargetType: "project", Status: "running", CreatedAt: "2026-04-11T12:00:01.000Z", UpdatedAt: "2026-04-11T12:00:01.000Z"},
+		{ID: "loop_2", Seq: 2, ProjectID: "project_a", Type: "worker", TargetType: "project", Status: "paused", CreatedAt: "2026-04-11T12:00:02.000Z", UpdatedAt: "2026-04-11T12:00:02.000Z"},
+		{ID: "loop_3", Seq: 3, ProjectID: "project_a", Type: "worker", TargetType: "project", Status: "running", CreatedAt: "2026-04-11T12:00:03.000Z", UpdatedAt: "2026-04-11T12:00:03.000Z"},
+		{ID: "loop_4", Seq: 4, ProjectID: "project_b", Type: "worker", TargetType: "project", Status: "running", CreatedAt: "2026-04-11T12:00:04.000Z", UpdatedAt: "2026-04-11T12:00:04.000Z"},
+		{ID: "loop_5", Seq: 5, ProjectID: "project_b", Type: "worker", TargetType: "project", Status: "failed", CreatedAt: "2026-04-11T12:00:05.000Z", UpdatedAt: "2026-04-11T12:00:05.000Z"},
+	} {
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+
+	t.Run("unlimited returns all items and total", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/loops", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+		}
+		body := parseJSONMap(t, recorder.Body.Bytes())
+		data := body["data"].(map[string]any)
+		items := data["items"].([]any)
+		if len(items) != 5 {
+			t.Fatalf("items len = %d, want 5", len(items))
+		}
+		assertEqual(t, data["total"], float64(5))
+		assertEqual(t, data["offset"], float64(0))
+		if _, ok := data["limit"]; ok {
+			t.Fatalf("limit present on unlimited list: %#v", data["limit"])
+		}
+	})
+
+	t.Run("limit and offset page with total", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/loops?limit=2&offset=1", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+		}
+		body := parseJSONMap(t, recorder.Body.Bytes())
+		data := body["data"].(map[string]any)
+		items := data["items"].([]any)
+		if len(items) != 2 {
+			t.Fatalf("items len = %d, want 2", len(items))
+		}
+		assertEqual(t, items[0].(map[string]any)["id"], "loop_4")
+		assertEqual(t, items[1].(map[string]any)["id"], "loop_3")
+		assertEqual(t, data["total"], float64(5))
+		assertEqual(t, data["limit"], float64(2))
+		assertEqual(t, data["offset"], float64(1))
+	})
+
+	t.Run("offset without limit still skips rows", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/loops?offset=2", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+		}
+		body := parseJSONMap(t, recorder.Body.Bytes())
+		data := body["data"].(map[string]any)
+		items := data["items"].([]any)
+		if len(items) != 3 {
+			t.Fatalf("items len = %d, want 3", len(items))
+		}
+		assertEqual(t, items[0].(map[string]any)["id"], "loop_3")
+		assertEqual(t, items[1].(map[string]any)["id"], "loop_2")
+		assertEqual(t, items[2].(map[string]any)["id"], "loop_1")
+		assertEqual(t, data["total"], float64(5))
+		assertEqual(t, data["offset"], float64(2))
+		if _, ok := data["limit"]; ok {
+			t.Fatalf("limit present on offset-only list: %#v", data["limit"])
+		}
+	})
+
+	t.Run("status filter", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/loops?status=running", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+		}
+		body := parseJSONMap(t, recorder.Body.Bytes())
+		data := body["data"].(map[string]any)
+		items := data["items"].([]any)
+		if len(items) != 3 {
+			t.Fatalf("items len = %d, want 3", len(items))
+		}
+		assertEqual(t, data["total"], float64(3))
+		for _, item := range items {
+			assertEqual(t, item.(map[string]any)["status"], "running")
+		}
+	})
+
+	t.Run("projectId filter", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/loops?projectId=project_b", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+		}
+		body := parseJSONMap(t, recorder.Body.Bytes())
+		data := body["data"].(map[string]any)
+		items := data["items"].([]any)
+		if len(items) != 2 {
+			t.Fatalf("items len = %d, want 2", len(items))
+		}
+		assertEqual(t, data["total"], float64(2))
+		for _, item := range items {
+			assertEqual(t, item.(map[string]any)["projectId"], "project_b")
+		}
+	})
+
+	t.Run("invalid limit", func(t *testing.T) {
+		for _, path := range []string{"/api/v1/loops?limit=0", "/api/v1/loops?limit=-1", "/api/v1/loops?limit=abc", "/api/v1/loops?limit=201"} {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("%s status = %d, want 400; body=%s", path, recorder.Code, recorder.Body.String())
+			}
+			body := parseJSONMap(t, recorder.Body.Bytes())
+			errObj := body["error"].(map[string]any)
+			assertEqual(t, errObj["code"], string(pkgapi.ErrorCodeValidationFailed))
+		}
+	})
+
+	t.Run("invalid offset", func(t *testing.T) {
+		for _, path := range []string{"/api/v1/loops?offset=-1", "/api/v1/loops?offset=abc"} {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("%s status = %d, want 400; body=%s", path, recorder.Code, recorder.Body.String())
+			}
+			body := parseJSONMap(t, recorder.Body.Bytes())
+			errObj := body["error"].(map[string]any)
+			assertEqual(t, errObj["code"], string(pkgapi.ErrorCodeValidationFailed))
+		}
+	})
+}
+
 func TestHandlerLoopRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 	routes := loadResponseArtifact(t)
 	requestArtifact := loadRequestArtifact(t)
@@ -2252,24 +2413,52 @@ func TestHandlerLoopRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 		method  string
 		path    string
 		body    string
-		prepare func(*testing.T, *Handler)
-	}{{routeID: "loops.list", method: http.MethodGet, path: "/api/v1/loops"}, {routeID: "loop.detail", method: http.MethodGet, path: "/api/v1/loops/loop_1"}, {routeID: "loop.logs", method: http.MethodGet, path: "/api/v1/loops/loop_1/logs"}, {routeID: "loop.start", method: http.MethodPost, path: "/api/v1/loops/loop_1/start"}, {routeID: "loop.pause", method: http.MethodPost, path: "/api/v1/loops/loop_1/pause", prepare: func(t *testing.T, h *Handler) {
-		t.Helper()
-		startReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/loop_1/start", nil)
-		startRecorder := httptest.NewRecorder()
-		h.ServeHTTP(startRecorder, startReq)
-		if startRecorder.Code != http.StatusOK {
-			t.Fatalf("pre-start status = %d, want 200", startRecorder.Code)
-		}
-	}}, {routeID: "loops.create", method: http.MethodPost, path: "/api/v1/loops", body: marshalArtifactRequestBody(t, requestArtifact, "loops.create")}}
+		prepare func(*testing.T, *Handler, *looperdruntime.Runtime)
+	}{
+		{routeID: "loops.list", method: http.MethodGet, path: "/api/v1/loops"},
+		{routeID: "loop.detail", method: http.MethodGet, path: "/api/v1/loops/loop_1"},
+		{routeID: "loop.logs", method: http.MethodGet, path: "/api/v1/loops/loop_1/logs"},
+		{routeID: "loop.start", method: http.MethodPost, path: "/api/v1/loops/loop_1/start"},
+		{routeID: "loop.pause", method: http.MethodPost, path: "/api/v1/loops/loop_1/pause", prepare: func(t *testing.T, h *Handler, _ *looperdruntime.Runtime) {
+			t.Helper()
+			startReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/loop_1/start", nil)
+			startRecorder := httptest.NewRecorder()
+			h.ServeHTTP(startRecorder, startReq)
+			if startRecorder.Code != http.StatusOK {
+				t.Fatalf("pre-start status = %d, want 200", startRecorder.Code)
+			}
+		}},
+		{routeID: "loop.retry", method: http.MethodPost, path: "/api/v1/loops/loop_1/retry", body: marshalArtifactRequestBody(t, requestArtifact, "loop.retry"), prepare: func(t *testing.T, _ *Handler, rt *looperdruntime.Runtime) {
+			t.Helper()
+			prepareLoopRouteForRetry(t, rt, "paused")
+		}},
+		{routeID: "loop.takeover", method: http.MethodPost, path: "/api/v1/loops/loop_1/takeover"},
+		{routeID: "loop.handback", method: http.MethodPost, path: "/api/v1/loops/loop_1/handback", body: marshalArtifactRequestBody(t, requestArtifact, "loop.handback"), prepare: func(t *testing.T, _ *Handler, rt *looperdruntime.Runtime) {
+			t.Helper()
+			prepareLoopRouteForRetry(t, rt, "human_takeover")
+		}},
+		{routeID: "loops.create", method: http.MethodPost, path: "/api/v1/loops", body: marshalArtifactRequestBody(t, requestArtifact, "loops.create")},
+	}
 
 	for _, tt := range tests {
 		t.Run(tt.routeID, func(t *testing.T) {
 			fixture := newTestFixture(t)
 			seedLoopRouteData(t, fixture.runtime)
-			h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+			h := NewHandler(Context{
+				Config:  fixture.config,
+				Runtime: fixture.runtime,
+				Now:     func() time.Time { return fixture.now.Add(time.Minute) },
+				TakeoverLoop: func(_ context.Context, loopID, _ string) (TakeoverResult, error) {
+					return TakeoverResult{
+						LoopID:       loopID,
+						Vendor:       "codex",
+						SessionID:    "session_fixture_1",
+						WorktreePath: "/tmp/worktrees/loop_1",
+					}, nil
+				},
+			})
 			if tt.prepare != nil {
-				tt.prepare(t, h)
+				tt.prepare(t, h, fixture.runtime)
 			}
 
 			var body io.Reader
@@ -2285,7 +2474,7 @@ func TestHandlerLoopRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 			h.ServeHTTP(recorder, req)
 
 			if recorder.Code != http.StatusOK {
-				t.Fatalf("status = %d, want 200", recorder.Code)
+				t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 			}
 
 			actual := normalizeResponseValue(parseJSONValue(t, recorder.Body.Bytes()), fixture.rootDir)
@@ -6994,6 +7183,42 @@ func (f *fakeWebhookForwarder) Close() {}
 func seedLoopRouteData(t *testing.T, rt *looperdruntime.Runtime) {
 	t.Helper()
 	seedStatusData(t, rt)
+}
+
+// prepareLoopRouteForRetry clears active run/queue blockers on seeded loop_1 and
+// sets the loop status so /retry and /handback contract routes can succeed.
+func prepareLoopRouteForRetry(t *testing.T, rt *looperdruntime.Runtime, loopStatus string) {
+	t.Helper()
+	services := rt.Services()
+	ctx := context.Background()
+	nowISO := "2026-04-11T12:00:00.000Z"
+
+	loop, err := services.Repositories.Loops.GetByID(ctx, "loop_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID(loop_1) = %#v, %v", loop, err)
+	}
+	loop.Status = loopStatus
+	loop.UpdatedAt = nowISO
+	if err := services.Repositories.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert(loop_1) error = %v", err)
+	}
+
+	run, err := services.Repositories.Runs.GetByID(ctx, "run_1")
+	if err != nil || run == nil {
+		t.Fatalf("Runs.GetByID(run_1) = %#v, %v", run, err)
+	}
+	run.Status = "completed"
+	endedAt := nowISO
+	run.EndedAt = &endedAt
+	run.UpdatedAt = nowISO
+	if err := services.Repositories.Runs.Upsert(ctx, *run); err != nil {
+		t.Fatalf("Runs.Upsert(run_1) error = %v", err)
+	}
+
+	reason := "cleared for contract fixture"
+	if _, err := services.Repositories.Queue.CancelByLoop(ctx, "loop_1", nowISO, &reason); err != nil {
+		t.Fatalf("Queue.CancelByLoop(loop_1) error = %v", err)
+	}
 }
 
 func seedEventAndPullRequestRouteData(t *testing.T, rt *looperdruntime.Runtime) {

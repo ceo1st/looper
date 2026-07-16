@@ -96,6 +96,7 @@ type Handler struct {
 	now              func() time.Time
 	recoverySummary  func() any
 	webhookForwarder webhookforward.Forwarder
+	bootstrap        *bootstrapCodes
 	// discardBeforeGitHook is test-only: invoked after discard preflight recheck
 	// and immediately before git reset/clean so tests can inject a requeue race
 	// that bypasses LockLoopRequeue (defense-in-depth for the pre-git recheck).
@@ -131,11 +132,15 @@ func NewHandler(context Context) *Handler {
 		}
 	}
 
+	bootstrap := newBootstrapCodes()
+	bootstrap.now = now
+
 	return &Handler{
 		context:          context,
 		now:              now,
 		recoverySummary:  recoverySummary,
 		webhookForwarder: forwarder,
+		bootstrap:        bootstrap,
 	}
 }
 
@@ -183,11 +188,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !asAPIError(err, &typed) {
 			typed = internalServerError(err)
 		}
+		// Bootstrap paths must never be cached, including auth/Host/Origin failures.
+		if isDashboardBootstrapPath(path) {
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		h.writeError(w, requestID, typed)
 		return
 	}
 
 	switch path {
+	case dashboardBootstrapCodePath:
+		h.handleBootstrapMint(w, r, requestID)
+		return
+	case dashboardBootstrapExchangePath:
+		h.handleBootstrapExchange(w, r, requestID)
+		return
 	case webhookForwardPath:
 		payload, err := h.buildWebhookForwardResponse(r)
 		if err != nil {
@@ -621,6 +636,15 @@ func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 			return nil
 		}
 	}
+
+	// Browser foundation: Host allowlist + Origin match against config-derived
+	// authorities when Origin is present (reads and mutations). CLI without Origin OK.
+	// Non-browser callbacks (e.g. Feishu) with no Origin skip Host allowlist so a
+	// public Host on 0.0.0.0 without server.baseUrl still reaches token verification.
+	if err := validateBrowserRequestForPath(r, cfg, path); err != nil {
+		return err
+	}
+
 	if cfg.Server.AuthMode != config.AuthModeLocalToken {
 		return nil
 	}
@@ -631,6 +655,11 @@ func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 			status:  http.StatusInternalServerError,
 			message: "Local token auth is enabled but no token is configured",
 		}
+	}
+
+	// Public one-shot exception: SPA exchanges bootstrap code without Bearer.
+	if isDashboardBootstrapExchange(path, r.Method) {
+		return nil
 	}
 
 	if r.Header.Get("Authorization") != fmt.Sprintf("Bearer %s", *cfg.Server.LocalToken) {
@@ -1316,8 +1345,13 @@ type projectsListResponse struct {
 }
 
 type loopsListResponse struct {
-	Items []loopResponse `json:"items"`
+	Items  []loopResponse `json:"items"`
+	Total  int64          `json:"total"`
+	Limit  *int64         `json:"limit,omitempty"`
+	Offset int64          `json:"offset"`
 }
+
+const maxLoopsListLimit int64 = 200
 
 type eventsListResponse struct {
 	Items []eventResponse `json:"items"`
@@ -1668,7 +1702,17 @@ func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
 
 	switch r.Method {
 	case http.MethodGet:
-		items, err := services.Repositories.Loops.List(r.Context())
+		opts, err := parseLoopsListOptions(r)
+		if err != nil {
+			return nil, err
+		}
+
+		total, err := services.Repositories.Loops.CountFiltered(r.Context(), opts)
+		if err != nil {
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+
+		items, err := services.Repositories.Loops.ListFiltered(r.Context(), opts)
 		if err != nil {
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
@@ -1678,12 +1722,49 @@ func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
 			responseItems = append(responseItems, serializeLoop(item))
 		}
 
-		return loopsListResponse{Items: responseItems}, nil
+		resp := loopsListResponse{
+			Items:  responseItems,
+			Total:  total,
+			Offset: opts.Offset,
+		}
+		if opts.Limit > 0 {
+			limit := opts.Limit
+			resp.Limit = &limit
+		}
+		return resp, nil
 	case http.MethodPost:
 		return h.buildCreateLoopResponse(r)
 	default:
 		return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/loops")}
 	}
+}
+
+func parseLoopsListOptions(r *http.Request) (storage.ListLoopsOptions, error) {
+	opts := storage.ListLoopsOptions{
+		Status:    strings.TrimSpace(r.URL.Query().Get("status")),
+		ProjectID: strings.TrimSpace(r.URL.Query().Get("projectId")),
+	}
+
+	if limitValue := strings.TrimSpace(r.URL.Query().Get("limit")); limitValue != "" {
+		parsed, err := strconv.ParseInt(limitValue, 10, 64)
+		if err != nil || parsed <= 0 {
+			return storage.ListLoopsOptions{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "limit must be a positive integer"}
+		}
+		if parsed > maxLoopsListLimit {
+			return storage.ListLoopsOptions{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("limit must be at most %d", maxLoopsListLimit)}
+		}
+		opts.Limit = parsed
+	}
+
+	if offsetValue := strings.TrimSpace(r.URL.Query().Get("offset")); offsetValue != "" {
+		parsed, err := strconv.ParseInt(offsetValue, 10, 64)
+		if err != nil || parsed < 0 {
+			return storage.ListLoopsOptions{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "offset must be a non-negative integer"}
+		}
+		opts.Offset = parsed
+	}
+
+	return opts, nil
 }
 
 func (h *Handler) buildRunsRouteResponse(r *http.Request) (runsListResponse, error) {
