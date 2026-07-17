@@ -1650,7 +1650,7 @@ func TestRuntimeRecoveryRequeuesRunningQueueItemWithoutRun(t *testing.T) {
 	}
 }
 
-func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
+func TestRuntimeRecoveryQuarantinesOrphanAgentExecutionsWithoutKill(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -1669,8 +1669,27 @@ func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
 	seedRepos := storage.NewRepositories(seedCoordinator.DB())
 	pid := int64(4242)
 	nativeSessionID := "codex-session-1"
+	loopID := "loop_orphan_1"
+	projectID := "project_1"
+	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() seed error = %v", err)
+	}
+	if err := seedRepos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() seed error = %v", err)
+	}
+	queueError := "was running"
+	if err := seedRepos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: "queue_orphan_1", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
+		DedupeKey: "worker:project_1:loop_orphan_1", Priority: storage.QueuePriorityWorker, Status: "running",
+		AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, LastError: &queueError, ClaimedBy: stringPtr("scheduler"),
+		ClaimedAt: stringPtr(nowISO), StartedAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() seed error = %v", err)
+	}
 	if err := seedRepos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
 		ID:              "agent_orphan_1",
+		ProjectID:       &projectID,
+		LoopID:          &loopID,
 		Vendor:          "codex",
 		Status:          "running",
 		PID:             &pid,
@@ -1688,6 +1707,7 @@ func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
 		t.Fatalf("seed coordinator close error = %v", err)
 	}
 
+	signaled := false
 	rt := New(Options{
 		Config: cfg,
 		Logger: &testLogger{},
@@ -1698,12 +1718,8 @@ func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
 			return "codex exec fix failing tests", nil
 		},
 		SignalProcess: func(gotPID int, signal syscall.Signal) error {
-			if signal == syscall.SIGKILL {
-				return nil
-			}
-			if gotPID != -int(pid) || signal != syscall.SIGTERM {
-				t.Fatalf("SignalProcess(%d, %v), want (%d, SIGTERM)", gotPID, signal, -pid)
-			}
+			signaled = true
+			t.Fatalf("SignalProcess(%d, %v) called, want no recovery PID action", gotPID, signal)
 			return nil
 		},
 	})
@@ -1717,24 +1733,48 @@ func TestRuntimeRecoveryCleansOrphanAgentExecutions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
 	}
-	if agentExecution == nil || agentExecution.Status != "killed" || agentExecution.EndedAt == nil {
-		t.Fatalf("AgentExecutions.GetByID(agent_orphan_1) = %#v, want killed with ended_at", agentExecution)
+	if agentExecution == nil || agentExecution.Status != "running" || agentExecution.EndedAt != nil {
+		t.Fatalf("AgentExecutions.GetByID(agent_orphan_1) = %#v, want still running evidence", agentExecution)
 	}
-	if agentExecution.NativeSessionID == nil || *agentExecution.NativeSessionID != nativeSessionID || agentExecution.NativeResumeMode == nil || *agentExecution.NativeResumeMode != "native_resume" || agentExecution.NativeResumeStatus == nil || *agentExecution.NativeResumeStatus != "pending" {
-		t.Fatalf("AgentExecutions.GetByID(agent_orphan_1) = %#v, want native resume pending metadata", agentExecution)
+	if agentExecution.NativeSessionID == nil || *agentExecution.NativeSessionID != nativeSessionID {
+		t.Fatalf("AgentExecutions.GetByID(agent_orphan_1) = %#v, want native session preserved", agentExecution)
+	}
+	if signaled {
+		t.Fatal("SignalProcess() called during recovery")
+	}
+
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused quarantine", loop)
+	}
+	queue, err := services.Repositories.Queue.GetByID(context.Background(), "queue_orphan_1")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "manual_intervention" {
+		t.Fatalf("queue = %#v, want manual_intervention quarantine", queue)
 	}
 
 	events, err := services.Repositories.Events.ListByEntity(context.Background(), "agent_execution", "agent_orphan_1")
 	if err != nil {
 		t.Fatalf("Events.ListByEntity(agent_execution) error = %v", err)
 	}
-	if !containsEventType(events, "agent.killed") {
-		t.Fatalf("agent_execution events = %#v, want agent.killed", events)
+	if containsEventType(events, "agent.killed") {
+		t.Fatalf("agent_execution events = %#v, want no agent.killed", events)
+	}
+	if !containsEventType(events, "looperd.recovery.execution_quarantined") {
+		t.Fatalf("agent_execution events = %#v, want execution_quarantined", events)
 	}
 
 	recovery := rt.RecoverySummary()
-	if !recovery.OrphanAgentCleanup.Attempted || recovery.OrphanAgentCleanup.CleanedCount != 1 {
-		t.Fatalf("RecoverySummary().OrphanAgentCleanup = %#v, want attempted + cleanedCount=1", recovery.OrphanAgentCleanup)
+	if !recovery.OrphanAgentCleanup.Attempted || recovery.OrphanAgentCleanup.CleanedCount != 0 || recovery.OrphanAgentCleanup.QuarantinedCount != 1 {
+		t.Fatalf("RecoverySummary().OrphanAgentCleanup = %#v, want attempted + quarantinedCount=1 + cleanedCount=0", recovery.OrphanAgentCleanup)
+	}
+	if rt.AdmissionState() != AdmissionReady {
+		t.Fatalf("AdmissionState() = %q, want ready after CompleteStartup", rt.AdmissionState())
 	}
 }
 
@@ -1820,8 +1860,14 @@ func TestRuntimeRecoverySkipsMismatchedRecoveredPID(t *testing.T) {
 	if recovery.OrphanAgentCleanup.CleanedCount != 0 {
 		t.Fatalf("RecoverySummary().OrphanAgentCleanup = %#v, want cleanedCount=0", recovery.OrphanAgentCleanup)
 	}
+	if recovery.OrphanAgentCleanup.QuarantinedCount != 1 {
+		t.Fatalf("RecoverySummary().OrphanAgentCleanup = %#v, want quarantinedCount=1", recovery.OrphanAgentCleanup)
+	}
 	if !logger.containsMessage("recovery skipped due to uncertain process identity") {
 		t.Fatalf("logger entries = %#v, want uncertain process identity warning", logger.messages())
+	}
+	if !containsEventType(events, "looperd.recovery.execution_quarantined") {
+		t.Fatalf("agent_execution events = %#v, want execution_quarantined", events)
 	}
 }
 
@@ -1910,8 +1956,8 @@ func TestRuntimeRecoveryPreservesRunWithUncertainActiveAgentExecution(t *testing
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "running" {
-		t.Fatalf("Loops.GetByID(%s) = %#v, want preserved running loop", loopID, loop)
+	if loop == nil || loop.Status != "paused" {
+		t.Fatalf("Loops.GetByID(%s) = %#v, want quarantined paused loop", loopID, loop)
 	}
 	agentExecution, err := services.Repositories.AgentExecutions.GetByID(context.Background(), "agent_mismatched_running_run")
 	if err != nil {
@@ -2062,23 +2108,23 @@ func TestRuntimeRecoveryPreservesLoopWithActiveAgentExecution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "running" {
-		t.Fatalf("Loops.GetByID(%s) = %#v, want preserved running loop", loopID, loop)
+	if loop == nil || loop.Status != "paused" {
+		t.Fatalf("Loops.GetByID(%s) = %#v, want quarantined paused loop", loopID, loop)
 	}
 	run, err := services.Repositories.Runs.GetByID(context.Background(), runID)
 	if err != nil {
 		t.Fatalf("Runs.GetByID() error = %v", err)
 	}
 	if run == nil || run.Status != "running" || run.EndedAt != nil {
-		t.Fatalf("Runs.GetByID(%s) = %#v, want preserved running run", runID, run)
+		t.Fatalf("Runs.GetByID(%s) = %#v, want preserved running run evidence", runID, run)
 	}
 	queueItems, err := services.Repositories.Queue.List(context.Background())
 	if err != nil {
 		t.Fatalf("Queue.List() error = %v", err)
 	}
 	for _, item := range queueItems {
-		if item.LoopID != nil && *item.LoopID == loopID {
-			t.Fatalf("unexpected queue item for active running loop: %#v", item)
+		if item.LoopID != nil && *item.LoopID == loopID && item.Status != "manual_intervention" && item.Status != "completed" && item.Status != "failed" && item.Status != "cancelled" {
+			t.Fatalf("unexpected actionable queue item for quarantined loop: %#v", item)
 		}
 	}
 	if recovery := rt.RecoverySummary(); recovery.InterruptedRunsMarked != 0 || recovery.LoopsRequeued != 0 || recovery.OrphanAgentCleanup.CleanedCount != 0 {
@@ -2283,6 +2329,140 @@ func TestRuntimeReconcileStaleRunningRunsSkipsVerifiedLiveExecution(t *testing.T
 			run, _ := repos.Runs.GetByID(context.Background(), "run_live_execution")
 			if run == nil || run.Status != "running" {
 				t.Fatalf("run = %#v, want still running", run)
+			}
+		})
+	}
+}
+
+// Regression: after quarantining dead/nil-PID execution evidence, stale-run
+// reconciliation must not requeue via pre-quarantine loop/latestRun repair or the
+// later interrupted-loop pass while agent_executions remain running evidence.
+func TestRuntimeReconcileStaleRunningRunsSkipsQueueRepairAfterQuarantine(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		reconcile func(*Runtime, context.Context) (StaleRunReconcileSummary, error)
+	}{
+		{name: "live", reconcile: func(rt *Runtime, ctx context.Context) (StaleRunReconcileSummary, error) {
+			return rt.reconcileLiveStaleRunningRuns(ctx)
+		}},
+		{name: "manual", reconcile: func(rt *Runtime, ctx context.Context) (StaleRunReconcileSummary, error) {
+			return rt.ReconcileStaleRunningRuns(ctx)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workingDir := t.TempDir()
+			cfg, err := config.DefaultConfig(workingDir)
+			if err != nil {
+				t.Fatalf("DefaultConfig() error = %v", err)
+			}
+			cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+			backupDir := filepath.Join(workingDir, "backups")
+			cfg.Storage.BackupDir = &backupDir
+			now := time.Date(2026, time.May, 20, 12, 0, 0, 0, time.UTC)
+			nowISO := formatJavaScriptISOString(now)
+			oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
+			// PID gone: empty process command probes as dead (not uncertain).
+			deadPID := int64(6161)
+
+			rt := New(Options{
+				Config:             cfg,
+				Logger:             &testLogger{},
+				Now:                func() time.Time { return now },
+				ReadProcessCommand: func(context.Context, int) (string, error) { return "", nil },
+				SignalProcess: func(int, syscall.Signal) error {
+					t.Fatal("SignalProcess called, want no recovery PID action after dead probe")
+					return nil
+				},
+			})
+			if err := rt.Start(context.Background()); err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			defer rt.Stop("test cleanup")
+			repos := rt.Services().Repositories
+			repo := "nexu-io/looper"
+			prNumber := int64(575)
+			targetID := "pr:nexu-io/looper:575"
+			loopID := "loop_dead_exec_quarantine"
+			runID := "run_dead_exec_quarantine"
+			queueID := "queue_dead_exec_quarantine"
+			if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+			if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+			if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("repair"), StartedAt: oldISO, LastHeartbeatAt: stringPtr(oldISO), CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+				t.Fatalf("Runs.Upsert() error = %v", err)
+			}
+			if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+				ID: queueID, ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID,
+				DedupeKey: "fixer:project_1:" + loopID, Priority: storage.QueuePriorityFixer, Status: "running",
+				AvailableAt: oldISO, Attempts: 1, MaxAttempts: 3, ClaimedBy: stringPtr("scheduler"), ClaimedAt: stringPtr(oldISO),
+				StartedAt: stringPtr(oldISO), CreatedAt: oldISO, UpdatedAt: oldISO,
+			}); err != nil {
+				t.Fatalf("Queue.Upsert() error = %v", err)
+			}
+			if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+				ID: "exec_dead_quarantine", ProjectID: stringPtr("project_1"), LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running",
+				PID: &deadPID, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir),
+				StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO,
+			}); err != nil {
+				t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+			}
+
+			summary, err := tc.reconcile(rt, context.Background())
+			if err != nil {
+				t.Fatalf("reconcile error = %v", err)
+			}
+			if summary.CandidateRuns != 1 || summary.InterruptedRuns != 1 {
+				t.Fatalf("summary = %#v, want one interrupted stale run", summary)
+			}
+			if summary.LoopsRequeued != 0 || summary.QueueItemsRequeued != 0 {
+				t.Fatalf("summary = %#v, want no requeue after quarantine", summary)
+			}
+			if summary.CleanedExecutions != 0 {
+				t.Fatalf("summary.CleanedExecutions = %d, want 0 (quarantine is not cleanup)", summary.CleanedExecutions)
+			}
+			if summary.QuarantinedExecutions != 1 {
+				t.Fatalf("summary.QuarantinedExecutions = %d, want 1", summary.QuarantinedExecutions)
+			}
+
+			run, err := repos.Runs.GetByID(context.Background(), runID)
+			if err != nil {
+				t.Fatalf("Runs.GetByID() error = %v", err)
+			}
+			if run == nil || run.Status != "interrupted" {
+				t.Fatalf("run = %#v, want interrupted", run)
+			}
+			execution, err := repos.AgentExecutions.GetByID(context.Background(), "exec_dead_quarantine")
+			if err != nil {
+				t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+			}
+			if execution == nil || execution.Status != "running" || execution.EndedAt != nil {
+				t.Fatalf("execution = %#v, want still-running evidence", execution)
+			}
+			loop, err := repos.Loops.GetByID(context.Background(), loopID)
+			if err != nil {
+				t.Fatalf("Loops.GetByID() error = %v", err)
+			}
+			if loop == nil || loop.Status != "paused" {
+				t.Fatalf("loop = %#v, want paused quarantine (not requeued)", loop)
+			}
+			queue, err := repos.Queue.GetByID(context.Background(), queueID)
+			if err != nil {
+				t.Fatalf("Queue.GetByID() error = %v", err)
+			}
+			if queue == nil || queue.Status != "manual_intervention" {
+				t.Fatalf("queue = %#v, want manual_intervention quarantine", queue)
+			}
+			active, err := repos.Queue.FindActiveByLoopID(context.Background(), loopID)
+			if err != nil {
+				t.Fatalf("FindActiveByLoopID() error = %v", err)
+			}
+			if active != nil {
+				t.Fatalf("FindActiveByLoopID = %#v, want no active queue after quarantine", active)
 			}
 		})
 	}
@@ -2992,6 +3172,10 @@ func TestRuntimeTriggerSchedulerClaimRunsImmediatelyWithoutWaitingForPolling(t *
 
 	var tickCount int32
 	var claimCount int32
+	admission := NewAdmission()
+	if err := admission.MarkReady("test"); err != nil {
+		t.Fatalf("MarkReady() error = %v", err)
+	}
 	rt := &Runtime{
 		config:                cfg,
 		logger:                &testLogger{},
@@ -2999,6 +3183,7 @@ func TestRuntimeTriggerSchedulerClaimRunsImmediatelyWithoutWaitingForPolling(t *
 		defaultSchedulerClaim: func(context.Context, Services) error { atomic.AddInt32(&claimCount, 1); return nil },
 		services:              Services{Repositories: &storage.Repositories{}},
 		shutdownTimeout:       time.Second,
+		admission:             admission,
 	}
 
 	rt.startSchedulerLoop()
@@ -3100,6 +3285,8 @@ func (s stubRuntimeWebhookForwarder) Forward(context.Context, webhookforward.Del
 }
 
 func (s stubRuntimeWebhookForwarder) Stats() webhookforward.Stats { return s.stats }
+
+func (stubRuntimeWebhookForwarder) CancelExecute() {}
 
 func (stubRuntimeWebhookForwarder) Close() {}
 

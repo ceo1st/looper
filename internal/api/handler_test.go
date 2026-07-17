@@ -922,6 +922,7 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 
 	assertEqual(t, service["healthy"], true)
 	assertEqual(t, service["daemonMode"], "foreground")
+	assertEqual(t, service["admissionState"], "ready")
 	binaryPath, ok := binaryInfo["path"].(string)
 	if !ok || strings.TrimSpace(binaryPath) == "" {
 		t.Fatalf("service.binary.path missing/invalid: %#v", binaryInfo["path"])
@@ -7118,6 +7119,18 @@ func newTestFixture(t *testing.T, configure ...func(*looperdruntime.Options)) te
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Runtime.Start() error = %v", err)
 	}
+	// Admission opens only after CompleteStartup. DeferRecovery fixtures still
+	// need a ready gate for mutation API tests (#575).
+	if err := rt.CompleteStartup(context.Background()); err != nil {
+		t.Fatalf("Runtime.CompleteStartup() error = %v", err)
+	}
+	// CompleteStartup starts deferred reviewer recovery after MarkReady. Wait
+	// so tests that insert terminal reviewer metadata (status=failed + metadata
+	// terminated) cannot race normalizeTerminalReviewerLoopForRecovery flipping
+	// loop.Status to terminated before retry preconditions run.
+	if err := rt.WaitForDeferredReviewerRecovery(context.Background()); err != nil {
+		t.Fatalf("Runtime.WaitForDeferredReviewerRecovery() error = %v", err)
+	}
 
 	t.Cleanup(func() {
 		rt.Stop("test cleanup")
@@ -7259,6 +7272,8 @@ func (f *fakeWebhookForwarder) Forward(context.Context, webhookforward.DeliveryR
 }
 
 func (f *fakeWebhookForwarder) Stats() webhookforward.Stats { return webhookforward.Stats{} }
+
+func (f *fakeWebhookForwarder) CancelExecute() {}
 
 func (f *fakeWebhookForwarder) Close() {}
 

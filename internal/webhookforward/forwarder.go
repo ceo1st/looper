@@ -82,6 +82,10 @@ type Stats struct {
 type Forwarder interface {
 	Forward(context.Context, DeliveryRequest) (ForwardResult, error)
 	Stats() Stats
+	// CancelExecute aborts in-flight discovery without waiting for workers to
+	// exit. BeginShutdown should call this so admission-closed races cannot
+	// finish CreateOrGetActiveByDedupe after a one-time AllowExecute pass.
+	CancelExecute()
 	Close()
 }
 
@@ -111,6 +115,11 @@ type Options struct {
 	DeliveryTTL        time.Duration
 	RetryDelay         time.Duration
 	RecentOutcomeLimit int
+	// AllowExecute, when set, is rechecked immediately before each worker
+	// discovery attempt. Forward may accept a delivery while admission is
+	// still open; the background worker drains later and must refuse to
+	// persist queue work after BeginShutdown. Nil means ungated (tests).
+	AllowExecute func() error
 }
 
 type deliveryRecord struct {
@@ -210,6 +219,11 @@ type forwarder struct {
 	deliveryTTL        time.Duration
 	retryDelay         time.Duration
 	recentOutcomeLimit int
+	allowExecute       func() error
+	// execCtx is canceled by CancelExecute / Close so discovery that already
+	// passed AllowExecute still observes shutdown and cannot enqueue late.
+	execCtx    context.Context
+	execCancel context.CancelFunc
 
 	mu              sync.Mutex
 	cond            *sync.Cond
@@ -248,6 +262,7 @@ func New(options Options) Forwarder {
 	if recentOutcomeLimit <= 0 {
 		recentOutcomeLimit = defaultRecentOutcomeSize
 	}
+	execCtx, execCancel := context.WithCancel(context.Background())
 	f := &forwarder{
 		repos:              options.Repos,
 		cfg:                options.Config,
@@ -261,6 +276,9 @@ func New(options Options) Forwarder {
 		deliveryTTL:        deliveryTTL,
 		retryDelay:         retryDelay,
 		recentOutcomeLimit: recentOutcomeLimit,
+		allowExecute:       options.AllowExecute,
+		execCtx:            execCtx,
+		execCancel:         execCancel,
 		works:              map[string]*workItem{},
 		deliveries:         map[string]deliveryRecord{},
 	}
@@ -335,7 +353,19 @@ func (f *forwarder) Stats() Stats {
 	return stats
 }
 
+// CancelExecute aborts in-flight worker discovery without waiting for drain.
+// Runtime.BeginShutdown must call this so a worker that already passed
+// AllowExecute cannot finish CreateOrGetActiveByDedupe after admission closes.
+// Safe to call multiple times; Close also cancels.
+func (f *forwarder) CancelExecute() {
+	if f == nil || f.execCancel == nil {
+		return
+	}
+	f.execCancel()
+}
+
 func (f *forwarder) Close() {
+	f.CancelExecute()
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
@@ -444,7 +474,9 @@ func (f *forwarder) worker() {
 		if !ok {
 			return
 		}
-		outcome := f.executeWithRetry(context.Background(), key, item)
+		// Use the cancelable exec context so BeginShutdown aborts discovery that
+		// already passed AllowExecute (context.Background would keep enqueueing).
+		outcome := f.executeWithRetry(f.execCtx, key, item)
 		f.finishWork(key, outcome)
 	}
 }
@@ -548,11 +580,29 @@ func (f *forwarder) executeWithRetry(ctx context.Context, key workKey, item work
 }
 
 func (f *forwarder) executeOnce(ctx context.Context, key workKey, item workItem) error {
+	// Recheck admission at discovery time: Forward may have accepted this work
+	// while ready, but BeginShutdown can close admission before the worker runs.
+	if f.allowExecute != nil {
+		if err := f.allowExecute(); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if _, ok := item.lanes[LaneReviewer]; ok {
 		if f.reviewer == nil {
 			return fmt.Errorf("reviewer targeted discovery is not configured")
 		}
 		if _, err := f.reviewer.DiscoverPullRequest(ctx, reviewer.TargetedDiscoveryInput{ProjectID: key.ProjectID, Repo: key.Repo, PRNumber: key.Number}); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if f.allowExecute != nil {
+		if err := f.allowExecute(); err != nil {
 			return err
 		}
 	}

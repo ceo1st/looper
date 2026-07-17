@@ -79,14 +79,18 @@ type schedulerAsyncRunner interface {
 }
 
 type defaultSchedulerTickInput struct {
-	Repos                    *storage.Repositories
-	GitHubGateway            *githubinfra.Gateway
-	Logger                   bootstrap.Logger
-	Now                      func() time.Time
-	MaxConcurrentRuns        int
-	ClaimMu                  *sync.Mutex
-	ClaimBoundary            *sync.RWMutex
-	RefreshForClaim          func() defaultSchedulerTickInput
+	Repos             *storage.Repositories
+	GitHubGateway     *githubinfra.Gateway
+	Logger            bootstrap.Logger
+	Now               func() time.Time
+	MaxConcurrentRuns int
+	ClaimMu           *sync.Mutex
+	ClaimBoundary     *sync.RWMutex
+	RefreshForClaim   func() defaultSchedulerTickInput
+	// AllowClaim, when set, is the admission projection for all work-producing
+	// scheduler activity: the full default tick (discovery, HITL, claims,
+	// stale-reconcile) and each durable ClaimNext*. Nil means ungated (tests).
+	AllowClaim               func() error
 	ReconcileStaleRuns       func(context.Context) (StaleRunReconcileSummary, error)
 	AsyncRunner              schedulerAsyncRunner
 	RequestSchedulerWake     func()
@@ -2853,7 +2857,7 @@ func (f *schedulerNotificationGatewayFactory) New(options notify.Options) *notif
 	return notify.NewGateway(options)
 }
 
-func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
+func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error) defaultSchedulerHandlers {
 	if source == nil {
 		fail := func(context.Context, Services) error { return fmt.Errorf("project catalog is not configured") }
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
@@ -2885,49 +2889,44 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			}},
 			Logger: logger,
 			Now:    now,
+			// Worker discovery must recheck the same admission Authority as
+			// scheduler claims: Forward can accept just before BeginShutdown,
+			// then drain after admission is already stopping (#583).
+			AllowExecute: allowClaim,
 		})
+	}
+	attachClaimGate := func(input defaultSchedulerTickInput, services Services) defaultSchedulerTickInput {
+		input.ClaimBoundary = claimBoundary
+		input.AllowClaim = allowClaim
+		input.RefreshForClaim = func() defaultSchedulerTickInput {
+			latestSnapshot := handlers.snapshot()
+			if latestSnapshot.input == nil {
+				stopped := input
+				stopped.MaxConcurrentRuns = 0
+				stopped.RefreshForClaim = nil
+				stopped.AllowClaim = allowClaim
+				return stopped
+			}
+			latest := latestSnapshot.input(services)
+			latest.ClaimBoundary = claimBoundary
+			latest.AllowClaim = allowClaim
+			return latest
+		}
+		return input
 	}
 	handlers.tick = func(ctx context.Context, services Services) error {
 		snapshot := handlers.snapshot()
 		if snapshot.input == nil {
 			return snapshot.tick(ctx, services)
 		}
-		input := snapshot.input(services)
-		input.ClaimBoundary = claimBoundary
-		input.RefreshForClaim = func() defaultSchedulerTickInput {
-			latestSnapshot := handlers.snapshot()
-			if latestSnapshot.input == nil {
-				stopped := input
-				stopped.MaxConcurrentRuns = 0
-				stopped.RefreshForClaim = nil
-				return stopped
-			}
-			latest := latestSnapshot.input(services)
-			latest.ClaimBoundary = claimBoundary
-			return latest
-		}
-		return runDefaultSchedulerTick(ctx, input)
+		return runDefaultSchedulerTick(ctx, attachClaimGate(snapshot.input(services), services))
 	}
 	handlers.claim = func(ctx context.Context, services Services) error {
 		snapshot := handlers.snapshot()
 		if snapshot.input == nil {
 			return snapshot.claim(ctx, services)
 		}
-		input := snapshot.input(services)
-		input.ClaimBoundary = claimBoundary
-		input.RefreshForClaim = func() defaultSchedulerTickInput {
-			latestSnapshot := handlers.snapshot()
-			if latestSnapshot.input == nil {
-				stopped := input
-				stopped.MaxConcurrentRuns = 0
-				stopped.RefreshForClaim = nil
-				return stopped
-			}
-			latest := latestSnapshot.input(services)
-			latest.ClaimBoundary = claimBoundary
-			return latest
-		}
-		return runIndependentClaimPass(ctx, input)
+		return runIndependentClaimPass(ctx, attachClaimGate(snapshot.input(services), services))
 	}
 	return handlers
 }
@@ -3364,6 +3363,15 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	if input.Repos == nil || input.Repos.Projects == nil {
 		return nil
 	}
+	// Gate the entire work-producing tick (discovery, HITL, claims, stale
+	// reconcile), not only ClaimNext*. Admission closed during starting/stopping
+	// must not enqueue via CreateOrGetActiveByDedupe or requeue via reconcile.
+	if err := admissionRefuseWork(input); err != nil {
+		if input.Logger != nil {
+			input.Logger.Debug("scheduler tick skipped: admission closed", map[string]any{"error": err.Error()})
+		}
+		return nil
+	}
 
 	startedAt := time.Now()
 	claimStats := schedulerClaimStats{}
@@ -3434,6 +3442,15 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			retErr = errors.Join(append(errs, err)...)
 			return retErr
 		}
+		// Recheck before each project's work-producing lanes so BeginShutdown
+		// during HTTP drain cannot leave a tick that passed the entry gate free
+		// to enqueue discovery/HITL after admission is already stopping.
+		if err := admissionRefuseWork(input); err != nil {
+			if input.Logger != nil {
+				input.Logger.Debug("scheduler tick stopped mid-flight: admission closed", map[string]any{"error": err.Error(), "projectId": project.ID})
+			}
+			break
+		}
 		if project.Archived {
 			continue
 		}
@@ -3461,6 +3478,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			continue
 		}
 		if input.Planner != nil && discoveryEnabled(input.PlannerDiscoveryEnabled) {
+			if err := admissionRefuseWork(input); err != nil {
+				break
+			}
 			appendErr(runSchedulerLane(input, "planner discovery", project.ID, repo, func() error {
 				result, err := input.Planner.DiscoverIssues(ctx, planner.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				trackRunnableDiscovery(result.QueueItems)
@@ -3477,6 +3497,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "coordinator discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
 				}
 			} else {
+				if err := admissionRefuseWork(input); err != nil {
+					break
+				}
 				appendErr(runSchedulerLane(input, "coordinator discovery", project.ID, repo, func() error {
 					_, err := input.Coordinator.DiscoverIssues(ctx, coordinatorrole.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 					return wrapSchedulerError("coordinator discovery", project.ID, repo, err)
@@ -3486,6 +3509,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			}
 		}
 		if input.Reviewer != nil && discoveryEnabled(input.ReviewerDiscoveryEnabled) {
+			if err := admissionRefuseWork(input); err != nil {
+				break
+			}
 			appendErr(runSchedulerLane(input, "reviewer discovery", project.ID, repo, func() error {
 				result, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				trackRunnableDiscovery(result.QueueItems)
@@ -3502,6 +3528,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "fixer discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
 				}
 			} else {
+				if err := admissionRefuseWork(input); err != nil {
+					break
+				}
 				appendErr(runSchedulerLane(input, "fixer discovery", project.ID, repo, func() error {
 					result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 					trackRunnableDiscovery(result.QueueItems)
@@ -3514,6 +3543,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			input.Logger.Debug("fixer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if discoverer, ok := input.Worker.(workerIssueDiscoveryScheduler); ok && discoveryEnabled(input.WorkerDiscoveryEnabled) {
+			if err := admissionRefuseWork(input); err != nil {
+				break
+			}
 			appendErr(runSchedulerLane(input, "worker issue discovery", project.ID, repo, func() error {
 				result, err := discoverer.DiscoverIssues(ctx, worker.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				trackRunnableDiscovery(result.QueueItems)
@@ -3527,12 +3559,17 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 
 		// HITL (github transport): deliver any human answers posted on this
 		// project's awaiting_human PRs so those loops resume.
+		if err := admissionRefuseWork(input); err != nil {
+			break
+		}
 		runGitHubHITLPoll(ctx, input, project)
 	}
 
 	// HITL (feishu transport): poll the shared Cloudflare inbox once per tick and
 	// deliver any answers for this looper's awaiting loops.
-	runFeishuHITLPoll(ctx, input)
+	if err := admissionRefuseWork(input); err == nil {
+		runFeishuHITLPoll(ctx, input)
+	}
 
 	claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_discovery", input, discoveredRunnableIDs, true)
 	recordClaim(claimedCount, availableSlots, err)
@@ -3542,6 +3579,16 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	}
 	retErr = errors.Join(errs...)
 	return retErr
+}
+
+// admissionRefuseWork rechecks the admission projection mid-tick. Nil AllowClaim
+// means ungated (tests). A non-nil error means admission is closed and the
+// caller must not start further discovery/HITL enqueue work.
+func admissionRefuseWork(input defaultSchedulerTickInput) error {
+	if input.AllowClaim == nil {
+		return nil
+	}
+	return input.AllowClaim()
 }
 
 func discoveryEnabled(value *bool) bool {
@@ -3611,6 +3658,11 @@ func (s *schedulerClaimStats) record(claimedCount, availableSlots int) {
 }
 
 func runIndependentClaimPass(ctx context.Context, input defaultSchedulerTickInput) error {
+	if input.AllowClaim != nil {
+		if err := input.AllowClaim(); err != nil {
+			return nil
+		}
+	}
 	_, catalogCurrent, err := schedulerProjectsForCapturedCatalog(ctx, input)
 	if err != nil || !catalogCurrent {
 		return err
@@ -3654,6 +3706,12 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 	if input.RefreshForClaim != nil {
 		input = input.RefreshForClaim()
 	}
+	// Re-check after RefreshForClaim so a mid-tick catalog snapshot cannot open
+	// claims/reconcile after admission closed. Discovery/HITL recheck via
+	// admissionRefuseWork around each work-producing lane as well.
+	if err := admissionRefuseWork(input); err != nil {
+		return 0, 0, nil
+	}
 	start := time.Now()
 	availableSlots, err := schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)
 	if err != nil {
@@ -3661,6 +3719,12 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 		return 0, 0, err
 	}
 	if availableSlots == 0 && input.ReconcileStaleRuns != nil {
+		// Recheck immediately before stale reconcile: availableSlots can race
+		// with BeginShutdown after the count returns, and ReconcileStaleRuns
+		// mutates runs/queue during the HTTP drain window.
+		if err := admissionRefuseWork(input); err != nil {
+			return 0, 0, nil
+		}
 		if _, err := input.ReconcileStaleRuns(ctx); err != nil {
 			logClaimPhase(input.Logger, phase, 0, 0, time.Since(start), err)
 			return 0, 0, err
@@ -3750,33 +3814,83 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	}
 	nowISO := formatJavaScriptISOString(now().UTC())
 	queueItems := make([]storage.QueueItemRecord, 0, availableSlots)
+	// Recheck admission at each durable claim so BeginShutdown cannot race past
+	// an earlier pump-level AllowClaim and still ClaimNext under scheduler locks.
+	// If admission closes mid-batch after some ClaimNext* already persisted
+	// running/claimed items, stop claiming further slots but still process the
+	// items already claimed — never return them un-dispatched (stranded).
+	// The same invariant applies when BeginShutdown cancels the scheduler
+	// context mid-batch: stop further ClaimNext*, but still dispatch already
+	// durable claims (do not return the non-empty claimed slice with ctx.Err
+	// before runScheduledQueueItems).
+	admitClaim := func() error {
+		if input.AllowClaim == nil {
+			return nil
+		}
+		return input.AllowClaim()
+	}
+	stopClaiming := false
 	for i := 0; i < availableSlots; i++ {
 		if err := ctx.Err(); err != nil {
-			return queueItems, err
+			// Match admission mid-batch: stop claiming, fall through to dispatch.
+			break
+		}
+		if err := admitClaim(); err != nil {
+			stopClaiming = true
+			break
 		}
 		item, err := input.Repos.Queue.ClaimNextNonLongTermRetry(ctx, nowISO, "scheduler")
 		if err != nil {
-			return queueItems, err
+			// BeginShutdown may cancel mid-ClaimNext after earlier slots succeeded.
+			// Stop claiming and dispatch already-durable claims instead of stranding.
+			if ctx.Err() != nil {
+				break
+			}
+			return queueItems, dispatchClaimedQueueItems(ctx, queueItems, input, err)
 		}
 		if item == nil {
 			break
 		}
 		queueItems = append(queueItems, *item)
 	}
-	for len(queueItems) < availableSlots {
+	for !stopClaiming && len(queueItems) < availableSlots {
 		if err := ctx.Err(); err != nil {
-			return queueItems, err
+			break
+		}
+		if err := admitClaim(); err != nil {
+			break
 		}
 		item, err := input.Repos.Queue.ClaimNextLongTermRetry(ctx, nowISO, "scheduler")
 		if err != nil {
-			return queueItems, err
+			if ctx.Err() != nil {
+				break
+			}
+			return queueItems, dispatchClaimedQueueItems(ctx, queueItems, input, err)
 		}
 		if item == nil {
 			break
 		}
 		queueItems = append(queueItems, *item)
 	}
-	return queueItems, runScheduledQueueItems(ctx, queueItems, input)
+	return queueItems, dispatchClaimedQueueItems(ctx, queueItems, input, nil)
+}
+
+// dispatchClaimedQueueItems launches processors for items already durable as
+// running/claimed. Always detach the scheduler cancel: BeginShutdown may race
+// after a clean ctx.Err() check here but before ProcessClaimedQueueItem runs
+// its storage reads and Fail/Complete recovery writes. Relying on cancellation
+// already being visible at this exact check strands claims as running/
+// claimed_by=scheduler until a later recovery pass.
+func dispatchClaimedQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput, priorErr error) error {
+	if len(queueItems) == 0 {
+		return priorErr
+	}
+	dispatchCtx := ctx
+	if ctx != nil {
+		dispatchCtx = context.WithoutCancel(ctx)
+	}
+	runErr := runScheduledQueueItems(dispatchCtx, queueItems, input)
+	return errors.Join(runErr, priorErr)
 }
 
 // schedulerLoopParked reports whether a claimed queue item's loop was parked
@@ -3808,11 +3922,10 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 		now = time.Now
 	}
 	errList := make([]error, 0)
+	// Do not abort the launch loop on ctx cancel: every item in queueItems is
+	// already durable as claimed/running. Skipping remaining launches strands
+	// those claims (BeginShutdown cancels the scheduler context during drain).
 	for _, item := range queueItems {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
 		// A loop parked for human takeover (or paused) must never be run, even if a
 		// queue item survived a race with the parking and got claimed. Release the
 		// claim (so the slot frees) and skip — only an explicit handback re-arms it.

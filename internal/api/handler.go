@@ -279,6 +279,17 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Mutation readiness is a projection of the single admission Authority
+	// (ADR-0015 / #575). Reads remain available while starting/stopping/degraded.
+	// Feishu url_verification is a non-mutating challenge echo and is gated
+	// inside handleFeishuCardActionRoute after the handshake branch.
+	if isMutatingHTTPMethod(r.Method) && !isAdmissionExemptMutationPath(path) && path != apiBasePath+"/hitl/feishu" {
+		if typed, denied := h.admissionMutationDenial(); denied {
+			h.writeError(w, requestID, typed)
+			return
+		}
+	}
+
 	switch path {
 	case dashboardBootstrapCodePath:
 		h.handleBootstrapMint(w, r, requestID)
@@ -721,6 +732,62 @@ func assertMethod(method, allowed, path string, w http.ResponseWriter, requestID
 	return false
 }
 
+func isMutatingHTTPMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+// isAdmissionExemptMutationPath lists mutation routes that must stay available
+// before admission is ready (dashboard bootstrap) or are not work-producing.
+func isAdmissionExemptMutationPath(path string) bool {
+	switch path {
+	case dashboardBootstrapCodePath, dashboardBootstrapExchangePath:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) admissionMutationDenial() (apiError, bool) {
+	runtimeValue := h.context.Runtime
+	if runtimeValue == nil {
+		// Tests and embedders without a runtime keep prior open-admission behavior.
+		return apiError{}, false
+	}
+	gate, ok := any(runtimeValue).(interface{ AllowMutations() error })
+	if !ok {
+		return apiError{}, false
+	}
+	if err := gate.AllowMutations(); err != nil {
+		return apiError{
+			code:    pkgapi.ErrorCodeServiceUnavailable,
+			status:  http.StatusServiceUnavailable,
+			message: err.Error(),
+		}, true
+	}
+	return apiError{}, false
+}
+
+// admissionStateString projects the single admission Authority for status
+// surfaces. Missing/partial runtimes report "ready" so embedders and older
+// test doubles keep open-admission behavior (same as AllowMutations).
+func (h *Handler) admissionStateString() string {
+	runtimeValue := h.context.Runtime
+	if runtimeValue == nil {
+		return string(looperdruntime.AdmissionReady)
+	}
+	if typed, ok := any(runtimeValue).(interface {
+		AdmissionState() looperdruntime.AdmissionState
+	}); ok {
+		return string(typed.AdmissionState())
+	}
+	return string(looperdruntime.AdmissionReady)
+}
+
 func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 	if path == webhookForwardPath && cfg.Webhook.Enabled && isLoopbackRemoteAddr(r.RemoteAddr) {
 		if !hasForwardingProxyHeaders(r.Header) {
@@ -895,9 +962,12 @@ type statusService struct {
 	Version    string                `json:"version"`
 	Build      version.BuildMetadata `json:"build"`
 	DaemonMode config.DaemonMode     `json:"daemonMode"`
-	StartedAt  *string               `json:"startedAt,omitempty"`
-	Recovery   any                   `json:"recovery"`
-	Binary     statusBinary          `json:"binary"`
+	// AdmissionState is the single live admission Authority (ADR-0015 R1).
+	// HTTP mutations and scheduler claims open only when this is "ready".
+	AdmissionState string       `json:"admissionState"`
+	StartedAt      *string      `json:"startedAt,omitempty"`
+	Recovery       any          `json:"recovery"`
+	Binary         statusBinary `json:"binary"`
 }
 
 type statusBinary struct {
@@ -1471,12 +1541,13 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 
 	return statusResponse{
 		Service: statusService{
-			Healthy:    storageState.OK,
-			Version:    version.Current().Version,
-			Build:      version.Current().Metadata,
-			DaemonMode: h.context.Config.Daemon.Mode,
-			StartedAt:  h.startedAtISO(),
-			Recovery:   h.recoverySummary(),
+			Healthy:        storageState.OK,
+			Version:        version.Current().Version,
+			Build:          version.Current().Metadata,
+			DaemonMode:     h.context.Config.Daemon.Mode,
+			AdmissionState: h.admissionStateString(),
+			StartedAt:      h.startedAtISO(),
+			Recovery:       h.recoverySummary(),
 			Binary: statusBinary{
 				Name:             "looperd",
 				Path:             daemonExecutablePath(),
@@ -1709,10 +1780,11 @@ func normalizeRecoverySummary(summary looperdruntime.RecoverySummary) map[string
 	if summary.CompletedAt != "" {
 		normalized["completedAt"] = summary.CompletedAt
 	}
-	if summary.OrphanAgentCleanup.Attempted || summary.OrphanAgentCleanup.CleanedCount != 0 || summary.OrphanAgentCleanup.Warning != "" {
+	if summary.OrphanAgentCleanup.Attempted || summary.OrphanAgentCleanup.CleanedCount != 0 || summary.OrphanAgentCleanup.QuarantinedCount != 0 || summary.OrphanAgentCleanup.Warning != "" {
 		orphan := map[string]any{
-			"attempted":    summary.OrphanAgentCleanup.Attempted,
-			"cleanedCount": summary.OrphanAgentCleanup.CleanedCount,
+			"attempted":        summary.OrphanAgentCleanup.Attempted,
+			"cleanedCount":     summary.OrphanAgentCleanup.CleanedCount,
+			"quarantinedCount": summary.OrphanAgentCleanup.QuarantinedCount,
 		}
 		if summary.OrphanAgentCleanup.Warning != "" {
 			orphan["warning"] = summary.OrphanAgentCleanup.Warning
@@ -5604,7 +5676,9 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 	tokenMatches := expectedToken != "" && subtle.ConstantTimeCompare([]byte(presentedToken), []byte(expectedToken)) == 1
 
 	// Feishu URL-verification handshake: echo the challenge verbatim. When a token
-	// is configured, require it to match even for the handshake.
+	// is configured, require it to match even for the handshake. This path produces
+	// no work and must succeed while admission is starting/stopping/degraded so
+	// Feishu can register or revalidate the callback URL.
 	if envelope.Type == "url_verification" {
 		if expectedToken != "" && !tokenMatches {
 			h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeUnauthorized, status: http.StatusUnauthorized, message: "Feishu verification token mismatch"})
@@ -5612,6 +5686,11 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"challenge": envelope.Challenge})
+		return
+	}
+	// Real card actions and thread replies mutate HITL state; require admission.
+	if typed, denied := h.admissionMutationDenial(); denied {
+		h.writeError(w, requestID, typed)
 		return
 	}
 	if !h.context.Config.HITL.Enabled {
