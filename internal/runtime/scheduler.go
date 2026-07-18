@@ -2806,25 +2806,18 @@ func (a workerGitAdapter) Push(ctx context.Context, input worker.PushInput) erro
 
 type workerAgentExecutorAdapter struct {
 	executor *agent.ConfiguredExecutor
-	registry *ActiveExecutionRegistry
 }
 type workerAgentExecutionAdapter struct {
 	execution agent.Execution
 }
 
 func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.AgentRunInput) (worker.AgentExecution, error) {
+	// Ownership is acquired at the common executor boundary (AdmitSpawn +
+	// BindHandle), not via post-spawn role-adapter registration (#576 / not #572).
 	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
 	if err != nil {
 		return nil, err
 	}
-	unregister := func() {}
-	if a.registry != nil {
-		unregister = a.registry.Register(input.LoopID, input.RunID, input.ExecutionID, execution)
-	}
-	go func() {
-		_, _ = execution.Wait(context.Background())
-		unregister()
-	}()
 	return workerAgentExecutionAdapter{execution: execution}, nil
 }
 
@@ -3071,6 +3064,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Repos:  repos,
 		LogDir: cfg.Daemon.LogDir,
 		Now:    now,
+		// Common executor boundary ownership for every in-scope agent role
+		// (planner/reviewer/fixer/worker/coordinator) — not post-spawn adapters (#576).
+		Owner: activeExecutions,
 		// Live progress → Feishu anchor card. Vendor-agnostic (works off the agent
 		// subprocess's stdout tail). Only wired when the Feishu app-bot transport is
 		// configured; a no-op otherwise.
@@ -3227,7 +3223,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
 		},
 		Git:             workerGitAdapter{gateway: gitGateway, stamper: stamper},
-		AgentExecutor:   workerAgentExecutorAdapter{executor: agentExecutor, registry: activeExecutions},
+		AgentExecutor:   workerAgentExecutorAdapter{executor: agentExecutor},
 		Logger:          logger,
 		Now:             now,
 		AllowAutoCommit: cfg.Defaults.AllowAutoCommit,
@@ -3942,6 +3938,12 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 			}
 			continue
 		}
+
+		// Do not ClearLoopStop here. A claim can race with looper stop: pass the
+		// parked check while still running, then BeginLoopStop closes admission
+		// before launch. Unconditional clear would reopen the sticky gate for
+		// that pre-stop claim. Intentional re-activation (API unpause/retry/
+		// handback) is the authority that clears the gate.
 
 		process, err := schedulerQueueProcessor(item, input)
 		if err != nil {
