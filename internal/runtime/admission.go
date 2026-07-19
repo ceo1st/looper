@@ -18,10 +18,10 @@ import (
 // recovery is incomplete or shutdown has begun; recovery inventing cleanliness
 // from reusable PIDs without a single closed admission Authority.
 //
-// Costs / new edge cases: sticky degraded until restart/clear; startup window
+// Costs / new edge cases: sticky degraded until process restart; startup window
 // where reads work but all mutations and work-producing ticks no-op; shutdown
 // must BeginShutdown before storage close; every new work-producing path must
-// call AllowMutations/AllowClaim (easy to miss → #580 audit); more
+// call AllowMutations/AllowClaim (audited under #580); more
 // manual_intervention quarantine instead of aggressive auto-clean.
 //
 // Why simpler alternatives are insufficient: a boolean ready flag next to
@@ -34,10 +34,13 @@ import (
 //
 //	starting  → ready | stopping | degraded
 //	ready     → stopping | degraded
-//	degraded  → stopping          (sticky until restart/clear; no ready)
+//	degraded  → stopping          (sticky until process restart; no ready)
 //	stopping  → (none)            (terminal for this process lifetime)
 //
-// any → degraded is sticky until restart or an explicit ClearDegraded.
+// any → degraded is sticky until process restart. There is no ClearDegraded:
+// Runtime.MarkDegraded cancels producer contexts (scheduler, cleanup, webhook
+// execute), so reopening admission without restart would leave a ready-looking
+// daemon with permanently dead work producers.
 type AdmissionState string
 
 const (
@@ -104,7 +107,7 @@ func legalAdmissionTransition(from, to AdmissionState) bool {
 	case AdmissionReady:
 		return to == AdmissionStopping || to == AdmissionDegraded
 	case AdmissionDegraded:
-		// Sticky until restart/clear: only stopping (or explicit clear → ready).
+		// Sticky until process restart: only stopping is legal (no ready reopen).
 		return to == AdmissionStopping
 	case AdmissionStopping:
 		return false
@@ -159,25 +162,66 @@ func (a *Admission) BeginShutdown(reason string) error {
 	return nil
 }
 
-// MarkDegraded is sticky until restart or ClearDegraded.
+// MarkDegraded is sticky until process restart (degraded → ready is illegal).
+// Recovery is restart looperd; Runtime.MarkDegraded also cancels work producers.
 func (a *Admission) MarkDegraded(reason string) error {
 	return a.Transition(AdmissionDegraded, reason)
 }
 
-// ClearDegraded reopens admission after an operator/runtime-clear path
-// (restart is the normal path; this exists for tests and future clear hooks).
-func (a *Admission) ClearDegraded(reason string) error {
+// TransitionThen applies a legal state change and runs then while still holding
+// a.mu. Runtime.MarkDegraded / BeginShutdown use this so cancelWorkProducers
+// runs in the same critical section as the closed transition — there is no
+// window where admission is already closed but producer cancel has not run yet
+// (worktree cleanup could otherwise start git worktree remove after close).
+// then must not call back into Admission methods that take a.mu (would deadlock).
+func (a *Admission) TransitionThen(to AdmissionState, reason string, then func()) error {
 	if a == nil {
 		return ErrAdmissionStopping
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.state != AdmissionDegraded {
-		return fmt.Errorf("%w: clear degraded from %s", ErrAdmissionIllegalMove, a.state)
+	if !legalAdmissionTransition(a.state, to) {
+		return fmt.Errorf("%w: %s → %s", ErrAdmissionIllegalMove, a.state, to)
 	}
-	a.state = AdmissionReady
+	a.state = to
 	if reason != "" {
 		a.reason = reason
+	}
+	if then != nil {
+		then()
+	}
+	return nil
+}
+
+// BeginShutdownThen is BeginShutdown plus a then callback still holding a.mu
+// after the stopping transition (or when already stopping).
+func (a *Admission) BeginShutdownThen(reason string, then func()) error {
+	if a == nil {
+		if then != nil {
+			then()
+		}
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.state == AdmissionStopping {
+		if reason != "" {
+			a.reason = reason
+		}
+		if then != nil {
+			then()
+		}
+		return nil
+	}
+	if !legalAdmissionTransition(a.state, AdmissionStopping) {
+		return fmt.Errorf("%w: %s → %s", ErrAdmissionIllegalMove, a.state, AdmissionStopping)
+	}
+	a.state = AdmissionStopping
+	if reason != "" {
+		a.reason = reason
+	}
+	if then != nil {
+		then()
 	}
 	return nil
 }
@@ -195,12 +239,36 @@ func (a *Admission) AllowClaim() error {
 	return a.allowWork()
 }
 
+// WithAllowWork runs fn only when admission currently allows work, holding the
+// same mutex as AllowMutations/AllowClaim for the full duration of fn. Use this
+// for check-then-act sections (e.g. webhook accept + enqueue) so MarkDegraded
+// and BeginShutdown cannot interleave between the gate and the mutation.
+// fn must not call back into Admission methods that take a.mu (would deadlock).
+func (a *Admission) WithAllowWork(fn func()) error {
+	if a == nil {
+		return ErrAdmissionStopping
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.allowWorkLocked(); err != nil {
+		return err
+	}
+	if fn != nil {
+		fn()
+	}
+	return nil
+}
+
 func (a *Admission) allowWork() error {
 	if a == nil {
 		return ErrAdmissionStopping
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.allowWorkLocked()
+}
+
+func (a *Admission) allowWorkLocked() error {
 	switch a.state {
 	case AdmissionReady:
 		return nil

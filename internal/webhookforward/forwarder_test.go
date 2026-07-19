@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,9 +17,8 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-// Contract: Forward may accept while admission is open; worker discovery must
-// still refuse when AllowExecute closes before executeWithRetry runs.
-func TestWorkerSkipsDiscoveryWhenAllowExecuteRefuses(t *testing.T) {
+// Contract (#580): Forward refuses accept-time enqueue when admission is already closed.
+func TestForwardRefusesWhenAllowExecuteClosedAtAccept(t *testing.T) {
 	repos := newTestRepositories(t)
 	seedProject(t, repos, "project_1", "acme/looper")
 	reviewerRunner := newFakeTargetedRunner(nil)
@@ -38,6 +38,52 @@ func TestWorkerSkipsDiscoveryWhenAllowExecuteRefuses(t *testing.T) {
 	})
 	defer forwarder.Close()
 
+	_, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-closed-accept",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 99),
+	})
+	if err == nil || !errors.Is(err, ErrAdmissionRefused) || !strings.Contains(err.Error(), "admission is stopping") {
+		t.Fatalf("Forward() error = %v, want ErrAdmissionRefused wrapping admission refusal", err)
+	}
+	if executeCalls.Load() == 0 {
+		t.Fatal("AllowExecute was not consulted at Forward accept time")
+	}
+	stats := forwarder.Stats()
+	if stats.DeliveriesAccepted != 0 || stats.QueueEnqueued != 0 {
+		t.Fatalf("stats = %#v, want no accept/enqueue while admission closed", stats)
+	}
+	reviewerRunner.assertCallCount(t, 0)
+	fixerRunner.assertCallCount(t, 0)
+}
+
+// Contract (#592 review): Forward may accept while admission is open; once
+// accepted/202, worker discovery must still complete even if AllowExecute later
+// refuses. Post-accept admission recheck would drop work GitHub will not retry.
+func TestWorkerCompletesDiscoveryWhenAdmissionClosesAfterAccept(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+	var executeCalls atomic.Int64
+	forwarder := New(Options{
+		Repos:         repos,
+		Config:        testConfig(t),
+		Reviewer:      reviewerRunner,
+		Fixer:         targetedFixerAdapter{runner: fixerRunner},
+		MaxConcurrent: 1,
+		QueueCapacity: 8,
+		AllowExecute: func() error {
+			// Accept-time calls succeed; any later worker recheck would refuse
+			// (and must not be consulted after accepted/202).
+			if executeCalls.Add(1) <= 2 {
+				return nil
+			}
+			return errors.New("daemon admission is degraded")
+		},
+	})
+	defer forwarder.Close()
+
 	result, err := forwarder.Forward(context.Background(), DeliveryRequest{
 		DeliveryID: "admission-closed-exec",
 		EventType:  "pull_request",
@@ -53,23 +99,224 @@ func TestWorkerSkipsDiscoveryWhenAllowExecuteRefuses(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		stats := forwarder.Stats()
-		if stats.ExecutionsFailed >= 1 && stats.InFlight == 0 && stats.Queued == 0 {
+		if stats.ExecutionsSucceeded >= 1 && stats.InFlight == 0 && stats.Queued == 0 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	stats := forwarder.Stats()
-	if stats.ExecutionsFailed < 1 {
-		t.Fatalf("ExecutionsFailed = %d, want >= 1 after admission refuse", stats.ExecutionsFailed)
+	if stats.ExecutionsSucceeded < 1 {
+		t.Fatalf("ExecutionsSucceeded = %d, want >= 1 after post-accept admission close", stats.ExecutionsSucceeded)
 	}
-	if executeCalls.Load() == 0 {
-		t.Fatal("AllowExecute was not consulted at worker discovery time")
+	if stats.ExecutionsFailed != 0 {
+		t.Fatalf("ExecutionsFailed = %d, want 0 when accepted work still discovers", stats.ExecutionsFailed)
+	}
+	// Only accept-time AllowExecute calls (pre-lock + under-lock fallback path).
+	if executeCalls.Load() != 2 {
+		t.Fatalf("AllowExecute calls = %d, want 2 (accept only; no worker recheck)", executeCalls.Load())
+	}
+	reviewerRunner.assertCallCount(t, 1)
+	fixerRunner.assertCallCount(t, 1)
+}
+
+// Contract (#580 review): admission closed after the pre-lock allowExecute pass
+// but before enqueue must refuse with ErrAdmissionRefused (503), not accept (202).
+func TestForwardRefusesWhenAllowExecuteClosesBeforeEnqueue(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+	var executeCalls atomic.Int64
+	forwarder := New(Options{
+		Repos:         repos,
+		Config:        testConfig(t),
+		Reviewer:      reviewerRunner,
+		Fixer:         targetedFixerAdapter{runner: fixerRunner},
+		MaxConcurrent: 1,
+		QueueCapacity: 8,
+		AllowExecute: func() error {
+			// Pre-lock pass succeeds; under-enqueue-lock recheck refuses.
+			if executeCalls.Add(1) == 1 {
+				return nil
+			}
+			return errors.New("daemon admission is degraded")
+		},
+	})
+	defer forwarder.Close()
+
+	_, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-race-enqueue",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 99),
+	})
+	if err == nil || !errors.Is(err, ErrAdmissionRefused) || !strings.Contains(err.Error(), "degraded") {
+		t.Fatalf("Forward() error = %v, want ErrAdmissionRefused wrapping degraded", err)
+	}
+	if executeCalls.Load() < 2 {
+		t.Fatalf("AllowExecute calls = %d, want >= 2 (pre-lock + under-lock recheck)", executeCalls.Load())
+	}
+	stats := forwarder.Stats()
+	if stats.DeliveriesAccepted != 0 || stats.QueueEnqueued != 0 {
+		t.Fatalf("stats = %#v, want no accept/enqueue after under-lock admission refuse", stats)
 	}
 	reviewerRunner.assertCallCount(t, 0)
 	fixerRunner.assertCallCount(t, 0)
-	if stats.ExecutionsSucceeded != 0 {
-		t.Fatalf("ExecutionsSucceeded = %d, want 0 when admission refuses discovery", stats.ExecutionsSucceeded)
+}
+
+// Contract (#580/#592 review): AllowExecuteWhile must hold admission across
+// enqueue AND delivery bookkeeping so MarkDegraded cannot interleave between
+// the gate and the accepted-delivery record (202 without a retryable record).
+// A concurrent closer blocked on the same mutex cannot flip state mid-section.
+func TestForwardAllowExecuteWhileHoldsAdmissionAcrossEnqueue(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+
+	var mu sync.Mutex
+	ready := true
+	var whileEntered atomic.Bool
+	// Unbuffered handoff: close(started) is observed by the concurrent closer
+	// only after AllowExecuteWhile holds mu. Do not use select+default on a
+	// send — under CI load the receiver may not be scheduled yet and the
+	// signal is lost, leaving degradeDone forever open (CI flake).
+	started := make(chan struct{})
+	degradeDone := make(chan struct{})
+
+	forwarder := New(Options{
+		Repos:         repos,
+		Config:        testConfig(t),
+		Reviewer:      reviewerRunner,
+		Fixer:         targetedFixerAdapter{runner: fixerRunner},
+		MaxConcurrent: 1,
+		QueueCapacity: 8,
+		AllowExecute:  func() error { return nil },
+		AllowExecuteWhile: func(fn func()) error {
+			mu.Lock()
+			defer mu.Unlock()
+			if !ready {
+				return errors.New("daemon admission is degraded")
+			}
+			whileEntered.Store(true)
+			// Concurrent MarkDegraded must block on mu until fn returns
+			// (including delivery bookkeeping written inside fn).
+			close(started)
+			select {
+			case <-degradeDone:
+				t.Error("admission flipped to not-ready while AllowExecuteWhile held the mutex")
+			case <-time.After(30 * time.Millisecond):
+			}
+			fn()
+			if !ready {
+				t.Error("admission flipped to not-ready while AllowExecuteWhile held the mutex")
+			}
+			return nil
+		},
+	})
+	defer forwarder.Close()
+
+	go func() {
+		<-started
+		mu.Lock()
+		ready = false
+		mu.Unlock()
+		close(degradeDone)
+	}()
+
+	result, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-while-atomic",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 99),
+	})
+	if err != nil {
+		t.Fatalf("Forward() error = %v, want accept under held admission", err)
 	}
+	if result.Status != "accepted" || result.WorkItems != 1 {
+		t.Fatalf("Forward() = %#v, want accepted with work under held admission", result)
+	}
+	if !whileEntered.Load() {
+		t.Fatal("AllowExecuteWhile was not used for accept-time enqueue")
+	}
+	// Accepted outcome implies delivery bookkeeping completed inside While fn
+	// (recordAcceptedLocked runs before AllowExecuteWhile returns).
+	stats := forwarder.Stats()
+	if stats.DeliveriesAccepted != 1 {
+		t.Fatalf("DeliveriesAccepted = %d, want 1 after atomic accept record", stats.DeliveriesAccepted)
+	}
+	// Duplicate of the same delivery must be observed as deduped (record written).
+	dup, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-while-atomic",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 99),
+	})
+	// After concurrent degrade flipped ready=false, further While calls refuse.
+	// Dedup is checked before AllowExecuteWhile, so this still returns duplicate
+	// when the delivery was recorded inside the first While hold.
+	if err != nil {
+		// If degrade flipped the pre-lock AllowExecute path... we only set While.
+		// Pre-lock AllowExecute is always nil-error here; While refuses new IDs.
+		// Same delivery ID hits dedup before While.
+		t.Fatalf("duplicate Forward() error = %v, want deduped success after recorded accept", err)
+	}
+	if dup.Status != "duplicate" {
+		t.Fatalf("duplicate Forward() = %#v, want duplicate after accept recorded under hold", dup)
+	}
+	select {
+	case <-degradeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent degrade did not complete after AllowExecuteWhile released")
+	}
+	// After release, further accepts must refuse.
+	_, err = forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-while-after-degrade",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 100),
+	})
+	if err == nil || !errors.Is(err, ErrAdmissionRefused) {
+		t.Fatalf("Forward() after degrade error = %v, want ErrAdmissionRefused", err)
+	}
+}
+
+// Contract: AllowExecuteWhile refusal at accept refuses with ErrAdmissionRefused
+// without enqueueing (503 path), even when pre-lock AllowExecute still passes.
+func TestForwardRefusesWhenAllowExecuteWhileRefuses(t *testing.T) {
+	repos := newTestRepositories(t)
+	seedProject(t, repos, "project_1", "acme/looper")
+	reviewerRunner := newFakeTargetedRunner(nil)
+	fixerRunner := newFakeTargetedRunner(nil)
+	var whileCalls atomic.Int64
+	forwarder := New(Options{
+		Repos:         repos,
+		Config:        testConfig(t),
+		Reviewer:      reviewerRunner,
+		Fixer:         targetedFixerAdapter{runner: fixerRunner},
+		MaxConcurrent: 1,
+		QueueCapacity: 8,
+		AllowExecute:  func() error { return nil },
+		AllowExecuteWhile: func(fn func()) error {
+			whileCalls.Add(1)
+			return errors.New("daemon admission is degraded")
+		},
+	})
+	defer forwarder.Close()
+
+	_, err := forwarder.Forward(context.Background(), DeliveryRequest{
+		DeliveryID: "admission-while-refuse",
+		EventType:  "pull_request",
+		Payload:    pullRequestPayload("opened", "acme/looper", 99),
+	})
+	if err == nil || !errors.Is(err, ErrAdmissionRefused) || !strings.Contains(err.Error(), "degraded") {
+		t.Fatalf("Forward() error = %v, want ErrAdmissionRefused wrapping degraded", err)
+	}
+	if whileCalls.Load() != 1 {
+		t.Fatalf("AllowExecuteWhile calls = %d, want 1", whileCalls.Load())
+	}
+	stats := forwarder.Stats()
+	if stats.DeliveriesAccepted != 0 || stats.QueueEnqueued != 0 {
+		t.Fatalf("stats = %#v, want no accept/enqueue when While refuses", stats)
+	}
+	reviewerRunner.assertCallCount(t, 0)
+	fixerRunner.assertCallCount(t, 0)
 }
 
 // Contract: CancelExecute aborts in-flight discovery that already passed

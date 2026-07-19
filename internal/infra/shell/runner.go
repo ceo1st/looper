@@ -50,6 +50,13 @@ type Options struct {
 	// Set only for Supervisor-owned paths (worker/fixer validation). Leave nil
 	// for independently lifecycle-owned gateways (git/gh/tea, osascript).
 	Tracker processcontainment.LiveTracker
+	// StartGate, when set, wraps each cmd.Start attempt so callers can hold
+	// an external critical section (e.g. admission.mu) across process Start
+	// only. Retry waits and Wait/Drain stay outside the gate so long-running
+	// commands do not block concurrent close/cancel. The gate must call start
+	// at most once per invocation; if it returns without calling start, Run
+	// treats that as a refused start (no process launched).
+	StartGate func(start func() error) error
 }
 
 type CommandExecutionError struct {
@@ -270,7 +277,17 @@ func processPIDGone(pid int) bool {
 func startContainedCommand(ctx context.Context, options Options, gracefulShutdown time.Duration, stdout, stderr *boundedBuffer) (*processcontainment.Handle, error) {
 	var lastErr error
 	for attempt := 0; attempt < startAttempts; attempt++ {
+		// Honor cancel before Start so producers that closed admission and
+		// canceled the work context cannot launch a new process (e.g. git
+		// worktree remove) after close — Wait-only cancel cannot undo Start.
+		// When StartGate is set, the gate rechecks under its critical section
+		// immediately around Start (admission hold); this is the fast path.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if attempt > 0 {
+			// Retry wait is outside StartGate so admission close can proceed
+			// between ETXTBSY attempts without waiting on the backoff timer.
 			wait := startRetryBaseWait * time.Duration(attempt)
 			timer := time.NewTimer(wait)
 			select {
@@ -297,7 +314,14 @@ func startContainedCommand(ctx context.Context, options Options, gracefulShutdow
 		cmd.Stderr = stderr
 		processcontainment.Configure(cmd)
 
-		if err := cmd.Start(); err != nil {
+		start := func() error { return cmd.Start() }
+		var err error
+		if options.StartGate != nil {
+			err = options.StartGate(start)
+		} else {
+			err = start()
+		}
+		if err != nil {
 			lastErr = err
 			if isTextFileBusy(err) {
 				continue

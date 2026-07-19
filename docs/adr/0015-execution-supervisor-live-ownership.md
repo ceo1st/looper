@@ -79,7 +79,7 @@ reused PID/PGID; dual ready flags that disagree with admission.
 
 **Costs:** one in-memory Supervisor lifecycle; explicit lease release; serialized
 per-execution persistence; platform-specific containment adapters; sticky
-`degraded` until restart/clear; more quarantine / manual-intervention during
+`degraded` until process restart; more quarantine / manual-intervention during
 uncertain recovery instead of aggressive auto-clean.
 
 **Why simpler alternatives are insufficient:**
@@ -121,7 +121,7 @@ to a slice while any open blocker remains.
 | R4 | #577 | Migrate remaining Supervisor-owned non-agent subprocesses | Validation/shell and other in-scope non-agents on containment; no raw PID fallback inside Supervisor domain; shutdown order tested | **Enforced** |
 | R5 | #578 | Execution persistence Authority + degrade on mid-life failure | Ordered writer; terminal immutability; hard persist failure degrades; no terminal status before confirmed dead | **Enforced** |
 | R6 | #579 | Operation lease owns queue claims until durable finalize | No live `running` claim without lease; release only after durable finalize; finalize failure retains ownership + degrades | **Enforced** |
-| R7 | #580 | Full non-mutating coverage when not-ready or degraded | Exhaustive mutation surface audit; scheduler pause; HTTP 503; no dual ready Authority | **Deferred** |
+| R7 | #580 | Full non-mutating coverage when not-ready or degraded | Exhaustive mutation surface audit; scheduler pause; HTTP 503; no dual ready Authority | **Enforced** |
 | R8 | #581 | Conservative startup recovery without PID Authority | confirmed dead / observed live / uncertain; uncertain cannot act; PID is evidence only | **Deferred** |
 
 Update the **Enforcement** column as each issue closes (move the slice from
@@ -133,10 +133,11 @@ in-scope items and full-program exit criteria hold.
 Authoritative live states: `starting | ready | stopping | degraded`.
 
 - Transitions are monotonic / legal only (e.g. `starting→ready`, `ready→stopping`,
-  sticky `degraded` until restart/clear). Documented in `internal/runtime/admission.go`.
+  sticky `degraded` until process restart). Documented in `internal/runtime/admission.go`.
 - HTTP mutation readiness and the work-producing **scheduler tick** (discovery,
   HITL, claims, stale-reconcile) are **projections** of this state, not a second
-  Authority. Exhaustive non-claim mutation surface audit remains #580.
+  Authority. Exhaustive non-claim mutation surface audit is enforced by #580
+  (see “Full non-mutating coverage” below).
 - Admission decisions must be atomic with the action they gate (single `Admission`
   mutex; no dual ready flag that can disagree).
 
@@ -230,7 +231,7 @@ handles (`Drain` when needed after leader `Wait`).
 
 1. Inspect daemon logs for `daemon admission degraded after agent execution persistence failure` and the underlying storage error.
 2. Repair storage (disk space, permissions, SQLite integrity) under the configured runtime path (default `~/.looper/`).
-3. **Restart `looperd`** — the normal recovery path. Admission is sticky degraded until process restart (or an explicit `ClearDegraded` test/operator hook).
+3. **Restart `looperd`** — the only recovery path. Admission is sticky degraded until process restart; there is no in-process clear. `MarkDegraded` cancels work-producer contexts (scheduler, cleanup, recovery) but leaves webhook execute live so already-accepted/202 deliveries can still finish discovery; reopening admission without restart would leave a ready-looking daemon with dead scheduler/cleanup producers.
 4. After restart, startup recovery classifies durable observations conservatively (#581); do not manually requeue uncertain work.
 
 **Persistence concept trade-off (R5):**
@@ -238,7 +239,7 @@ handles (`Drain` when needed after leader `Wait`).
 | | |
 |--|--|
 | **Failure prevented** | Stale live writers regressing terminal rows; silent upsert “success” when zero rows changed; split-brain observations while admission keeps accepting work; terminal status before containment confirmed dead. |
-| **Costs** | Sticky degrade stops new work until restart/clear; terminal conflict means first terminal wins even if a later writer had richer fields; per-execution serialization; hard fail paths kill on initial persist failure. |
+| **Costs** | Sticky degrade stops new work until process restart; terminal conflict means first terminal wins even if a later writer had richer fields; per-execution serialization; hard fail paths kill on initial persist failure. |
 | **Why not simpler** | Trusting raw Upsert success leaves #579 release able to free claims on silent no-op writes. Global writer queues add complexity without fixing per-execution ordering. Soft-degrade on cancel creates sticky noise without recovery signal. |
 | **Deletion attempt** | Remove mid-life heartbeat persistence and keep only terminal — insufficient for operator progress and native-session capture while live. |
 
@@ -273,6 +274,44 @@ record; the lease is in-memory Supervisor Authority for the live daemon only.
 | **Why not simpler** | Compensating “reservation” flags and growing claim state machines reintroduce dual Authority. Trusting runner return alone leaves stranded `running` under a released lease. Releasing before verified durable finalize reopens the unowned-claim window #578 was ordered to close first. |
 | **Deletion attempt** | Drop lease and trust process handles only — fails for the claim-before-process interval and for roles that finalize without a live agent handle. |
 
+### Full non-mutating coverage when not-ready or degraded (enforced by #580)
+
+R1 landed the admission Authority and known HTTP/claim gates. After producer
+cutover (#576–#579), R7 completes the **exhaustive mutation-surface audit** so
+HTTP cannot be gated while the scheduler still discovers/enqueues (the dangerous
+mid-state named in #580).
+
+**Authority (no dual ready):** `Admission` is the only readiness Authority.
+`AllowMutations` (HTTP + tunnel accept) and `AllowClaim` (scheduler tick,
+durable claims, spawn leases, worktree cleanup, webhook **accept**) are
+projections under the same mutex. Already-accepted webhook worker discovery is
+a post-202 commitment and is not re-gated. `ownershipAcquired` is **not** a gate.
+
+**Mutation surface matrix (not-ready / degraded / stopping):**
+
+| Surface | Gate | Closed behavior |
+|---------|------|-----------------|
+| HTTP mutating methods (`POST`/`PUT`/`PATCH`/`DELETE` under `/api/v1/*`, `/webhook/forward`) | `Handler` → `AllowMutations` | Explicit **503** `SERVICE_UNAVAILABLE` (not silent no-op). Bootstrap mint/exchange exempt. Feishu `url_verification` handshake exempt; card actions gated. |
+| Read-only HTTP (`GET` health/status/config/lists/…) | none (reads always allowed) | Available in starting / ready / stopping / degraded |
+| Scheduler full tick (planner/coordinator/reviewer/fixer/worker discovery, HITL polls, claim phases, stale-reconcile) | `AllowClaim` at tick entry + mid-tick rechecks per project/lane; `MarkDegraded`/`BeginShutdown` cancel scheduler context | Entire work-producing tick no-ops (prefer pause over “read-only discovery”); in-flight ticks observe cancel |
+| Durable `ClaimNext*` / operation-lease admit | `AllowClaim` immediately before each claim | No new claims |
+| Agent spawn leases | registry `allowSpawn` → `AllowClaim` | No new agent starts |
+| Webhook tunnel deliveries | `allowForward` → `AllowMutations` before Forward | **503** |
+| Webhook forwarder accept + worker discovery | `AllowExecute` / `AllowExecuteWhile` at **accept only** (same claim projection); `BeginShutdown`/`Stop` call `CancelExecute`; sticky `MarkDegraded` does **not** cancel accepted discovery | New accepts refuse (**503**); already-accepted/202 queue still completes `CreateOrGetActiveByDedupe` after degrade (no GitHub retry for 202); process-exit aborts in-flight discovery |
+| Worktree cleanup pass | `AllowClaim` before pass | No filesystem/DB cleanup mutations while closed |
+| Config file hot-reload loop | not gated (policy Authority ADR-0014) | May refresh hot-safe fields; work-producing side effects still hit scheduler/HTTP gates |
+| Deferred reviewer recovery requeue | `AllowClaim` before requeue; `MarkDegraded`/`BeginShutdown` cancel recovery context | No requeue after close |
+| Shutdown order | `daemonRuntime.Stop`: `BeginShutdown` → HTTP `Server.Stop` drain → `Runtime.Stop` | Aligns with #577: admission → ingress → producers → handles; retain storage / fail loud on incomplete drain |
+
+**Non-mutating coverage concept trade-off (R7):**
+
+| | |
+|--|--|
+| **Failure prevented** | Partial #575: HTTP 503 while scheduler still discovers/enqueues; webhook Forward queueing work after admission closed; cleanup/spawn paths acting during degraded. |
+| **Costs** | Every new work-producing path must call `AllowMutations`/`AllowClaim`; sticky degraded refuses operator mutations until process restart; cleanup and discovery pause during starting. |
+| **Why not simpler** | Gating only HTTP leaves producer cutover paths free. Gating only claims leaves discovery/HITL free. Silent no-op HTTP hides unavailability from operators/CLI. |
+| **Deletion attempt** | Remove per-surface gates and trust scheduler pause alone — insufficient for tunnel/HTTP/webhook worker and for direct service entrypoints after producer migration. |
+
 ### Shutdown order (enforced by #575 admission close + #577 drain/retain)
 
 Drain **admission → ingress → producers → handles/finalizers** before SQLite
@@ -283,7 +322,9 @@ error (agents **and** tracked Supervisor-owned non-agent handles); late
 `ReportDrainFailure` from shell/trusted-review cancel paths is re-collected
 after producer waits. `StorageRetained()` is the operator-visible signal.
 Independent infra (webhook forwarder, network manager) still stop — they are
-not Supervisor domain.
+not Supervisor domain. Daemon stop order is also `BeginShutdown` → HTTP ingress
+`Server.Stop` → `Runtime.Stop` so in-flight mutations drain or fail-loud before
+storage close (#580 aligns with #577).
 
 ### Non-agent Supervisor-owned producers (enforced by #577)
 

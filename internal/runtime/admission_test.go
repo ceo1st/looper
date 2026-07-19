@@ -3,6 +3,7 @@ package runtime
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestAdmissionLegalTransitions(t *testing.T) {
@@ -43,15 +44,15 @@ func TestAdmissionLegalTransitions(t *testing.T) {
 	if err := a.AllowMutations(); !errors.Is(err, ErrAdmissionDegraded) {
 		t.Fatalf("AllowMutations() while degraded = %v, want ErrAdmissionDegraded", err)
 	}
-	// degraded is sticky: cannot go back to ready via Transition.
+	// degraded is sticky until process restart: cannot go back to ready.
 	if err := a.Transition(AdmissionReady, "nope"); !errors.Is(err, ErrAdmissionIllegalMove) {
 		t.Fatalf("Transition(ready) from degraded = %v, want illegal", err)
 	}
-	if err := a.ClearDegraded("operator clear"); err != nil {
-		t.Fatalf("ClearDegraded() error = %v", err)
+	if err := a.MarkReady("no clear path"); !errors.Is(err, ErrAdmissionIllegalMove) {
+		t.Fatalf("MarkReady() from degraded = %v, want illegal (restart-only recovery)", err)
 	}
-	if err := a.AllowClaim(); err != nil {
-		t.Fatalf("AllowClaim() after clear = %v, want nil", err)
+	if err := a.AllowClaim(); !errors.Is(err, ErrAdmissionDegraded) {
+		t.Fatalf("AllowClaim() while degraded = %v, want ErrAdmissionDegraded", err)
 	}
 
 	if err := a.BeginShutdown("signal"); err != nil {
@@ -87,6 +88,105 @@ func TestAdmissionStartingToDegradedAndStopping(t *testing.T) {
 	}
 	if got := b.State(); got != AdmissionStopping {
 		t.Fatalf("State() = %q, want stopping", got)
+	}
+}
+
+// Contract (#592 review): TransitionThen holds a.mu across the state change and
+// then callback so cancelWorkProducers can run with no closed-before-cancel window.
+func TestAdmissionTransitionThenRunsCallbackUnderLock(t *testing.T) {
+	t.Parallel()
+
+	a := NewAdmission()
+	if err := a.MarkReady("ready"); err != nil {
+		t.Fatalf("MarkReady() error = %v", err)
+	}
+
+	started := make(chan struct{})
+	allowDone := make(chan error, 1)
+	thenEntered := make(chan struct{})
+
+	go func() {
+		<-started
+		// Concurrent WithAllowWork must block until TransitionThen releases a.mu
+		// (including after then returns).
+		allowDone <- a.WithAllowWork(func() {})
+	}()
+
+	err := a.TransitionThen(AdmissionDegraded, "atomic cancel", func() {
+		close(thenEntered)
+		close(started)
+		select {
+		case err := <-allowDone:
+			t.Errorf("WithAllowWork completed while TransitionThen held admission: %v", err)
+		case <-time.After(30 * time.Millisecond):
+		}
+	})
+	if err != nil {
+		t.Fatalf("TransitionThen() error = %v", err)
+	}
+	select {
+	case <-thenEntered:
+	default:
+		t.Fatal("TransitionThen did not run then callback")
+	}
+	select {
+	case err := <-allowDone:
+		if !errors.Is(err, ErrAdmissionDegraded) {
+			t.Fatalf("WithAllowWork() after TransitionThen = %v, want ErrAdmissionDegraded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WithAllowWork did not complete after TransitionThen released")
+	}
+	if got := a.State(); got != AdmissionDegraded {
+		t.Fatalf("State() = %q, want degraded", got)
+	}
+}
+
+// Contract: WithAllowWork holds admission.mu across fn so MarkDegraded cannot
+// interleave between the allow check and the critical section body.
+func TestAdmissionWithAllowWorkHoldsMutexAcrossFn(t *testing.T) {
+	t.Parallel()
+
+	a := NewAdmission()
+	if err := a.MarkReady("ready"); err != nil {
+		t.Fatalf("MarkReady() error = %v", err)
+	}
+
+	started := make(chan struct{})
+	degradeDone := make(chan error, 1)
+
+	go func() {
+		<-started
+		degradeDone <- a.MarkDegraded("concurrent degrade")
+	}()
+
+	err := a.WithAllowWork(func() {
+		close(started)
+		// MarkDegraded must block until we leave WithAllowWork.
+		select {
+		case err := <-degradeDone:
+			t.Errorf("MarkDegraded completed while WithAllowWork held admission: %v", err)
+		case <-time.After(30 * time.Millisecond):
+		}
+	})
+	if err != nil {
+		t.Fatalf("WithAllowWork() error = %v", err)
+	}
+	select {
+	case err := <-degradeDone:
+		if err != nil {
+			t.Fatalf("MarkDegraded() after release error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("MarkDegraded did not complete after WithAllowWork released")
+	}
+	if got := a.State(); got != AdmissionDegraded {
+		t.Fatalf("State() after concurrent MarkDegraded = %q, want degraded", got)
+	}
+	if err := a.WithAllowWork(func() {
+		t.Error("fn must not run when admission is degraded")
+	}); !errors.Is(err, ErrAdmissionDegraded) {
+		t.Fatalf("WithAllowWork() while degraded = %v, want ErrAdmissionDegraded", err)
 	}
 }
 
