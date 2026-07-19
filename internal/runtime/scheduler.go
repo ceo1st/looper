@@ -92,7 +92,11 @@ type defaultSchedulerTickInput struct {
 	// AllowClaim, when set, is the admission projection for all work-producing
 	// scheduler activity: the full default tick (discovery, HITL, claims,
 	// stale-reconcile) and each durable ClaimNext*. Nil means ungated (tests).
-	AllowClaim               func() error
+	AllowClaim func() error
+	// OperationOwner, when set, admits a Supervisor operation lease before each
+	// durable ClaimNext* and holds it until durable complete/cancel/requeue
+	// (ADR-0015 R6 / #579). Nil means ungated claim ownership (unit tests).
+	OperationOwner           *ActiveExecutionRegistry
 	ReconcileStaleRuns       func(context.Context) (StaleRunReconcileSummary, error)
 	AsyncRunner              schedulerAsyncRunner
 	RequestSchedulerWake     func()
@@ -2970,6 +2974,13 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	attachClaimGate := func(input defaultSchedulerTickInput, services Services) defaultSchedulerTickInput {
 		input.ClaimBoundary = claimBoundary
 		input.AllowClaim = allowClaim
+		// Wire Supervisor operation leases for claim ownership span (#579).
+		// Prefer the live registry from Services when present (daemon path).
+		if services.ActiveExecutions != nil {
+			input.OperationOwner = services.ActiveExecutions
+		} else if activeExecutions != nil {
+			input.OperationOwner = activeExecutions
+		}
 		input.RefreshForClaim = func() defaultSchedulerTickInput {
 			latestSnapshot := handlers.snapshot()
 			if latestSnapshot.input == nil {
@@ -2977,11 +2988,21 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 				stopped.MaxConcurrentRuns = 0
 				stopped.RefreshForClaim = nil
 				stopped.AllowClaim = allowClaim
+				if services.ActiveExecutions != nil {
+					stopped.OperationOwner = services.ActiveExecutions
+				} else if activeExecutions != nil {
+					stopped.OperationOwner = activeExecutions
+				}
 				return stopped
 			}
 			latest := latestSnapshot.input(services)
 			latest.ClaimBoundary = claimBoundary
 			latest.AllowClaim = allowClaim
+			if services.ActiveExecutions != nil {
+				latest.OperationOwner = services.ActiveExecutions
+			} else if activeExecutions != nil {
+				latest.OperationOwner = activeExecutions
+			}
 			return latest
 		}
 		return input
@@ -4030,6 +4051,19 @@ func schedulerAvailableSlots(ctx context.Context, repos *storage.Repositories, m
 	return available, nil
 }
 
+// ownedQueueClaim is one durable running claim held under a Supervisor
+// operation lease until durable finalize (#579).
+type ownedQueueClaim struct {
+	item   storage.QueueItemRecord
+	lease  OperationLease
+	permit OperationPermit
+}
+
+// testAfterClaimHook, when set by tests, rewrites ClaimNext* results so the
+// ambiguous cancel path (durable claim committed, error returned) can be
+// exercised without racing SQLite QueryRowContext cancellation.
+var testAfterClaimHook func(item *storage.QueueItemRecord, err error) (*storage.QueueItemRecord, error)
+
 // allowedQueueTypesFromRunners returns queue item types that have a non-nil
 // runner processor. Prefer claimTypeSetsFromInput for claim filtering: that
 // path further splits live-configured roles from sticky-snapshot-only roles.
@@ -4096,6 +4130,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		now = time.Now
 	}
 	nowISO := formatJavaScriptISOString(now().UTC())
+	owned := make([]ownedQueueClaim, 0, availableSlots)
 	queueItems := make([]storage.QueueItemRecord, 0, availableSlots)
 	// Recheck admission at each durable claim so BeginShutdown cannot race past
 	// an earlier pump-level AllowClaim and still ClaimNext under scheduler locks.
@@ -4106,74 +4141,331 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	// context mid-batch: stop further ClaimNext*, but still dispatch already
 	// durable claims (do not return the non-empty claimed slice with ctx.Err
 	// before runScheduledQueueItems).
+	//
+	// When OperationOwner is set (#579): AdmitOperation before each ClaimNext*,
+	// BindClaim after success (explicit permit), Release immediately on miss/
+	// error, and never start a processor without a valid permit.
 	admitClaim := func() error {
 		if input.AllowClaim == nil {
 			return nil
 		}
 		return input.AllowClaim()
 	}
-	stopClaiming := false
-	for i := 0; i < availableSlots; i++ {
+	// claimOne result: empty means this lane has no more candidates (try next
+	// lane); stop means halt all further ClaimNext*; err is a hard claim failure.
+	const (
+		claimContinue = iota
+		claimEmpty
+		claimStop
+	)
+	claimOne := func(claimFn func(context.Context, string, string) (*storage.QueueItemRecord, error)) (result int, claimErr error) {
 		if err := ctx.Err(); err != nil {
-			// Match admission mid-batch: stop claiming, fall through to dispatch.
-			break
+			return claimStop, nil
 		}
 		if err := admitClaim(); err != nil {
-			stopClaiming = true
-			break
+			return claimStop, nil
 		}
-		item, err := input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSets(ctx, nowISO, "scheduler", unrestrictedTypes, stickySnapshotTypes)
+		var lease OperationLease
+		if input.OperationOwner != nil {
+			var admitErr error
+			lease, admitErr = input.OperationOwner.AdmitOperation(ctx, OperationMeta{ClaimedBy: "scheduler"})
+			if admitErr != nil {
+				// Admission closed between AllowClaim and AdmitOperation.
+				return claimStop, nil
+			}
+		}
+		item, err := claimFn(ctx, nowISO, "scheduler")
+		if testAfterClaimHook != nil {
+			item, err = testAfterClaimHook(item, err)
+		}
 		if err != nil {
+			// Context cancel mid-ClaimNext can leave UPDATE...RETURNING committed
+			// without a returned item. Recover (or retain/degrade) before Release
+			// so a durable running claim is never left unowned (#579 / ADR-0015 R6).
+			if lease != nil && claimErrorIsAmbiguousCancel(ctx, err) {
+				recovered, recErr := recoverAmbiguousCancelledClaim(ctx, input, nowISO, owned)
+				if recErr != nil {
+					if input.OperationOwner != nil {
+						input.OperationOwner.ReportHardPersistFailure(recErr)
+					}
+					// Retain lease — do not Release; BeginShutdown still observes it.
+					return claimStop, errors.Join(ErrOperationFinalizeFailed, recErr)
+				}
+				if recovered != nil {
+					item = recovered
+					err = nil
+				} else {
+					// Confirmed no durable claim under this tick — safe to drop lease.
+					lease.Release()
+					// BeginShutdown may cancel mid-ClaimNext after earlier slots
+					// succeeded. Stop claiming; dispatch already-durable claims.
+					return claimStop, nil
+				}
+			}
+		}
+		if err != nil {
+			if lease != nil {
+				lease.Release()
+			}
 			// BeginShutdown may cancel mid-ClaimNext after earlier slots succeeded.
 			// Stop claiming and dispatch already-durable claims instead of stranding.
 			if ctx.Err() != nil {
-				break
+				return claimStop, nil
 			}
-			return queueItems, dispatchClaimedQueueItems(ctx, queueItems, input, err)
+			return claimStop, err
 		}
 		if item == nil {
-			break
+			if lease != nil {
+				lease.Release()
+			}
+			// No candidate in this lane (e.g. non-long-term exhausted); caller may
+			// continue with long-term retry lane.
+			return claimEmpty, nil
+		}
+		if lease != nil {
+			permit, bindErr := lease.BindClaim(*item)
+			if bindErr != nil {
+				// Cancelled lease never starts the processor. Durable-requeue
+				// under retained ownership; Release only after requeue commits.
+				if finErr := finalizeCancelledClaim(ctx, *item, input, now); finErr != nil {
+					if input.OperationOwner != nil {
+						input.OperationOwner.ReportHardPersistFailure(finErr)
+					}
+					// Retain ownership — do not Release; do not dispatch.
+					return claimContinue, errors.Join(ErrOperationFinalizeFailed, finErr)
+				}
+				lease.Release()
+				return claimContinue, nil
+			}
+			if !permit.Valid() {
+				// Defensive: BindClaim must return a valid permit or error.
+				if finErr := finalizeCancelledClaim(ctx, *item, input, now); finErr != nil {
+					if input.OperationOwner != nil {
+						input.OperationOwner.ReportHardPersistFailure(finErr)
+					}
+					return claimContinue, errors.Join(ErrOperationFinalizeFailed, finErr)
+				}
+				lease.Release()
+				return claimContinue, nil
+			}
+			owned = append(owned, ownedQueueClaim{item: *item, lease: lease, permit: permit})
+		} else {
+			// Tests without OperationOwner: claim without lease ownership.
+			owned = append(owned, ownedQueueClaim{item: *item})
 		}
 		queueItems = append(queueItems, *item)
+		return claimContinue, nil
+	}
+
+	stopClaiming := false
+	for i := 0; i < availableSlots; i++ {
+		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
+			return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes)
+		})
+		if err != nil {
+			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
+		}
+		if result == claimEmpty {
+			break
+		}
+		if result == claimStop {
+			stopClaiming = true
+			break
+		}
 	}
 	for !stopClaiming && len(queueItems) < availableSlots {
-		if err := ctx.Err(); err != nil {
-			break
-		}
-		if err := admitClaim(); err != nil {
-			break
-		}
-		item, err := input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSets(ctx, nowISO, "scheduler", unrestrictedTypes, stickySnapshotTypes)
+		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
+			return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes)
+		})
 		if err != nil {
-			if ctx.Err() != nil {
-				break
-			}
-			return queueItems, dispatchClaimedQueueItems(ctx, queueItems, input, err)
+			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
 		}
-		if item == nil {
+		if result == claimEmpty || result == claimStop {
 			break
 		}
-		queueItems = append(queueItems, *item)
 	}
-	return queueItems, dispatchClaimedQueueItems(ctx, queueItems, input, nil)
+	return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, nil)
 }
 
-// dispatchClaimedQueueItems launches processors for items already durable as
-// running/claimed. Always detach the scheduler cancel: BeginShutdown may race
-// after a clean ctx.Err() check here but before ProcessClaimedQueueItem runs
-// its storage reads and Fail/Complete recovery writes. Relying on cancellation
-// already being visible at this exact check strands claims as running/
-// claimed_by=scheduler until a later recovery pass.
-func dispatchClaimedQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput, priorErr error) error {
-	if len(queueItems) == 0 {
+// claimErrorIsAmbiguousCancel reports whether a ClaimNext* error may have
+// already committed a durable running claim that was not returned to the caller
+// (context cancelled during UPDATE...RETURNING scan).
+func claimErrorIsAmbiguousCancel(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return ctx != nil && ctx.Err() != nil
+}
+
+// ambiguousClaimRecoveryTimeout bounds ListRunningClaimedBy after ClaimNext
+// cancel/deadline. Recovery must detach the caller deadline (an expired tick can
+// still observe a committed claim) without hanging forever if SQLite is blocked
+// while the operation lease remains pending.
+const ambiguousClaimRecoveryTimeout = 5 * time.Second
+
+// newAmbiguousClaimRecoveryContext returns a cancel-detached context with a
+// fresh timeout. Parent values are preserved when parent is non-nil; cancel and
+// deadline from the parent are not inherited.
+func newAmbiguousClaimRecoveryContext(parent context.Context) (context.Context, context.CancelFunc) {
+	base := context.Background()
+	if parent != nil {
+		base = context.WithoutCancel(parent)
+	}
+	return context.WithTimeout(base, ambiguousClaimRecoveryTimeout)
+}
+
+// recoverAmbiguousCancelledClaim looks up running claims made by the scheduler
+// at nowISO that are not already owned by this tick or by any live registry
+// operation lease. Zero matches means the cancel happened before any durable
+// claim (safe to release). One match is the recovered item. Multiple unowned
+// matches cannot be bound to a single lease.
+//
+// Filtering only the current batch's owned slice is insufficient: two claim
+// batches can share the same formatted nowISO (back-to-back wakeups within one
+// millisecond) and both use claimed_by="scheduler", so ListRunningClaimedBy
+// also returns earlier still-running claims. Those must be excluded via
+// OperationOwner.OwnsQueueClaim so recovery never adopts a registry-owned row
+// or degrades on a multi-match that includes live ownership.
+func recoverAmbiguousCancelledClaim(ctx context.Context, input defaultSchedulerTickInput, nowISO string, owned []ownedQueueClaim) (*storage.QueueItemRecord, error) {
+	if input.Repos == nil || input.Repos.Queue == nil {
+		return nil, errors.New("queue repository is not configured for ambiguous claim recovery")
+	}
+	// Bound recovery: WithoutCancel alone would wait indefinitely on blocked
+	// SQLite while the lease stays pending and shutdown times out retaining storage.
+	recoverCtx, cancel := newAmbiguousClaimRecoveryContext(ctx)
+	defer cancel()
+	items, err := input.Repos.Queue.ListRunningClaimedBy(recoverCtx, "scheduler", nowISO)
+	if err != nil {
+		return nil, err
+	}
+	ownedIDs := make(map[string]struct{}, len(owned))
+	for _, o := range owned {
+		if o.item.ID != "" {
+			ownedIDs[o.item.ID] = struct{}{}
+		}
+	}
+	var found *storage.QueueItemRecord
+	for i := range items {
+		id := items[i].ID
+		if _, ok := ownedIDs[id]; ok {
+			continue
+		}
+		// Prior-batch claims with the same claimed_at share this query result;
+		// skip any still bound to a live operation lease in the registry.
+		if input.OperationOwner != nil && input.OperationOwner.OwnsQueueClaim(id) {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("%w: multiple unowned running claims after cancelled ClaimNext", ErrOperationFinalizeFailed)
+		}
+		item := items[i]
+		found = &item
+	}
+	return found, nil
+}
+
+// cancelledClaimFinalizeTimeout bounds MarkRetryIfRunning/GetByID after a
+// stop/bind refuse. Finalize must detach the caller cancel/deadline (shutdown
+// or a timed tick can still require durable requeue) without hanging forever if
+// SQLite is blocked while the operation lease remains pending.
+const cancelledClaimFinalizeTimeout = 5 * time.Second
+
+// newCancelledClaimFinalizeContext returns a cancel-detached context with a
+// fresh timeout. Parent values are preserved when parent is non-nil; cancel and
+// deadline from the parent are not inherited.
+func newCancelledClaimFinalizeContext(parent context.Context) (context.Context, context.CancelFunc) {
+	base := context.Background()
+	if parent != nil {
+		base = context.WithoutCancel(parent)
+	}
+	return context.WithTimeout(base, cancelledClaimFinalizeTimeout)
+}
+
+// finalizeCancelledClaim durable-requeues a claim that cannot start because the
+// operation lease was cancelled (stop/bind race). Keeps the claim out of the
+// stranded running state without starting a processor.
+//
+// Uses a cancellation-detached, time-bounded context: Runtime.BeginShutdown
+// cancels the scheduler context before the registry drain, so a bind refused
+// after ClaimNext* must still requeue under retained ownership (same pattern as
+// dispatchOwnedQueueClaims / ambiguous-claim recovery). Passing the cancelled
+// scheduler ctx would make MarkRetry fail immediately, report hard persist
+// failure, and strand the claim. WithoutCancel alone would drop a caller
+// deadline and wait indefinitely on blocked SQLite while the lease stays pending.
+//
+// Pause/terminal stop may CancelByLoop the claim to cancelled after ClaimNext*
+// and before BindClaim refuses. Use MarkRetryIfRunning so concurrent
+// terminalization yields a zero-row no-op treated as durable success (stop must
+// not resurrect cancelled work). Unrestricted MarkRetry is reserved for runner
+// finalize after processing, which may requeue after mid-run pause cancel.
+func finalizeCancelledClaim(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput, now func() time.Time) error {
+	if input.Repos == nil || input.Repos.Queue == nil {
+		return errors.New("queue repository is not configured for cancelled-claim finalize")
+	}
+	// Bound finalization: detach cancel/deadline then apply a fresh timeout so
+	// shutdown/timed ticks still requeue without unbounded DB waits under a
+	// retained operation lease.
+	ctx, cancel := newCancelledClaimFinalizeContext(ctx)
+	defer cancel()
+	if now == nil {
+		now = time.Now
+	}
+	nowISO := formatJavaScriptISOString(now().UTC())
+	msg := "operation lease cancelled before queue processor start"
+	// Atomic status-guarded requeue: only updates while still running. Zero rows
+	// (already cancelled/completed/failed) is success — do not resurrect.
+	if err := input.Repos.Queue.MarkRetryIfRunning(ctx, storage.QueueMarkRetryInput{
+		ID:           item.ID,
+		AvailableAt:  nowISO,
+		Attempts:     item.Attempts,
+		ErrorMessage: &msg,
+		ErrorKind:    "retryable_transient",
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		return err
+	}
+	// Verify durable observation: still-running after guarded requeue means
+	// the write did not take effect (e.g. archived project) and ownership must
+	// not pretend finalize succeeded.
+	got, err := input.Repos.Queue.GetByID(ctx, item.ID)
+	if err != nil {
+		return err
+	}
+	if got == nil || got.Status == "running" {
+		return fmt.Errorf("%w: claim %s still running after requeue", ErrOperationFinalizeFailed, item.ID)
+	}
+	return nil
+}
+
+// dispatchOwnedQueueClaims launches processors for items already durable as
+// running/claimed under operation leases. Always detach the scheduler cancel:
+// BeginShutdown may race after a clean ctx.Err() check here but before
+// ProcessClaimedQueueItem runs its storage reads and Fail/Complete recovery
+// writes. Relying on cancellation already being visible at this exact check
+// strands claims as running/claimed_by=scheduler until a later recovery pass.
+func dispatchOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input defaultSchedulerTickInput, priorErr error) error {
+	if len(owned) == 0 {
 		return priorErr
 	}
 	dispatchCtx := ctx
 	if ctx != nil {
 		dispatchCtx = context.WithoutCancel(ctx)
 	}
-	runErr := runScheduledQueueItems(dispatchCtx, queueItems, input)
+	runErr := runOwnedQueueClaims(dispatchCtx, owned, input)
 	return errors.Join(runErr, priorErr)
+}
+
+// dispatchClaimedQueueItems is retained for tests that build bare claim slices
+// without operation leases.
+func dispatchClaimedQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput, priorErr error) error {
+	owned := make([]ownedQueueClaim, 0, len(queueItems))
+	for _, item := range queueItems {
+		owned = append(owned, ownedQueueClaim{item: item})
+	}
+	return dispatchOwnedQueueClaims(ctx, owned, input, priorErr)
 }
 
 // schedulerLoopParked reports whether a claimed queue item's loop was parked
@@ -4196,7 +4488,15 @@ func schedulerLoopParked(ctx context.Context, item storage.QueueItemRecord, inpu
 }
 
 func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput) error {
-	if len(queueItems) == 0 {
+	owned := make([]ownedQueueClaim, 0, len(queueItems))
+	for _, item := range queueItems {
+		owned = append(owned, ownedQueueClaim{item: item})
+	}
+	return runOwnedQueueClaims(ctx, owned, input)
+}
+
+func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input defaultSchedulerTickInput) error {
+	if len(owned) == 0 {
 		return nil
 	}
 
@@ -4205,16 +4505,29 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 		now = time.Now
 	}
 	errList := make([]error, 0)
-	// Do not abort the launch loop on ctx cancel: every item in queueItems is
-	// already durable as claimed/running. Skipping remaining launches strands
-	// those claims (BeginShutdown cancels the scheduler context during drain).
-	for _, item := range queueItems {
+	// Do not abort the launch loop on ctx cancel: every item is already durable
+	// as claimed/running under an operation lease. Skipping remaining launches
+	// strands those claims (BeginShutdown cancels the scheduler context during drain).
+	for _, claim := range owned {
+		item := claim.item
+		lease := claim.lease
+		permit := claim.permit
+
 		// A loop parked for human takeover (or paused) must never be run, even if a
-		// queue item survived a race with the parking and got claimed. Release the
-		// claim (so the slot frees) and skip — only an explicit handback re-arms it.
+		// queue item survived a race with the parking and got claimed. Durable-
+		// complete the claim (so the slot frees) then Release the lease — only
+		// an explicit handback re-arms it.
 		if schedulerLoopParked(ctx, item, input) {
-			if input.Repos != nil && input.Repos.Queue != nil {
-				_ = input.Repos.Queue.Complete(ctx, item.ID, formatJavaScriptISOString(now().UTC()))
+			if err := durableCompleteClaim(ctx, item, input, now); err != nil {
+				errList = append(errList, err)
+				if lease != nil {
+					if input.OperationOwner != nil {
+						input.OperationOwner.ReportHardPersistFailure(err)
+					}
+					// Retain ownership on finalize failure.
+				}
+			} else if lease != nil {
+				lease.Release()
 			}
 			if input.Logger != nil {
 				loopID := ""
@@ -4232,32 +4545,210 @@ func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemR
 		// that pre-stop claim. Intentional re-activation (API unpause/retry/
 		// handback) is the authority that clears the gate.
 
+		// Stop/bind race: never start the processor without an explicit permit
+		// when OperationOwner is wired. Also refuse when the live lease was
+		// cancelled after BindClaim (BeginLoopStop / BeginShutdown): permit
+		// remains Valid() but the operation must not start. (Tests without
+		// owner skip this gate.)
+		leaseCancelled := lease != nil && lease.Context().Err() != nil
+		if input.OperationOwner != nil && (!permit.Valid() || leaseCancelled) {
+			if finErr := finalizeCancelledClaim(ctx, item, input, now); finErr != nil {
+				errList = append(errList, finErr)
+				if input.OperationOwner != nil {
+					input.OperationOwner.ReportHardPersistFailure(finErr)
+				}
+			} else if lease != nil {
+				lease.Release()
+			}
+			continue
+		}
+
 		process, err := schedulerQueueProcessor(item, input)
 		if err != nil {
+			// Processor missing: still durable-finalize when ownership is tracked
+			// so the claim is not left running under a released lease.
+			if lease != nil {
+				if finErr := ensureClaimFinalized(ctx, item, err, input, now); finErr != nil {
+					errList = append(errList, errors.Join(err, finErr))
+					if input.OperationOwner != nil {
+						input.OperationOwner.ReportHardPersistFailure(finErr)
+					}
+					// Retain ownership when finalize fails.
+					continue
+				}
+				lease.Release()
+			}
 			errList = append(errList, err)
 			continue
 		}
-		item := item
 		processFn := process
+		run := func() {
+			// Processor work is owned by the operation lease, not the detached
+			// scheduler dispatch context. dispatchOwnedQueueClaims uses
+			// context.WithoutCancel so finalize survives BeginShutdown, but
+			// that must not keep the processor alive after the lease is
+			// cancelled (post-bind stop race, including delayed AsyncRunner).
+			processCtx := ctx
+			if lease != nil {
+				processCtx = lease.Context()
+				if processCtx.Err() != nil {
+					if finErr := finalizeCancelledClaim(ctx, item, input, now); finErr != nil {
+						if input.OperationOwner != nil {
+							input.OperationOwner.ReportHardPersistFailure(finErr)
+						}
+						if input.Logger != nil {
+							input.Logger.Warn("scheduler queue finalize failed; retaining operation lease", map[string]any{
+								"type": item.Type, "queueItemId": item.ID, "error": finErr.Error(),
+							})
+						}
+						// Retain ownership — do not Release.
+						return
+					}
+					lease.Release()
+					return
+				}
+			}
+			runErr := processFn(processCtx)
+			if lease != nil {
+				// Finalize-before-release: only drop ownership after durable
+				// complete/cancel/requeue (or typed Fail recovery). Keep using
+				// the detached dispatch ctx so durable writes still succeed
+				// when the lease was cancelled mid-run.
+				//
+				// When the lease was cancelled mid-run (BeginLoopStop before
+				// CancelByLoop / Terminate), do not Fail→manual_intervention.
+				// That status is outside CancelByLoop's WHERE (queued|running),
+				// so haltLoop would leave work on a terminated loop in a
+				// non-cancelled terminal state. Status-guarded requeue preserves
+				// concurrent CancelByLoop (zero-row no-op if already cancelled)
+				// and keeps the row cancellable until Terminate runs.
+				var finErr error
+				if lease.Context().Err() != nil {
+					finErr = finalizeCancelledClaim(ctx, item, input, now)
+				} else {
+					finErr = ensureClaimFinalized(ctx, item, runErr, input, now)
+				}
+				if finErr != nil {
+					if input.OperationOwner != nil {
+						input.OperationOwner.ReportHardPersistFailure(finErr)
+					}
+					if input.Logger != nil {
+						input.Logger.Warn("scheduler queue finalize failed; retaining operation lease", map[string]any{
+							"type": item.Type, "queueItemId": item.ID, "error": finErr.Error(),
+						})
+					}
+					// Retain ownership — do not Release.
+					return
+				}
+				lease.Release()
+			}
+			if runErr != nil && input.Logger != nil {
+				input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": runErr.Error()})
+			}
+		}
 
 		if input.AsyncRunner != nil {
-			input.AsyncRunner.Go(func() {
-				if err := processFn(ctx); err != nil && input.Logger != nil {
-					input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": err.Error()})
-				}
-			})
+			input.AsyncRunner.Go(run)
 			continue
 		}
-		go func() {
-			if err := processFn(ctx); err != nil && input.Logger != nil {
-				input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": err.Error()})
-			}
-		}()
+		go run()
 	}
 	if len(errList) == 0 {
 		return nil
 	}
 	return errors.Join(errList...)
+}
+
+// durableCompleteClaim writes queue status completed and verifies the durable
+// observation left the running state.
+//
+// ErrQueueItemNotActive is not a hard persistence failure when the row is
+// already non-running: pause/terminate CancelByLoop can concurrent-terminalize
+// a claim to cancelled while the scheduler observes a parked loop and tries to
+// Complete. That race must free the operation lease rather than degrade and
+// retain ownership forever.
+func durableCompleteClaim(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput, now func() time.Time) error {
+	if input.Repos == nil || input.Repos.Queue == nil {
+		return errors.New("queue repository is not configured")
+	}
+	if now == nil {
+		now = time.Now
+	}
+	nowISO := formatJavaScriptISOString(now().UTC())
+	if err := input.Repos.Queue.Complete(ctx, item.ID, nowISO); err != nil {
+		if !errors.Is(err, storage.ErrQueueItemNotActive) {
+			return err
+		}
+		// Concurrent terminalization (e.g. CancelByLoop) already moved the claim
+		// off running — verify and treat as durable success for lease release.
+		got, getErr := input.Repos.Queue.GetByID(ctx, item.ID)
+		if getErr != nil {
+			return getErr
+		}
+		if got == nil || got.Status != "running" {
+			return nil
+		}
+		return fmt.Errorf("%w: claim %s still running after complete conflict", ErrOperationFinalizeFailed, item.ID)
+	}
+	got, err := input.Repos.Queue.GetByID(ctx, item.ID)
+	if err != nil {
+		return err
+	}
+	if got == nil || got.Status == "running" {
+		return fmt.Errorf("%w: claim %s still running after complete", ErrOperationFinalizeFailed, item.ID)
+	}
+	return nil
+}
+
+// ensureClaimFinalized guarantees typed durable finalization after a runner
+// returns. Happy-path runners already Complete/Fail; this closes the gap where
+// a runner error leaves status=running under a about-to-be-released lease.
+// Returns nil when the claim is no longer running (already finalized).
+func ensureClaimFinalized(ctx context.Context, item storage.QueueItemRecord, runErr error, input defaultSchedulerTickInput, now func() time.Time) error {
+	if input.Repos == nil || input.Repos.Queue == nil {
+		if runErr != nil {
+			return errors.New("queue repository is not configured for finalize")
+		}
+		return nil
+	}
+	got, err := input.Repos.Queue.GetByID(ctx, item.ID)
+	if err != nil {
+		return err
+	}
+	if got == nil || got.Status != "running" {
+		return nil
+	}
+	// Still running after processor return: typed durable finalization.
+	if now == nil {
+		now = time.Now
+	}
+	nowISO := formatJavaScriptISOString(now().UTC())
+	msg := "queue processor returned without durable finalize"
+	if runErr != nil {
+		msg = runErr.Error()
+	}
+	kind := "retryable_transient"
+	if runErr == nil {
+		kind = "non_retryable"
+	}
+	if err := input.Repos.Queue.Fail(ctx, storage.QueueFailInput{
+		ID:           item.ID,
+		Attempts:     got.Attempts,
+		FinishedAt:   nowISO,
+		ErrorMessage: &msg,
+		ErrorKind:    kind,
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		return err
+	}
+	after, err := input.Repos.Queue.GetByID(ctx, item.ID)
+	if err != nil {
+		return err
+	}
+	if after == nil || after.Status == "running" {
+		return fmt.Errorf("%w: claim %s still running after fail", ErrOperationFinalizeFailed, item.ID)
+	}
+	return nil
 }
 
 func schedulerQueueProcessor(item storage.QueueItemRecord, input defaultSchedulerTickInput) (func(context.Context) error, error) {

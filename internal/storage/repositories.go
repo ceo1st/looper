@@ -1830,6 +1830,32 @@ func (r *QueueRepository) ClaimNextLongTermRetry(ctx context.Context, nowISO, cl
 	`, []any{QueueLongTermRetryAttemptThreshold})
 }
 
+// claimCtxForDurableClaim refuses already-cancelled callers, then detaches
+// cancellation from the UPDATE...RETURNING while preserving any caller
+// deadline. If the parent context is cancelled after SQLite commits the claim
+// but before the row is scanned, QueryRowContext would return ctx.Err without
+// the claimed item and strand a durable running row with no owner
+// (ADR-0015 R6 / #579). context.WithoutCancel also strips Deadline, so a
+// WithTimeout caller would otherwise hang indefinitely on a blocked SQLite
+// claim; re-apply the deadline on the detached context. The returned cancel
+// must be deferred by the caller to free the deadline timer.
+func claimCtxForDurableClaim(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	noop := func() {}
+	if ctx == nil {
+		return context.Background(), noop, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	detached := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		// WithoutCancel strips Deadline; re-apply so QueryRowContext still bounds.
+		withDeadline, cancel := context.WithDeadline(detached, deadline)
+		return withDeadline, cancel, nil
+	}
+	return detached, noop, nil
+}
+
 // ClaimNextNonLongTermRetryAmongTypes claims the next non-long-term-retry item
 // whose type is in types. Empty types claims nothing.
 func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypes(ctx context.Context, nowISO, claimedBy string, types []string) (*QueueItemRecord, error) {
@@ -1922,7 +1948,12 @@ func queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes []string) (p
 }
 
 func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimedBy, extraPredicate string, extraArgs []any) (*QueueItemRecord, error) {
-	row := r.q.QueryRowContext(ctx, `
+	claimCtx, cancel, err := claimCtxForDurableClaim(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	row := r.q.QueryRowContext(claimCtx, `
 		WITH candidate AS (
 			`+scheduledQueueBaseQuery+extraPredicate+scheduledQueueOrderBy+`
 			LIMIT 1
@@ -1950,7 +1981,12 @@ func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimed
 }
 
 func (r *QueueRepository) ClaimNextOfType(ctx context.Context, nowISO, claimedBy, queueType string) (*QueueItemRecord, error) {
-	row := r.q.QueryRowContext(ctx, `
+	claimCtx, cancel, err := claimCtxForDurableClaim(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	row := r.q.QueryRowContext(claimCtx, `
 		WITH candidate AS (
 			`+scheduledQueueBaseQuery+`
 			AND qi.type = ?
@@ -1977,6 +2013,29 @@ func (r *QueueRepository) ClaimNextOfType(ctx context.Context, nowISO, claimedBy
 	}
 
 	return &record, nil
+}
+
+// ListRunningClaimedBy returns running queue items claimed by claimedBy at
+// claimedAt. Used to recover from ambiguous ClaimNext failures after context
+// cancellation when the durable UPDATE may have committed without returning
+// the row to the caller.
+func (r *QueueRepository) ListRunningClaimedBy(ctx context.Context, claimedBy, claimedAt string) ([]QueueItemRecord, error) {
+	if claimedBy == "" {
+		return []QueueItemRecord{}, nil
+	}
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT * FROM queue_items
+		WHERE status = 'running'
+			AND claimed_by = ?
+			AND claimed_at = ?
+		ORDER BY id ASC
+	`, claimedBy, claimedAt)
+	if err != nil {
+		return nil, fmt.Errorf("list running queue items by claimed_by: %w", err)
+	}
+	defer rows.Close()
+
+	return scanQueueItems(rows)
 }
 
 func (r *QueueRepository) Complete(ctx context.Context, id, finishedAt string) error {
@@ -2013,6 +2072,9 @@ func (r *QueueRepository) UpdateLockKey(ctx context.Context, id, lockKey, update
 }
 
 func (r *QueueRepository) MarkRetry(ctx context.Context, input QueueMarkRetryInput) error {
+	// Runner authority after processing: may requeue even when concurrent pause
+	// CancelByLoop already terminalized the claim mid-run (resume later). Do not
+	// status-guard here — stop/bind refuse uses MarkRetryIfRunning instead.
 	_, err := r.q.ExecContext(ctx, `
 		UPDATE queue_items
 		SET status = 'queued',
@@ -2033,6 +2095,36 @@ func (r *QueueRepository) MarkRetry(ctx context.Context, input QueueMarkRetryInp
 	`, input.AvailableAt, input.Attempts, input.ErrorMessage, input.ErrorKind, input.UpdatedAt, input.ID)
 	if err != nil {
 		return fmt.Errorf("mark queue item for retry: %w", err)
+	}
+
+	return nil
+}
+
+// MarkRetryIfRunning requeues only while status is still running. Zero rows
+// (already cancelled/completed/failed) is a no-op success so stop/bind refuse
+// cannot resurrect terminal cancellation. Prefer MarkRetry for runner finalize.
+func (r *QueueRepository) MarkRetryIfRunning(ctx context.Context, input QueueMarkRetryInput) error {
+	_, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET status = 'queued',
+			available_at = ?,
+			attempts = ?,
+			last_error = ?,
+			last_error_kind = ?,
+			claimed_by = NULL,
+			claimed_at = NULL,
+			finished_at = NULL,
+			updated_at = ?
+		WHERE id = ?
+			AND status = 'running'
+			AND NOT EXISTS (
+				SELECT 1
+				FROM projects p
+				WHERE p.id = queue_items.project_id AND p.archived = 1
+			)
+	`, input.AvailableAt, input.Attempts, input.ErrorMessage, input.ErrorKind, input.UpdatedAt, input.ID)
+	if err != nil {
+		return fmt.Errorf("mark queue item for retry if running: %w", err)
 	}
 
 	return nil

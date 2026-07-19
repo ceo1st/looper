@@ -1563,6 +1563,46 @@ func TestQueueRetryFailCompleteTransitions(t *testing.T) {
 		t.Fatalf("Queue.GetByID(qi_retry) after markRetry = %#v, want queued attempts=2 unclaimed", gotRetry)
 	}
 
+	// MarkRetryIfRunning must not resurrect a terminal cancellation.
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{
+		ID:          "qi_retry_cancelled",
+		LoopID:      &loopID,
+		Type:        "planner",
+		TargetType:  "project",
+		TargetID:    "project_tr",
+		DedupeKey:   "d_retry_cancelled",
+		Priority:    1,
+		Status:      "cancelled",
+		AvailableAt: now,
+		Attempts:    1,
+		MaxAttempts: 3,
+		CreatedAt:   now,
+		UpdatedAt:   claimedAt,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(qi_retry_cancelled) error = %v", err)
+	}
+	if err := repos.Queue.MarkRetryIfRunning(ctx, QueueMarkRetryInput{ID: "qi_retry_cancelled", AvailableAt: retryAt, Attempts: 2, ErrorMessage: &errMsg, ErrorKind: "retryable_transient", UpdatedAt: retryAt}); err != nil {
+		t.Fatalf("Queue.MarkRetryIfRunning(cancelled) error = %v", err)
+	}
+	gotCancelled, err := repos.Queue.GetByID(ctx, "qi_retry_cancelled")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(qi_retry_cancelled) error = %v", err)
+	}
+	if gotCancelled == nil || gotCancelled.Status != "cancelled" {
+		t.Fatalf("Queue.MarkRetryIfRunning on cancelled = %#v, want status still cancelled (zero-row no-op)", gotCancelled)
+	}
+	// Unrestricted MarkRetry remains runner authority: may requeue after mid-run pause cancel.
+	if err := repos.Queue.MarkRetry(ctx, QueueMarkRetryInput{ID: "qi_retry_cancelled", AvailableAt: retryAt, Attempts: 2, ErrorMessage: &errMsg, ErrorKind: "retryable_transient", UpdatedAt: retryAt}); err != nil {
+		t.Fatalf("Queue.MarkRetry(cancelled) error = %v", err)
+	}
+	gotResurrected, err := repos.Queue.GetByID(ctx, "qi_retry_cancelled")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(qi_retry_cancelled) after MarkRetry error = %v", err)
+	}
+	if gotResurrected == nil || gotResurrected.Status != "queued" || gotResurrected.Attempts != 2 {
+		t.Fatalf("Queue.MarkRetry on cancelled = %#v, want queued attempts=2", gotResurrected)
+	}
+
 	finished := "2026-04-11T12:06:00.000Z"
 	if err := repos.Queue.Complete(ctx, "qi_retry", finished); err != nil {
 		t.Fatalf("Queue.Complete() error = %v", err)
@@ -2008,6 +2048,158 @@ func TestQueueClaimNextSkipsArchivedProjects(t *testing.T) {
 	}
 	if claimed == nil || claimed.ID != "queue_active" {
 		t.Fatalf("Queue.ClaimNext() = %#v, want queue_active", claimed)
+	}
+}
+
+func TestQueueClaimNextRefusesAlreadyCancelledContextWithoutMutating(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-07-19T12:00:00.000Z"
+	projectID := "project_claim_cancel"
+	loopID := "loop_claim_cancel"
+	queueID := "queue_claim_cancel"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "ClaimCancel", RepoPath: "/tmp/claim-cancel", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert: %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "queued", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert: %v", err)
+	}
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{
+		ID: queueID, ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
+		DedupeKey: "worker:claim_cancel", Priority: 1, Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert: %v", err)
+	}
+
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	claimed, err := repos.Queue.ClaimNext(cancelCtx, now, "scheduler")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ClaimNext error = %v, want context.Canceled", err)
+	}
+	if claimed != nil {
+		t.Fatalf("ClaimNext = %#v, want nil when context already cancelled", claimed)
+	}
+	got, err := repos.Queue.GetByID(ctx, queueID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got == nil || got.Status != "queued" {
+		t.Fatalf("queue item = %#v, want still queued (no durable claim)", got)
+	}
+
+	// Live context still claims successfully (detached path returns the row).
+	claimed, err = repos.Queue.ClaimNext(ctx, now, "scheduler")
+	if err != nil || claimed == nil || claimed.ID != queueID {
+		t.Fatalf("ClaimNext live = (%#v, %v), want %s", claimed, err, queueID)
+	}
+}
+
+func TestClaimCtxForDurableClaimPreservesDeadlineAndDetachesCancel(t *testing.T) {
+	t.Parallel()
+
+	deadline := time.Now().Add(150 * time.Millisecond)
+	parent, cancelParent := context.WithDeadline(context.Background(), deadline)
+	defer cancelParent()
+
+	claimCtx, stop, err := claimCtxForDurableClaim(parent)
+	if err != nil {
+		t.Fatalf("claimCtxForDurableClaim: %v", err)
+	}
+	defer stop()
+
+	gotDeadline, ok := claimCtx.Deadline()
+	if !ok {
+		t.Fatal("claim context must retain the caller deadline")
+	}
+	if !gotDeadline.Equal(deadline) {
+		t.Fatalf("deadline = %v, want %v", gotDeadline, deadline)
+	}
+
+	// Parent cancel must not cancel the claim context (committed-but-unscanned case).
+	cancelParent()
+	if err := claimCtx.Err(); err != nil {
+		t.Fatalf("claimCtx.Err after parent cancel = %v, want nil", err)
+	}
+
+	// Deadline must still fire on the detached claim context.
+	select {
+	case <-claimCtx.Done():
+		if !errors.Is(claimCtx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("claimCtx.Err = %v, want DeadlineExceeded", claimCtx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("claim context did not honor retained deadline")
+	}
+}
+
+func TestClaimCtxForDurableClaimNoDeadlineWithoutParentDeadline(t *testing.T) {
+	t.Parallel()
+
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+
+	claimCtx, stop, err := claimCtxForDurableClaim(parent)
+	if err != nil {
+		t.Fatalf("claimCtxForDurableClaim: %v", err)
+	}
+	defer stop()
+	if _, ok := claimCtx.Deadline(); ok {
+		t.Fatal("claim context must not invent a deadline when parent has none")
+	}
+	cancelParent()
+	if err := claimCtx.Err(); err != nil {
+		t.Fatalf("claimCtx.Err after parent cancel = %v, want nil", err)
+	}
+}
+
+func TestQueueListRunningClaimedBy(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-07-19T12:00:00.000Z"
+	projectID := "project_list_claimed"
+	loopID := "loop_list_claimed"
+	claimedBy := "scheduler"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "ListClaimed", RepoPath: "/tmp/list-claimed", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert: %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "queued", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert: %v", err)
+	}
+	for _, id := range []string{"qi_list_a", "qi_list_b"} {
+		if err := repos.Queue.Upsert(ctx, QueueItemRecord{
+			ID: id, ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
+			DedupeKey: id, Priority: 1, Status: "running", AvailableAt: now, MaxAttempts: 3,
+			ClaimedBy: &claimedBy, ClaimedAt: &now, StartedAt: &now, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("Queue.Upsert(%s): %v", id, err)
+		}
+	}
+	// Different claimed_at must not match.
+	otherAt := "2026-07-19T11:00:00.000Z"
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{
+		ID: "qi_list_other", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID,
+		DedupeKey: "qi_list_other", Priority: 1, Status: "running", AvailableAt: now, MaxAttempts: 3,
+		ClaimedBy: &claimedBy, ClaimedAt: &otherAt, StartedAt: &otherAt, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(other): %v", err)
+	}
+
+	items, err := repos.Queue.ListRunningClaimedBy(ctx, claimedBy, now)
+	if err != nil {
+		t.Fatalf("ListRunningClaimedBy: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("len = %d, want 2; items=%#v", len(items), items)
+	}
+	if items[0].ID != "qi_list_a" || items[1].ID != "qi_list_b" {
+		t.Fatalf("order = %s,%s want qi_list_a,qi_list_b", items[0].ID, items[1].ID)
 	}
 }
 
